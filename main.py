@@ -12,7 +12,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 CLIENT_ID = os.getenv("DISCORD_CLIENT_ID")
 CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
 REDIRECT_URI = "https://backend-production-1f1a.up.railway.app/callback"
-FRONTEND_URL = "https://frontend-production-aa68.up.railway.app"
+frontend_url = f"https://frontend-production-ab5e.up.railway.app/?user_id={discord_id}"
 
 # CORS settings for frontend access
 origins = [FRONTEND_URL]
