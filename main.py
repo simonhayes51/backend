@@ -82,7 +82,7 @@ async def callback(request: Request, code: str):
     conn = await asyncpg.connect(DATABASE_URL)
     existing = await conn.fetchrow("SELECT * FROM traders WHERE discord_id = $1", discord_id)
     if not existing:
-        await conn.execute("INSERT INTO traders (discord_id) VALUES ($1)", discord_id)
+        await conn.execute("INSERT INTO traders (user_id) VALUES ($1)", discord_id)
     await conn.close()
 
     # Store session
@@ -124,7 +124,7 @@ async def log_trade(request: Request):
 
     conn = await asyncpg.connect(DATABASE_URL)
     await conn.execute("""
-        INSERT INTO trades (discord_id, name, version, buy_price, sell_price, platform)
+        INSERT INTO trades (user_id, name, version, buy_price, sell_price, platform)
         VALUES ($1, $2, $3, $4, $5, $6)
     """, user_id, name, version, int(buy_price), int(sell_price), platform)
     await conn.close()
