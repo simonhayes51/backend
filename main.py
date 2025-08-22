@@ -85,4 +85,4 @@ async def callback(code: str):
     
     @app.get("/")
     async def healthcheck():
-    return {"status": "Backend is alive"}
+        return {"status": "Backend is alive"}
