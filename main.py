@@ -82,8 +82,3 @@ async def callback(code: str):
     discord_id = user_info["id"]
     frontend_url = f"https://frontend-production-aa68.up.railway.app/?user_id={discord_id}"
     return RedirectResponse(frontend_url)
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8080))
-    uvicorn.run("main:app", host="0.0.0.0", port=port)
