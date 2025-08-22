@@ -107,7 +107,12 @@ async def get_profile(user_id: str):
 
 @app.post("/logtrade")
 async def log_trade(request: Request):
-    user_id = request.session.get("user_id")  # ✅ Use session
+    try:
+        user_id = request.session.get("user_id")  # ✅ Try to read session
+        print("[DEBUG] session user_id:", user_id)
+    except Exception as e:
+        print("[ERROR] Failed to read session:", str(e))
+        raise HTTPException(status_code=500, detail="Session read error")
 
     if not user_id:
         raise HTTPException(status_code=401, detail="User not logged in")
@@ -130,3 +135,4 @@ async def log_trade(request: Request):
     await conn.close()
 
     return {"status": "success"}
+
