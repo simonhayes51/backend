@@ -82,3 +82,7 @@ async def callback(code: str):
     discord_id = user_info["id"]
     frontend_url = f"https://frontend-production-aa68.up.railway.app/?user_id={discord_id}"
     return RedirectResponse(frontend_url)
+    
+    @app.get("/")
+    async def healthcheck():
+    return {"status": "Backend is alive"}
