@@ -7,12 +7,15 @@ import os
 
 app = FastAPI()
 
+# Load environment variables
 DATABASE_URL = os.getenv("DATABASE_URL")
 CLIENT_ID = os.getenv("DISCORD_CLIENT_ID")
 CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
 REDIRECT_URI = "https://backend-production-1f1a.up.railway.app/callback"
+FRONTEND_URL = "https://frontend-production-aa68.up.railway.app"
 
-origins = ["*"]
+# CORS settings for frontend access
+origins = [FRONTEND_URL]
 
 app.add_middleware(
     CORSMiddleware,
@@ -22,6 +25,65 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Health check
+@app.get("/")
+async def healthcheck():
+    return {"status": "Backend is alive"}
+
+# Redirect to Discord for OAuth
+@app.get("/login")
+async def login():
+    discord_auth_url = (
+        f"https://discord.com/api/oauth2/authorize"
+        f"?client_id={CLIENT_ID}"
+        f"&redirect_uri={REDIRECT_URI}"
+        f"&response_type=code"
+        f"&scope=identify"
+    )
+    return RedirectResponse(discord_auth_url)
+
+# Optional alias for login (in case frontend calls /auth/discord)
+@app.get("/auth/discord")
+async def auth_discord():
+    return RedirectResponse("/login")
+
+# Callback after Discord login
+@app.get("/callback")
+async def callback(code: str):
+    token_url = "https://discord.com/api/oauth2/token"
+    data = {
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": REDIRECT_URI,
+    }
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(token_url, data=data, headers=headers) as resp:
+            token_response = await resp.json()
+            access_token = token_response.get("access_token")
+
+            if not access_token:
+                raise HTTPException(status_code=400, detail="Invalid Discord code")
+
+    # Get user info from Discord
+    user_url = "https://discord.com/api/users/@me"
+    headers = {"Authorization": f"Bearer {access_token}"}
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(user_url, headers=headers) as resp:
+            user_info = await resp.json()
+
+    if "id" not in user_info:
+        raise HTTPException(status_code=400, detail="Failed to fetch Discord user")
+
+    # Redirect to frontend with user_id
+    discord_id = user_info["id"]
+    return RedirectResponse(f"{FRONTEND_URL}/?user_id={discord_id}")
+
+# Get user profile data
 @app.get("/api/profile/{user_id}")
 async def get_profile(user_id: str):
     try:
@@ -43,6 +105,7 @@ async def get_profile(user_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# Get recent trade history
 @app.get("/api/sales/{user_id}")
 async def get_sales(user_id: str):
     try:
@@ -55,47 +118,3 @@ async def get_sales(user_id: str):
         return [dict(row) for row in rows]
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/login")
-async def login():
-    discord_auth_url = (
-        f"https://discord.com/api/oauth2/authorize?client_id={CLIENT_ID}"
-        f"&redirect_uri={REDIRECT_URI}&response_type=code&scope=identify"
-    )
-    return RedirectResponse(discord_auth_url)
-
-# ✅ Add this alias route to match what your frontend is requesting
-@app.get("/auth/discord")
-async def auth_discord():
-    return RedirectResponse("/login")
-
-@app.get("/callback")
-async def callback(code: str):
-    token_url = "https://discord.com/api/oauth2/token"
-    data = {
-        "client_id": CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
-        "grant_type": "authorization_code",
-        "code": code,
-        "redirect_uri": REDIRECT_URI,
-    }
-    headers = {"Content-Type": "application/x-www-form-urlencoded"}
-
-    async with aiohttp.ClientSession() as session:
-        async with session.post(token_url, data=data, headers=headers) as resp:
-            token_response = await resp.json()
-            access_token = token_response.get("access_token")
-
-    user_url = "https://discord.com/api/users/@me"
-    headers = {"Authorization": f"Bearer {access_token}"}
-    async with aiohttp.ClientSession() as session:
-        async with session.get(user_url, headers=headers) as resp:
-            user_info = await resp.json()
-
-    discord_id = user_info["id"]
-    frontend_url = f"https://frontend-production-aa68.up.railway.app/?user_id={discord_id}"
-    return RedirectResponse(frontend_url)
-
-@app.get("/")
-async def healthcheck():
-    return {"status": "Backend is alive"}
