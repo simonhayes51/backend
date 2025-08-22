@@ -64,6 +64,11 @@ async def login():
     )
     return RedirectResponse(discord_auth_url)
 
+# ✅ Add this alias route to match what your frontend is requesting
+@app.get("/auth/discord")
+async def auth_discord():
+    return RedirectResponse("/login")
+
 @app.get("/callback")
 async def callback(code: str):
     token_url = "https://discord.com/api/oauth2/token"
@@ -91,7 +96,6 @@ async def callback(code: str):
     frontend_url = f"https://frontend-production-aa68.up.railway.app/?user_id={discord_id}"
     return RedirectResponse(frontend_url)
 
-# ✅ Healthcheck route added correctly here:
 @app.get("/")
 async def healthcheck():
     return {"status": "Backend is alive"}
