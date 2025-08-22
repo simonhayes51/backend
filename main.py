@@ -107,32 +107,26 @@ async def get_profile(user_id: str):
 
 @app.post("/logtrade")
 async def log_trade(request: Request):
-    try:
-        user_id = request.session.get("user_id")  # ✅ Try to read session
-        print("[DEBUG] session user_id:", user_id)
-    except Exception as e:
-        print("[ERROR] Failed to read session:", str(e))
-        raise HTTPException(status_code=500, detail="Session read error")
+    user_id = request.session.get("user_id")
 
     if not user_id:
         raise HTTPException(status_code=401, detail="User not logged in")
 
     data = await request.json()
-    name = data.get("name")
+    player = data.get("name")  # assuming frontend sends this as `name`
     version = data.get("version")
     buy_price = data.get("buyPrice")
     sell_price = data.get("sellPrice")
     platform = data.get("platform")
 
-    if not all([name, version, buy_price, sell_price, platform]):
+    if not all([player, version, buy_price, sell_price, platform]):
         raise HTTPException(status_code=400, detail="Missing trade fields")
 
     conn = await asyncpg.connect(DATABASE_URL)
     await conn.execute("""
-        INSERT INTO trades (user_id, name, version, buy_price, sell_price, platform)
+        INSERT INTO trades (user_id, player, version, buy, sell, platform)
         VALUES ($1, $2, $3, $4, $5, $6)
-    """, user_id, name, version, int(buy_price), int(sell_price), platform)
+    """, user_id, player, version, int(buy_price), int(sell_price), platform)
     await conn.close()
 
     return {"status": "success"}
-
