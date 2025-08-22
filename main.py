@@ -87,7 +87,8 @@ async def callback(request: Request, code: str):
 
     # Store session
     request.session["user_id"] = discord_id
-
+    print("[DEBUG] Set session user_id:", discord_id)
+    
     # Redirect to frontend
     return RedirectResponse(f"https://frontend-production-ab5e.up.railway.app/?user_id={discord_id}")
 
