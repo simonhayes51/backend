@@ -107,7 +107,7 @@ async def get_profile(user_id: str):
 
 @app.post("/logtrade")
 async def log_trade(request: Request):
-    user_id = request.headers.get("x-user-id")
+    user_id = request.session.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User not logged in")
 
