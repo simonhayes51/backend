@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Request
-from fastapi.responses import RedirectResponse, JSONResponse
+from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 import aiohttp
 import asyncpg
@@ -7,9 +7,9 @@ import os
 
 app = FastAPI()
 
-# CORS setup - allow frontend
+# CORS: allow frontend origin
 origins = [
-    "https://frontend-production-ab5e.up.railway.app",
+    "https://frontend-production-ab5e.up.railway.app",  # replace if your frontend changes
 ]
 
 app.add_middleware(
@@ -23,18 +23,15 @@ app.add_middleware(
 # Load environment variables
 DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID")
 DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
-REDIRECT_URI = "https://backend-production-1f1a.up.railway.app/callback"  # ✅ Set directly
+REDIRECT_URI = os.getenv("DISCORD_REDIRECT_URI")  # make sure this env var exists
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 
 @app.get("/login")
 async def login():
     discord_oauth_url = (
-        f"https://discord.com/api/oauth2/authorize"
-        f"?client_id={DISCORD_CLIENT_ID}"
-        f"&redirect_uri={REDIRECT_URI}"
-        f"&response_type=code"
-        f"&scope=identify"
+        f"https://discord.com/api/oauth2/authorize?client_id={DISCORD_CLIENT_ID}"
+        f"&redirect_uri={REDIRECT_URI}&response_type=code&scope=identify"
     )
     return RedirectResponse(discord_oauth_url)
 
@@ -43,7 +40,7 @@ async def login():
 async def callback(code: str):
     async with aiohttp.ClientSession() as session:
         # Exchange code for access token
-        token_data = {
+        data = {
             "client_id": DISCORD_CLIENT_ID,
             "client_secret": DISCORD_CLIENT_SECRET,
             "grant_type": "authorization_code",
@@ -53,21 +50,24 @@ async def callback(code: str):
         }
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
 
-        async with session.post("https://discord.com/api/oauth2/token", data=token_data, headers=headers) as token_resp:
-            token_response = await token_resp.json()
+        async with session.post("https://discord.com/api/oauth2/token", data=data, headers=headers) as resp:
+            token_response = await resp.json()
             access_token = token_response.get("access_token")
-
-            if not access_token:
-                return JSONResponse({"error": "Failed to retrieve access token", "details": token_response}, status_code=400)
 
         # Get user info
         headers = {"Authorization": f"Bearer {access_token}"}
-        async with session.get("https://discord.com/api/users/@me", headers=headers) as user_resp:
-            user = await user_resp.json()
-            discord_id = user.get("id")
+        async with session.get("https://discord.com/api/users/@me", headers=headers) as resp:
+            user = await resp.json()
+            discord_id = user["id"]
 
-            if not discord_id:
-                return JSONResponse({"error": "Failed to retrieve Discord user info", "details": user}, status_code=400)
+    # Connect to DB and insert user if not already in the table
+    conn = await asyncpg.connect(DATABASE_URL)
+    existing = await conn.fetchrow("SELECT * FROM traders WHERE discord_id = $1", discord_id)
+
+    if not existing:
+        await conn.execute("INSERT INTO traders (discord_id) VALUES ($1)", discord_id)
+
+    await conn.close()
 
     # Redirect to frontend with user_id
     frontend_url = f"https://frontend-production-ab5e.up.railway.app/?user_id={discord_id}"
@@ -76,16 +76,11 @@ async def callback(code: str):
 
 @app.get("/api/profile/{user_id}")
 async def get_profile(user_id: str):
-    try:
-        conn = await asyncpg.connect(DATABASE_URL)
-        query = "SELECT * FROM traders WHERE discord_id = $1"
-        row = await conn.fetchrow(query, user_id)
-        await conn.close()
+    conn = await asyncpg.connect(DATABASE_URL)
+    row = await conn.fetchrow("SELECT * FROM traders WHERE discord_id = $1", user_id)
+    await conn.close()
 
-        if row:
-            return dict(row)
-        else:
-            return {"error": "User not found"}
-
-    except Exception as e:
-        return {"error": str(e)}
+    if row:
+        return dict(row)
+    else:
+        return {"error": "User not found"}
