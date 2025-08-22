@@ -26,14 +26,19 @@ app.add_middleware(
 async def get_profile(user_id: str):
     try:
         conn = await asyncpg.connect(DATABASE_URL)
-        portfolio = await conn.fetchrow("SELECT starting_balance FROM portfolio WHERE user_id=$1", user_id)
-        stats = await conn.fetchrow("SELECT SUM(profit) AS total_profit, SUM(ea_tax) AS total_tax, COUNT(*) AS count FROM trades WHERE user_id=$1", user_id)
+        portfolio = await conn.fetchrow(
+            "SELECT starting_balance FROM portfolio WHERE user_id=$1", user_id
+        )
+        stats = await conn.fetchrow(
+            "SELECT SUM(profit) AS total_profit, SUM(ea_tax) AS total_tax, COUNT(*) AS count FROM trades WHERE user_id=$1",
+            user_id,
+        )
         await conn.close()
         return {
             "starting_balance": portfolio["starting_balance"] if portfolio else 0,
             "total_profit": stats["total_profit"] or 0,
             "total_tax": stats["total_tax"] or 0,
-            "trades": stats["count"]
+            "trades": stats["count"],
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -42,7 +47,10 @@ async def get_profile(user_id: str):
 async def get_sales(user_id: str):
     try:
         conn = await asyncpg.connect(DATABASE_URL)
-        rows = await conn.fetch("SELECT player, quantity, sell, profit, timestamp FROM trades WHERE user_id=$1 ORDER BY timestamp DESC LIMIT 10", user_id)
+        rows = await conn.fetch(
+            "SELECT player, quantity, sell, profit, timestamp FROM trades WHERE user_id=$1 ORDER BY timestamp DESC LIMIT 10",
+            user_id,
+        )
         await conn.close()
         return [dict(row) for row in rows]
     except Exception as e:
@@ -82,7 +90,8 @@ async def callback(code: str):
     discord_id = user_info["id"]
     frontend_url = f"https://frontend-production-aa68.up.railway.app/?user_id={discord_id}"
     return RedirectResponse(frontend_url)
-    
-    @app.get("/")
-    async def healthcheck():
-        return {"status": "Backend is alive"}
+
+# ✅ Healthcheck route added correctly here:
+@app.get("/")
+async def healthcheck():
+    return {"status": "Backend is alive"}
