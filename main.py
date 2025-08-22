@@ -11,7 +11,7 @@ app = FastAPI()
 
 # CORS: allow frontend origin
 origins = [
-    "https://frontend-production-ab5e.up.railway.app",  # your deployed frontend
+    "https://frontend-production-ab5e.up.railway.app",
 ]
 
 app.add_middleware(
@@ -22,13 +22,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Session for user ID tracking
-app.add_middleware(SessionMiddleware, secret_key=os.getenv("SESSION_SECRET", "supersecret"))
+# Session middleware with proper cross-origin support
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=os.getenv("SESSION_SECRET", "supersecret"),
+    same_site="none",
+    https_only=True
+)
 
 # ENV vars
 DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID")
 DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
-REDIRECT_URI = os.getenv("DISCORD_REDIRECT_URI")  # should match Discord portal
+REDIRECT_URI = os.getenv("DISCORD_REDIRECT_URI")  # must match Discord settings
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 
