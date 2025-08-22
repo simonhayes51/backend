@@ -1,7 +1,6 @@
-from fastapi import FastAPI, Request, HTTPException, Form
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.middleware.sessions import SessionMiddleware
 from pydantic import BaseModel
 import aiohttp
 import asyncpg
@@ -9,12 +8,9 @@ import os
 
 app = FastAPI()
 
-# Enable sessions for user tracking
-app.add_middleware(SessionMiddleware, secret_key="your_secret_key")  # replace with a strong key
-
 # CORS: allow frontend origin
 origins = [
-    "https://frontend-production-ab5e.up.railway.app",  # your deployed frontend
+    "https://frontend-production-ab5e.up.railway.app",
 ]
 
 app.add_middleware(
@@ -25,15 +21,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Environment variables
+# Load environment variables
 DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID")
 DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
 REDIRECT_URI = os.getenv("DISCORD_REDIRECT_URI")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# -------------------------
-# 🔐 Discord Login
-# -------------------------
 @app.get("/login")
 async def login():
     discord_oauth_url = (
@@ -42,10 +35,8 @@ async def login():
     )
     return RedirectResponse(discord_oauth_url)
 
-
 @app.get("/callback")
-async def callback(request: Request):
-    code = request.query_params.get("code")
+async def callback(code: str):
     async with aiohttp.ClientSession() as session:
         data = {
             "client_id": DISCORD_CLIENT_ID,
@@ -56,72 +47,62 @@ async def callback(request: Request):
             "scope": "identify",
         }
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
-
         async with session.post("https://discord.com/api/oauth2/token", data=data, headers=headers) as resp:
             token_response = await resp.json()
             access_token = token_response.get("access_token")
 
-        # Fetch user data
+        if not access_token:
+            raise HTTPException(status_code=400, detail="Failed to obtain access token")
+
         headers = {"Authorization": f"Bearer {access_token}"}
         async with session.get("https://discord.com/api/users/@me", headers=headers) as resp:
-            user_data = await resp.json()
+            user = await resp.json()
+            discord_id = user.get("id")
 
-    if "id" not in user_data:
-        raise HTTPException(status_code=400, detail="❌ Missing Discord ID")
-
-    discord_id = user_data["id"]
-    request.session["user"] = user_data  # store session
+        if not discord_id:
+            raise HTTPException(status_code=400, detail="Failed to fetch Discord user")
 
     conn = await asyncpg.connect(DATABASE_URL)
-    await conn.execute(
-        "INSERT INTO traders (discord_id) VALUES ($1) ON CONFLICT (discord_id) DO NOTHING",
-        discord_id,
-    )
+    existing = await conn.fetchrow("SELECT * FROM traders WHERE discord_id = $1", discord_id)
+
+    if not existing:
+        await conn.execute("INSERT INTO traders (discord_id) VALUES ($1)", discord_id)
+
     await conn.close()
 
-    # redirect back to frontend with user_id
     return RedirectResponse(f"https://frontend-production-ab5e.up.railway.app/?user_id={discord_id}")
 
-# -------------------------
-# 👤 Get Profile
-# -------------------------
 @app.get("/api/profile/{user_id}")
 async def get_profile(user_id: str):
     conn = await asyncpg.connect(DATABASE_URL)
     row = await conn.fetchrow("SELECT * FROM traders WHERE discord_id = $1", user_id)
     await conn.close()
-
     if row:
         return dict(row)
-    else:
-        return {"error": "User not found"}
+    return {"error": "User not found"}
 
-# -------------------------
-# 💼 Trade model
-# -------------------------
+# 👇👇👇 Add this to enable trade logging
 class Trade(BaseModel):
-    player_name: str
+    name: str
     version: str
-    buy_price: int
-    sell_price: int
+    buyPrice: int
+    sellPrice: int
     platform: str
+    user_id: str
 
-# -------------------------
-# 📥 Log Trade
-# -------------------------
-@app.post("/api/trade")
-async def log_trade(trade: Trade, request: Request):
-    user = request.session.get("user")
-    if not user:
-        raise HTTPException(status_code=401, detail="Not logged in.")
-
-    discord_id = str(user["id"])
-
-    conn = await asyncpg.connect(DATABASE_URL)
-    await conn.execute("""
-        INSERT INTO trades (player_name, version, buy_price, sell_price, platform, discord_id)
-        VALUES ($1, $2, $3, $4, $5, $6)
-    """, trade.player_name, trade.version, trade.buy_price, trade.sell_price, trade.platform, discord_id)
-    await conn.close()
-
-    return {"message": "✅ Trade logged"}
+@app.post("/logtrade")
+async def log_trade(trade: Trade):
+    try:
+        conn = await asyncpg.connect(DATABASE_URL)
+        await conn.execute(
+            """
+            INSERT INTO trades (user_id, name, version, buy_price, sell_price, platform)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            """,
+            trade.user_id, trade.name, trade.version, trade.buyPrice, trade.sellPrice, trade.platform
+        )
+        await conn.close()
+        return {"status": "success"}
+    except Exception as e:
+        print(f"[ERROR] Trade logging failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to log trade")
