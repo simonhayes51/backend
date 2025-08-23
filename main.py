@@ -22,7 +22,12 @@ app = FastAPI()
 app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # TODO: Lock this to your frontend later
+    allow_origins=[
+        "https://frontend-production-aa68.up.railway.app",
+        "http://localhost:5173",  # For local development
+        "http://localhost:3000",  # Alternative local port
+        "*"  # Remove this once you're sure the specific origins work
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -99,7 +104,7 @@ async def get_dashboard(user_id: str):
 
         tag_count = {}
         for t in trades:
-            tag = t["tag"] or "N/A"
+            tag = t.get("tag", "N/A") or "N/A"  # Safer way to handle missing tag field
             tag_count[tag] = tag_count.get(tag, 0) + 1
         most_used_tag = max(tag_count.items(), key=lambda x: x[1])[0] if tag_count else "N/A"
 
@@ -122,3 +127,8 @@ async def get_dashboard(user_id: str):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# Health check endpoint
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy"}
