@@ -91,7 +91,7 @@ async def get_dashboard(user_id: str):
             user_id,
         )
 
-        # Fetch trades
+        # Fetch latest trades (for recent activity display)
         trades = await conn.fetch(
             "SELECT player, version, buy, sell, quantity, platform, profit, ea_tax, timestamp "
             "FROM trades WHERE user_id=$1 ORDER BY timestamp DESC LIMIT 10",
@@ -103,12 +103,18 @@ async def get_dashboard(user_id: str):
         win_count = len([t for t in trades if t["profit"] and t["profit"] > 0])
         win_rate = round((win_count / len(trades)) * 100, 1) if trades else 0
 
-        tag_count = {}
-        for t in trades:
-            tag = t.get("tag", "N/A") or "N/A"  # Safer way to handle missing tag field
-            tag_count[tag] = tag_count.get(tag, 0) + 1
-        most_used_tag = max(tag_count.items(), key=lambda x: x[1])[0] if tag_count else "N/A"
+        # ✅ FIX: Get most used tag across ALL trades (not just last 10)
+        most_used_tag_row = await conn.fetchrow("""
+            SELECT tag, COUNT(*) AS cnt
+            FROM trades
+            WHERE user_id=$1 AND tag IS NOT NULL AND tag != ''
+            GROUP BY tag
+            ORDER BY cnt DESC
+            LIMIT 1
+        """, user_id)
+        most_used_tag = most_used_tag_row["tag"] if most_used_tag_row else "N/A"
 
+        # Find best trade
         best_trade = max(trades, key=lambda t: t["profit"] or 0, default=None)
 
         await conn.close()
