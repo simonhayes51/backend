@@ -76,17 +76,24 @@ async def callback(request: Request):
             request.session["user_id"] = user_id
             return RedirectResponse(f"https://frontend-production-ab5e.up.railway.app/?user_id={user_id}")
 
-# --- NEW ENDPOINT: Add Trade ---
+# ✅ NEW ENDPOINT: Profile
+@app.get("/api/profile/me")
+async def get_profile(request: Request):
+    """Returns the logged-in user's stats"""
+    user_id = request.query_params.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=400, detail="Missing user_id")
+    return await get_dashboard(user_id)
+
+# Add Trade
 @app.post("/api/add_trade")
 async def add_trade(request: Request):
     try:
         data = await request.json()
-
         required_fields = ["user_id", "player", "version", "buy", "sell", "quantity", "platform", "tag"]
         if not all(field in data for field in required_fields):
             raise HTTPException(status_code=400, detail="Missing required fields")
 
-        # Calculate profit & EA tax
         quantity = int(data["quantity"])
         buy = int(data["buy"])
         sell = int(data["sell"])
@@ -111,7 +118,6 @@ async def add_trade(request: Request):
             data["tag"]
         )
         await conn.close()
-
         return {"message": "Trade added successfully!"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -134,21 +140,17 @@ async def get_dashboard(user_id: str):
             user_id,
         )
 
-        # Calculate win rate
         total_profit = sum(t["profit"] or 0 for t in trades)
         win_count = len([t for t in trades if t["profit"] and t["profit"] > 0])
         win_rate = round((win_count / len(trades)) * 100, 1) if trades else 0
 
-        # Most used tag
         tag_count = {}
         for t in trades:
             tag = t.get("tag", "N/A") or "N/A"
             tag_count[tag] = tag_count.get(tag, 0) + 1
         most_used_tag = max(tag_count.items(), key=lambda x: x[1])[0] if tag_count else "N/A"
 
-        # Best trade
         best_trade = max(trades, key=lambda t: t["profit"] or 0, default=None)
-
         await conn.close()
 
         return {
@@ -157,7 +159,7 @@ async def get_dashboard(user_id: str):
             "startingBalance": portfolio["starting_balance"] if portfolio else 0,
             "trades": [dict(row) for row in trades],
             "profile": {
-                "totalProfit": total_profit,
+                "totalProfit": total_profit or 0,
                 "tradesLogged": len(trades),
                 "winRate": win_rate,
                 "mostUsedTag": most_used_tag,
@@ -167,7 +169,6 @@ async def get_dashboard(user_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# Health check
 @app.get("/health")
 async def health_check():
     return {"status": "healthy"}
