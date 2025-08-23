@@ -76,13 +76,19 @@ async def callback(request: Request):
             request.session["user_id"] = user_id
             return RedirectResponse(f"https://frontend-production-ab5e.up.railway.app/?user_id={user_id}")
 
-# ✅ NEW ENDPOINT: Profile
+# ✅ Existing profile endpoint (query param style)
 @app.get("/api/profile/me")
 async def get_profile(request: Request):
     """Returns the logged-in user's stats"""
     user_id = request.query_params.get("user_id")
     if not user_id:
         raise HTTPException(status_code=400, detail="Missing user_id")
+    return await get_dashboard(user_id)
+
+# ✅ NEW endpoint to fix frontend 404s
+@app.get("/api/profile/{user_id}")
+async def get_profile_by_id(user_id: str):
+    """Returns a user's stats using /api/profile/<user_id>"""
     return await get_dashboard(user_id)
 
 # Add Trade
@@ -128,6 +134,7 @@ async def get_dashboard(user_id: str):
     try:
         conn = await get_db()
 
+        # Fetch stats
         portfolio = await conn.fetchrow("SELECT starting_balance FROM portfolio WHERE user_id=$1", user_id)
         stats = await conn.fetchrow(
             "SELECT COALESCE(SUM(profit),0) AS total_profit, COALESCE(SUM(ea_tax),0) AS total_tax FROM trades WHERE user_id=$1",
@@ -140,16 +147,19 @@ async def get_dashboard(user_id: str):
             user_id,
         )
 
+        # Calculate performance
         total_profit = sum(t["profit"] or 0 for t in trades)
         win_count = len([t for t in trades if t["profit"] and t["profit"] > 0])
         win_rate = round((win_count / len(trades)) * 100, 1) if trades else 0
 
+        # Tags usage
         tag_count = {}
         for t in trades:
             tag = t.get("tag", "N/A") or "N/A"
             tag_count[tag] = tag_count.get(tag, 0) + 1
         most_used_tag = max(tag_count.items(), key=lambda x: x[1])[0] if tag_count else "N/A"
 
+        # Best trade
         best_trade = max(trades, key=lambda t: t["profit"] or 0, default=None)
         await conn.close()
 
@@ -169,6 +179,7 @@ async def get_dashboard(user_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# Health check
 @app.get("/health")
 async def health_check():
     return {"status": "healthy"}
