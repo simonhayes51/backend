@@ -76,22 +76,71 @@ async def callback(request: Request):
             request.session["user_id"] = user_id
             return RedirectResponse(f"https://frontend-production-ab5e.up.railway.app/?user_id={user_id}")
 
-# ✅ Existing profile endpoint (query param style)
+# ✅ Dashboard Logic
+async def fetch_dashboard(user_id: str):
+    try:
+        conn = await get_db()
+
+        portfolio = await conn.fetchrow("SELECT starting_balance FROM portfolio WHERE user_id=$1", user_id)
+        stats = await conn.fetchrow(
+            "SELECT COALESCE(SUM(profit),0) AS total_profit, COALESCE(SUM(ea_tax),0) AS total_tax FROM trades WHERE user_id=$1",
+            user_id,
+        )
+
+        trades = await conn.fetch(
+            "SELECT player, version, buy, sell, quantity, platform, profit, ea_tax, tag, timestamp "
+            "FROM trades WHERE user_id=$1 ORDER BY timestamp DESC LIMIT 10",
+            user_id,
+        )
+
+        total_profit = sum(t["profit"] or 0 for t in trades)
+        win_count = len([t for t in trades if t["profit"] and t["profit"] > 0])
+        win_rate = round((win_count / len(trades)) * 100, 1) if trades else 0
+
+        tag_count = {}
+        for t in trades:
+            tag = t.get("tag", "N/A") or "N/A"
+            tag_count[tag] = tag_count.get(tag, 0) + 1
+        most_used_tag = max(tag_count.items(), key=lambda x: x[1])[0] if tag_count else "N/A"
+
+        best_trade = max(trades, key=lambda t: t["profit"] or 0, default=None)
+        await conn.close()
+
+        return {
+            "netProfit": stats["total_profit"] or 0,
+            "taxPaid": stats["total_tax"] or 0,
+            "startingBalance": portfolio["starting_balance"] if portfolio else 0,
+            "trades": [dict(row) for row in trades],
+            "profile": {
+                "totalProfit": total_profit,
+                "tradesLogged": len(trades),
+                "winRate": win_rate,
+                "mostUsedTag": most_used_tag,
+                "bestTrade": dict(best_trade) if best_trade else None,
+            }
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ✅ Main Dashboard Endpoint
+@app.get("/api/dashboard/{user_id}")
+async def get_dashboard(user_id: str):
+    return await fetch_dashboard(user_id)
+
+# ✅ Fixes frontend 404 issue
+@app.get("/api/profile/{user_id}")
+async def get_profile_by_id(user_id: str):
+    return await fetch_dashboard(user_id)
+
+# ✅ /api/profile/me — Still supported
 @app.get("/api/profile/me")
-async def get_profile(request: Request):
-    """Returns the logged-in user's stats"""
+async def get_profile_me(request: Request):
     user_id = request.query_params.get("user_id")
     if not user_id:
         raise HTTPException(status_code=400, detail="Missing user_id")
-    return await get_dashboard(user_id)
+    return await fetch_dashboard(user_id)
 
-# ✅ NEW endpoint to fix frontend 404s
-@app.get("/api/profile/{user_id}")
-async def get_profile_by_id(user_id: str):
-    """Returns a user's stats using /api/profile/<user_id>"""
-    return await get_dashboard(user_id)
-
-# Add Trade
+# ✅ Add Trade
 @app.post("/api/add_trade")
 async def add_trade(request: Request):
     try:
@@ -128,58 +177,6 @@ async def add_trade(request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# Dashboard Endpoint
-@app.get("/api/dashboard/{user_id}")
-async def get_dashboard(user_id: str):
-    try:
-        conn = await get_db()
-
-        # Fetch stats
-        portfolio = await conn.fetchrow("SELECT starting_balance FROM portfolio WHERE user_id=$1", user_id)
-        stats = await conn.fetchrow(
-            "SELECT COALESCE(SUM(profit),0) AS total_profit, COALESCE(SUM(ea_tax),0) AS total_tax FROM trades WHERE user_id=$1",
-            user_id,
-        )
-
-        trades = await conn.fetch(
-            "SELECT player, version, buy, sell, quantity, platform, profit, ea_tax, tag, timestamp "
-            "FROM trades WHERE user_id=$1 ORDER BY timestamp DESC LIMIT 10",
-            user_id,
-        )
-
-        # Calculate performance
-        total_profit = sum(t["profit"] or 0 for t in trades)
-        win_count = len([t for t in trades if t["profit"] and t["profit"] > 0])
-        win_rate = round((win_count / len(trades)) * 100, 1) if trades else 0
-
-        # Tags usage
-        tag_count = {}
-        for t in trades:
-            tag = t.get("tag", "N/A") or "N/A"
-            tag_count[tag] = tag_count.get(tag, 0) + 1
-        most_used_tag = max(tag_count.items(), key=lambda x: x[1])[0] if tag_count else "N/A"
-
-        # Best trade
-        best_trade = max(trades, key=lambda t: t["profit"] or 0, default=None)
-        await conn.close()
-
-        return {
-            "netProfit": stats["total_profit"] or 0,
-            "taxPaid": stats["total_tax"] or 0,
-            "startingBalance": portfolio["starting_balance"] if portfolio else 0,
-            "trades": [dict(row) for row in trades],
-            "profile": {
-                "totalProfit": total_profit or 0,
-                "tradesLogged": len(trades),
-                "winRate": win_rate,
-                "mostUsedTag": most_used_tag,
-                "bestTrade": dict(best_trade) if best_trade else None,
-            }
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Health check
 @app.get("/health")
 async def health_check():
     return {"status": "healthy"}
