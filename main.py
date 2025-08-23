@@ -23,7 +23,7 @@ app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://frontend-production-aa68.up.railway.app",
+        "https://frontend-production-ab5e.up.railway.app",  # Updated to correct URL
         "http://localhost:5173",  # For local development
         "http://localhost:3000",  # Alternative local port
         "*"  # Remove this once you're sure the specific origins work
@@ -75,7 +75,8 @@ async def callback(request: Request):
             user_data = await resp.json()
             user_id = user_data["id"]
             request.session["user_id"] = user_id
-            return RedirectResponse(f"https://frontend-production-aa68.up.railway.app/?user_id={user_id}")
+            # Updated to correct frontend URL
+            return RedirectResponse(f"https://frontend-production-ab5e.up.railway.app/?user_id={user_id}")
 
 # --- Unified Dashboard Endpoint ---
 @app.get("/api/dashboard/{user_id}")
