@@ -142,8 +142,8 @@ async def add_trade(request: Request):
         if not all(field in data for field in required_fields):
             raise HTTPException(status_code=400, detail="Missing required fields")
 
-        profit = (data["sell"] - data["buy"]) * data["quantity"]
-        ea_tax = int((data["sell"] * data["quantity"]) * 0.05)  # 5% EA tax
+        profit = (int(data["sell"]) - int(data["buy"])) * int(data["quantity"])
+        ea_tax = int((int(data["sell"]) * int(data["quantity"])) * 0.05)
 
         conn = await get_db()
         await conn.execute(
@@ -151,15 +151,14 @@ async def add_trade(request: Request):
             INSERT INTO trades (user_id, player, version, buy, sell, quantity, platform, profit, ea_tax, tag, timestamp)
             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
             """,
-            data["user_id"], data["player"], data["version"], data["buy"], data["sell"],
-            data["quantity"], data["platform"], profit, ea_tax, data["tag"]
+            data["user_id"], data["player"], data["version"], int(data["buy"]), int(data["sell"]),
+            int(data["quantity"]), data["platform"], profit, ea_tax, data["tag"]
         )
         await conn.close()
 
         return {"message": "Trade added successfully!"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 # Health check
 @app.get("/health")
 async def health_check():
