@@ -43,12 +43,16 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+# Get port from Railway environment
+PORT = int(os.getenv("PORT", 8000))
+
 # Middleware
 app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         FRONTEND_URL,
+        "https://*.railway.app",  # Allow all Railway domains
         "http://localhost:5173",
         "http://localhost:3000",
     ],
@@ -303,4 +307,22 @@ async def delete_trade(
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "database": "connected" if pool else "disconnected"}
+    try:
+        # Test database connection
+        if pool:
+            async with pool.acquire() as conn:
+                await conn.fetchval("SELECT 1")
+            return {"status": "healthy", "database": "connected"}
+        else:
+            return {"status": "unhealthy", "database": "disconnected"}
+    except Exception as e:
+        return {"status": "unhealthy", "database": "disconnected", "error": str(e)}
+
+@app.get("/")
+async def root():
+    return {"message": "FUT Dashboard API", "status": "healthy"}
+
+# For Railway deployment
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
