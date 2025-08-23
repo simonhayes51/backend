@@ -1,7 +1,6 @@
 fastapi
-uvicorn
+uvicorn[standard]
 asyncpg
-python-dotenv
-authlib
 aiohttp
-itsdangerous
+python-dotenv
+python-multipart
