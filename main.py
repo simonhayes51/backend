@@ -23,10 +23,10 @@ app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://frontend-production-ab5e.up.railway.app",  # Updated to correct URL
-        "http://localhost:5173",  # For local development
-        "http://localhost:3000",  # Alternative local port
-        "*"  # Remove this once you're sure the specific origins work
+        "https://frontend-production-ab5e.up.railway.app",
+        "http://localhost:5173",
+        "http://localhost:3000",
+        "*"
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -67,7 +67,6 @@ async def callback(request: Request):
                 raise HTTPException(status_code=400, detail="OAuth failed")
             access_token = token_data["access_token"]
 
-        # Fetch Discord user info
         async with session.get(
             "https://discord.com/api/users/@me",
             headers={"Authorization": f"Bearer {access_token}"}
@@ -75,25 +74,24 @@ async def callback(request: Request):
             user_data = await resp.json()
             user_id = user_data["id"]
             request.session["user_id"] = user_id
-            # Updated to correct frontend URL
             return RedirectResponse(f"https://frontend-production-ab5e.up.railway.app/?user_id={user_id}")
 
-# --- Unified Dashboard Endpoint ---
+# --- Dashboard Endpoint ---
 @app.get("/api/dashboard/{user_id}")
 async def get_dashboard(user_id: str):
     try:
         conn = await get_db()
 
-        # Fetch portfolio + stats
+        # Portfolio & Stats
         portfolio = await conn.fetchrow("SELECT starting_balance FROM portfolio WHERE user_id=$1", user_id)
         stats = await conn.fetchrow(
             "SELECT COALESCE(SUM(profit),0) AS total_profit, COALESCE(SUM(ea_tax),0) AS total_tax FROM trades WHERE user_id=$1",
             user_id,
         )
 
-        # Fetch latest trades (for recent activity display)
+        # Fetch trades
         trades = await conn.fetch(
-            "SELECT player, version, buy, sell, quantity, platform, profit, ea_tax, timestamp "
+            "SELECT player, version, buy, sell, quantity, platform, profit, ea_tax, tag, timestamp "
             "FROM trades WHERE user_id=$1 ORDER BY timestamp DESC LIMIT 10",
             user_id,
         )
@@ -103,18 +101,17 @@ async def get_dashboard(user_id: str):
         win_count = len([t for t in trades if t["profit"] and t["profit"] > 0])
         win_rate = round((win_count / len(trades)) * 100, 1) if trades else 0
 
-        # ✅ FIX: Get most used tag across ALL trades (not just last 10)
-        most_used_tag_row = await conn.fetchrow("""
-            SELECT tag, COUNT(*) AS cnt
-            FROM trades
-            WHERE user_id=$1 AND tag IS NOT NULL AND tag != ''
-            GROUP BY tag
-            ORDER BY cnt DESC
-            LIMIT 1
-        """, user_id)
-        most_used_tag = most_used_tag_row["tag"] if most_used_tag_row else "N/A"
+        # Most used tag with count
+        tag_count = {}
+        for t in trades:
+            tag = t.get("tag", "N/A") or "N/A"
+            tag_count[tag] = tag_count.get(tag, 0) + 1
 
-        # Find best trade
+        if tag_count:
+            most_used_tag, tag_trades = max(tag_count.items(), key=lambda x: x[1])
+        else:
+            most_used_tag, tag_trades = "N/A", 0
+
         best_trade = max(trades, key=lambda t: t["profit"] or 0, default=None)
 
         await conn.close()
@@ -129,13 +126,41 @@ async def get_dashboard(user_id: str):
                 "tradesLogged": len(trades),
                 "winRate": win_rate,
                 "mostUsedTag": most_used_tag,
+                "tagTrades": tag_trades,
                 "bestTrade": dict(best_trade) if best_trade else None,
             }
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# Health check endpoint
+# --- Add Trade Endpoint ---
+@app.post("/api/add_trade")
+async def add_trade(request: Request):
+    try:
+        data = await request.json()
+        required_fields = ["user_id", "player", "version", "buy", "sell", "quantity", "platform", "tag"]
+        if not all(field in data for field in required_fields):
+            raise HTTPException(status_code=400, detail="Missing required fields")
+
+        profit = (data["sell"] - data["buy"]) * data["quantity"]
+        ea_tax = int((data["sell"] * data["quantity"]) * 0.05)  # 5% EA tax
+
+        conn = await get_db()
+        await conn.execute(
+            """
+            INSERT INTO trades (user_id, player, version, buy, sell, quantity, platform, profit, ea_tax, tag, timestamp)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
+            """,
+            data["user_id"], data["player"], data["version"], data["buy"], data["sell"],
+            data["quantity"], data["platform"], profit, ea_tax, data["tag"]
+        )
+        await conn.close()
+
+        return {"message": "Trade added successfully!"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Health check
 @app.get("/health")
 async def health_check():
     return {"status": "healthy"}
