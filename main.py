@@ -72,18 +72,14 @@ async def get_discord_user_info(access_token: str):
 
 async def check_server_membership(user_id: str):
     """Check if user is a member of the required Discord server"""
-    if not DISCORD_BOT_TOKEN or not DISCORD_SERVER_ID:
-        return True  # Skip check if not configured
-    
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
                 f"https://discord.com/api/guilds/{DISCORD_SERVER_ID}/members/{user_id}",
                 headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"}
             ) as resp:
-                return resp.status == 200
+                return resp.status == 200  # 200 = member, 404 = not member
     except Exception as e:
-        logging.error(f"Server membership check failed: {e}")
         return False  # Deny access on error
 
 @asynccontextmanager
