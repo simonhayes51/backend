@@ -17,7 +17,6 @@ import requests
 from bs4 import BeautifulSoup
 from fastapi import HTTPException
 from fastapi import Query
-app = FastAPI()
 
 load_dotenv()
 
