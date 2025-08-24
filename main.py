@@ -192,12 +192,16 @@ async def login():
 
 #Pricecheck Module
 @app.get("/api/pricecheck")
-async def price_check(player_name: str = Query(...), platform: str = Query("console")):
-    """
-    Scrapes Futbin for a player's price.
-    Works with Console (PS/Xbox) or PC.
-    """
+async def price_check(
+    player_name: str = Query(...), 
+    platform: str = Query("console"),
+    user_id: str = Depends(get_current_user)
+):
+    print(f"Pricecheck request: '{player_name}', platform: '{platform}'")
+    print(f"PLAYERS_DB loaded: {len(PLAYERS_DB) if PLAYERS_DB else 0} players")
+    
     try:
+        # Your existing search logic
         headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -206,26 +210,22 @@ async def price_check(player_name: str = Query(...), platform: str = Query("cons
             )
         }
 
-        # Search FUTBIN for the player ID
-        search_url = f"https://www.futbin.com/search?term={player_name.replace(' ', '%20')}"
-        resp = requests.get(search_url, headers=headers)
-        if resp.status_code != 200:
-            raise HTTPException(status_code=500, detail="Futbin search failed")
-
-        try:
-            players = resp.json()
-        except:
-            raise HTTPException(status_code=404, detail="Player not found or Futbin returned invalid data")
-
-        if not players:
-            raise HTTPException(status_code=404, detail="No player found with that name")
-
-        # Get the first player match
-        player_id = players[0]["id"]
-        player_url = f"https://www.futbin.com/25/player/{player_id}"
-        player_resp = requests.get(player_url, headers=headers)
-        if player_resp.status_code != 200:
-            raise HTTPException(status_code=500, detail="Failed to load player page")
+        # Search for player in PLAYERS_DB first
+        player_match = None
+        search_term = player_name.lower()
+        
+        for player in PLAYERS_DB:
+            if search_term in f"{player['name']} {player['rating']}".lower():
+                player_match = player
+                break
+        
+        print(f"Player match found: {player_match is not None}")
+        
+        if not player_match:
+            raise HTTPException(status_code=404, detail="Player not found in database")
+        
+        # Continue with your FUTBIN scraping using player_match['id']
+        # ...
 
         soup = BeautifulSoup(player_resp.text, "html.parser")
 
