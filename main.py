@@ -10,7 +10,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
-
+from pydantic import BaseModel
+from typing import List, Optional
+import logging
+import requests
 
 load_dotenv()
 app = FastAPI()
