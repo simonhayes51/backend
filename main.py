@@ -190,7 +190,8 @@ async def login():
 
 #Pricecheck Module
 @app.get("/api/pricecheck")
-async def price_check(player_name: str, platform: str = "console"):
+async def price_check(player: str, platform: str = Query("console")):
+    # You can use platform later if needed
     """
     Scrapes Futbin for a player's price.
     Works with Console (PS/Xbox) or PC.
