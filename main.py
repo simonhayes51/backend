@@ -288,12 +288,16 @@ async def get_user_settings(
             user_id
         )
         
+        # Always merge with defaults to ensure all fields exist
+        default_settings = UserSettings().dict()
+        
         if settings:
-            return settings["settings"]
+            # Merge saved settings with defaults
+            saved_settings = settings["settings"]
+            merged_settings = {**default_settings, **saved_settings}
+            return merged_settings
         else:
-            # Return default settings
-            default_settings = UserSettings()
-            return default_settings.dict()
+            return default_settings
     except Exception as e:
         raise HTTPException(status_code=500, detail="Failed to fetch settings")
 
