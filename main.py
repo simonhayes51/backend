@@ -137,9 +137,14 @@ async def lifespan(app: FastAPI):
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_user_settings_user_id ON user_settings(user_id)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_user_profiles_user_id ON user_profiles(user_id)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_trading_goals_user_id ON trading_goals(user_id)")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_date ON trades(user_id, DATE(timestamp))")
+        
+        # 🔧 trades indexes
+        # Safe composite index for user + time filtering/sorting
+        await conn.execute("DROP INDEX IF EXISTS idx_trades_date")  # remove bad expression index if it exists
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_user_ts ON trades(user_id, timestamp)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_tag ON trades(user_id, tag)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_platform ON trades(user_id, platform)")
+
     
     yield
     # Shutdown
