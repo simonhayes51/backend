@@ -29,6 +29,10 @@ DISCORD_REDIRECT_URI = os.getenv("DISCORD_REDIRECT_URI")
 SECRET_KEY = os.getenv("SECRET_KEY")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://frontend-production-ab5e.up.railway.app")
 
+# New Discord server verification variables
+DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+DISCORD_SERVER_ID = os.getenv("DISCORD_SERVER_ID")
+
 if not SECRET_KEY:
     raise ValueError("SECRET_KEY environment variable is required")
 
@@ -44,8 +48,43 @@ class UserSettings(BaseModel):
     default_chart_range: Optional[str] = "30d"  # 7d, 30d, 90d, all
     visible_widgets: Optional[List[str]] = ["profit", "tax", "balance", "trades"]
 
+class TradingGoal(BaseModel):
+    title: str
+    target_amount: int
+    target_date: Optional[str] = None
+    goal_type: str = "profit"  # profit, trades_count, win_rate
+    is_completed: bool = False
+
 # Global connection pool
 pool = None
+
+# Discord API helpers
+async def get_discord_user_info(access_token: str):
+    """Get detailed Discord user info including avatar"""
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            "https://discord.com/api/users/@me",
+            headers={"Authorization": f"Bearer {access_token}"}
+        ) as resp:
+            if resp.status != 200:
+                return None
+            return await resp.json()
+
+async def check_server_membership(user_id: str):
+    """Check if user is a member of the required Discord server"""
+    if not DISCORD_BOT_TOKEN or not DISCORD_SERVER_ID:
+        return True  # Skip check if not configured
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"https://discord.com/api/guilds/{DISCORD_SERVER_ID}/members/{user_id}",
+                headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"}
+            ) as resp:
+                return resp.status == 200
+    except Exception as e:
+        logging.error(f"Server membership check failed: {e}")
+        return False  # Deny access on error
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -53,8 +92,9 @@ async def lifespan(app: FastAPI):
     global pool
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
     
-    # Create user_settings table
+    # Create all required tables
     async with pool.acquire() as conn:
+        # User settings table
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS user_settings (
                 id SERIAL PRIMARY KEY,
@@ -64,9 +104,42 @@ async def lifespan(app: FastAPI):
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        
+        # User profiles table for Discord info
         await conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_user_settings_user_id ON user_settings(user_id)
+            CREATE TABLE IF NOT EXISTS user_profiles (
+                id SERIAL PRIMARY KEY,
+                user_id VARCHAR(255) UNIQUE NOT NULL,
+                username VARCHAR(255),
+                avatar_url TEXT,
+                global_name VARCHAR(255),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
         """)
+        
+        # Trading goals table
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS trading_goals (
+                id SERIAL PRIMARY KEY,
+                user_id VARCHAR(255) NOT NULL,
+                title VARCHAR(255) NOT NULL,
+                target_amount INTEGER NOT NULL,
+                target_date DATE,
+                goal_type VARCHAR(50) DEFAULT 'profit',
+                is_completed BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                completed_at TIMESTAMP
+            )
+        """)
+        
+        # Create indexes
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_user_settings_user_id ON user_settings(user_id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_user_profiles_user_id ON user_profiles(user_id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_trading_goals_user_id ON trading_goals(user_id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_date ON trades(user_id, DATE(timestamp))")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_tag ON trades(user_id, tag)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_platform ON trades(user_id, platform)")
     
     yield
     # Shutdown
@@ -111,6 +184,7 @@ async def login():
         f"https://discord.com/oauth2/authorize?client_id={DISCORD_CLIENT_ID}&redirect_uri={DISCORD_REDIRECT_URI}&response_type=code&scope=identify"
     )
 
+# Enhanced OAuth callback with server verification
 @app.get("/api/callback")
 async def callback(request: Request):
     code = request.query_params.get("code")
@@ -129,6 +203,7 @@ async def callback(request: Request):
 
     try:
         async with aiohttp.ClientSession() as session:
+            # Get access token
             async with session.post(token_url, data=data, headers=headers) as resp:
                 if resp.status != 200:
                     raise HTTPException(status_code=400, detail="OAuth token exchange failed")
@@ -138,26 +213,48 @@ async def callback(request: Request):
                     raise HTTPException(status_code=400, detail="OAuth failed")
                 access_token = token_data["access_token"]
 
-            async with session.get(
-                "https://discord.com/api/users/@me",
-                headers={"Authorization": f"Bearer {access_token}"}
-            ) as resp:
-                if resp.status != 200:
-                    raise HTTPException(status_code=400, detail="Failed to fetch user data")
-                user_data = await resp.json()
-                user_id = user_data["id"]
+            # Get detailed user info
+            user_data = await get_discord_user_info(access_token)
+            if not user_data:
+                raise HTTPException(status_code=400, detail="Failed to fetch user data")
                 
-                # Store in session
-                request.session["user_id"] = user_id
+            user_id = user_data["id"]
+            
+            # Check server membership
+            is_member = await check_server_membership(user_id)
+            if not is_member:
+                return RedirectResponse(f"{FRONTEND_URL}/access-denied")
+            
+            # Store user info in session
+            username = f"{user_data['username']}#{user_data.get('discriminator', '0000')}"
+            avatar_url = f"https://cdn.discordapp.com/avatars/{user_id}/{user_data['avatar']}.png" if user_data.get('avatar') else f"https://cdn.discordapp.com/embed/avatars/{int(user_data.get('discriminator', '0')) % 5}.png"
+            global_name = user_data.get('global_name') or user_data['username']
+            
+            request.session["user_id"] = user_id
+            request.session["username"] = username
+            request.session["avatar_url"] = avatar_url
+            request.session["global_name"] = global_name
+            
+            # Initialize user's portfolio and profile
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO portfolio (user_id, starting_balance) VALUES ($1, $2) ON CONFLICT (user_id) DO NOTHING",
+                    user_id, 0
+                )
                 
-                # Initialize user's portfolio if it doesn't exist
-                async with pool.acquire() as conn:
-                    await conn.execute(
-                        "INSERT INTO portfolio (user_id, starting_balance) VALUES ($1, $2) ON CONFLICT (user_id) DO NOTHING",
-                        user_id, 0
-                    )
-                
-                return RedirectResponse(f"{FRONTEND_URL}/?authenticated=true")
+                # Store/update user profile
+                await conn.execute(
+                    """
+                    INSERT INTO user_profiles (user_id, username, avatar_url, global_name, updated_at) 
+                    VALUES ($1, $2, $3, $4, NOW())
+                    ON CONFLICT (user_id) 
+                    DO UPDATE SET username = $2, avatar_url = $3, global_name = $4, updated_at = NOW()
+                    """,
+                    user_id, username, avatar_url, global_name
+                )
+            
+            return RedirectResponse(f"{FRONTEND_URL}/?authenticated=true")
+            
     except Exception as e:
         logging.error(f"OAuth error: {e}")
         raise HTTPException(status_code=500, detail="Authentication failed")
@@ -167,9 +264,16 @@ async def logout(request: Request):
     request.session.clear()
     return {"message": "Logged out successfully"}
 
+# Enhanced user info endpoint
 @app.get("/api/me")
-async def get_current_user_info(user_id: str = Depends(get_current_user)):
-    return {"user_id": user_id, "authenticated": True}
+async def get_current_user_info(request: Request, user_id: str = Depends(get_current_user)):
+    return {
+        "user_id": user_id,
+        "username": request.session.get("username"),
+        "avatar_url": request.session.get("avatar_url"),
+        "global_name": request.session.get("global_name"),
+        "authenticated": True
+    }
 
 # Settings endpoints
 @app.get("/api/settings")
@@ -231,6 +335,158 @@ async def update_starting_balance(
         return {"message": "Starting balance updated successfully"}
     except Exception as e:
         raise HTTPException(status_code=500, detail="Failed to update starting balance")
+
+# Trading goals endpoints
+@app.get("/api/goals")
+async def get_trading_goals(
+    user_id: str = Depends(get_current_user),
+    conn = Depends(get_db)
+):
+    try:
+        goals = await conn.fetch(
+            "SELECT * FROM trading_goals WHERE user_id=$1 ORDER BY created_at DESC",
+            user_id
+        )
+        return {"goals": [dict(goal) for goal in goals]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Failed to fetch goals")
+
+@app.post("/api/goals")
+async def create_trading_goal(
+    goal: TradingGoal,
+    user_id: str = Depends(get_current_user),
+    conn = Depends(get_db)
+):
+    try:
+        await conn.execute(
+            """
+            INSERT INTO trading_goals (user_id, title, target_amount, target_date, goal_type, is_completed, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, NOW())
+            """,
+            user_id, goal.title, goal.target_amount, goal.target_date, goal.goal_type, goal.is_completed
+        )
+        return {"message": "Goal created successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Failed to create goal")
+
+# Advanced analytics endpoint
+@app.get("/api/analytics/advanced")
+async def get_advanced_analytics(
+    user_id: str = Depends(get_current_user),
+    conn = Depends(get_db)
+):
+    try:
+        # Daily profit trend (last 30 days)
+        daily_profits = await conn.fetch("""
+            SELECT 
+                DATE(timestamp) as date,
+                COALESCE(SUM(profit), 0) as daily_profit,
+                COUNT(*) as trades_count
+            FROM trades 
+            WHERE user_id=$1 AND timestamp >= NOW() - INTERVAL '30 days'
+            GROUP BY DATE(timestamp)
+            ORDER BY date
+        """, user_id)
+        
+        # Tag performance analysis
+        tag_performance = await conn.fetch("""
+            SELECT 
+                tag,
+                COUNT(*) as trade_count,
+                COALESCE(SUM(profit), 0) as total_profit,
+                COALESCE(AVG(profit), 0) as avg_profit,
+                COUNT(CASE WHEN profit > 0 THEN 1 END) * 100.0 / COUNT(*) as win_rate
+            FROM trades 
+            WHERE user_id=$1 AND tag IS NOT NULL AND tag != ''
+            GROUP BY tag
+            ORDER BY total_profit DESC
+        """, user_id)
+        
+        # Platform comparison
+        platform_stats = await conn.fetch("""
+            SELECT 
+                platform,
+                COUNT(*) as trade_count,
+                COALESCE(SUM(profit), 0) as total_profit,
+                COALESCE(AVG(profit), 0) as avg_profit
+            FROM trades 
+            WHERE user_id=$1 
+            GROUP BY platform
+        """, user_id)
+        
+        # Monthly summary
+        monthly_summary = await conn.fetch("""
+            SELECT 
+                DATE_TRUNC('month', timestamp) as month,
+                COUNT(*) as trades_count,
+                COALESCE(SUM(profit), 0) as total_profit,
+                COALESCE(SUM(ea_tax), 0) as total_tax
+            FROM trades 
+            WHERE user_id=$1
+            GROUP BY DATE_TRUNC('month', timestamp)
+            ORDER BY month DESC
+            LIMIT 12
+        """, user_id)
+        
+        return {
+            "daily_profits": [dict(row) for row in daily_profits],
+            "tag_performance": [dict(row) for row in tag_performance],
+            "platform_stats": [dict(row) for row in platform_stats],
+            "monthly_summary": [dict(row) for row in monthly_summary]
+        }
+    except Exception as e:
+        logging.error(f"Advanced analytics error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch analytics")
+
+# Bulk trade operations
+@app.put("/api/trades/bulk")
+async def bulk_edit_trades(
+    request: Request,
+    user_id: str = Depends(get_current_user),
+    conn = Depends(get_db)
+):
+    try:
+        data = await request.json()
+        trade_ids = data.get('trade_ids', [])
+        updates = data.get('updates', {})
+        
+        if not trade_ids or not updates:
+            raise HTTPException(status_code=400, detail="trade_ids and updates required")
+        
+        # Build dynamic update query
+        set_clauses = []
+        params = []
+        param_count = 1
+        
+        if 'tag' in updates:
+            set_clauses.append(f"tag = ${param_count}")
+            params.append(updates['tag'])
+            param_count += 1
+            
+        if 'platform' in updates:
+            set_clauses.append(f"platform = ${param_count}")
+            params.append(updates['platform'])
+            param_count += 1
+        
+        if not set_clauses:
+            raise HTTPException(status_code=400, detail="No valid updates provided")
+        
+        # Add user_id and trade_ids to params
+        params.extend([user_id, trade_ids])
+        
+        query = f"""
+            UPDATE trades 
+            SET {', '.join(set_clauses)}
+            WHERE user_id = ${param_count} AND id = ANY(${param_count + 1})
+        """
+        
+        result = await conn.execute(query, *params)
+        
+        return {"message": f"Updated {len(trade_ids)} trades successfully"}
+        
+    except Exception as e:
+        logging.error(f"Bulk edit error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to update trades")
 
 # Data export endpoints
 @app.get("/api/export/trades")
