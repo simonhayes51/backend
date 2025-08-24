@@ -63,6 +63,27 @@ class TradingGoal(BaseModel):
 # Global connection pool
 pool = None
 
+# Add this global variable near the top with your other globals
+PLAYERS_DB = []
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    global pool, PLAYERS_DB
+    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+    
+    # Add this players loading code
+    try:
+        with open("players_temp.json", "r", encoding="utf-8") as f:
+            PLAYERS_DB = json.load(f)
+            print(f"SUCCESS: Loaded {len(PLAYERS_DB)} players")
+    except FileNotFoundError:
+        print("ERROR: players_temp.json not found")
+        PLAYERS_DB = []
+    except Exception as e:
+        print(f"ERROR loading players: {e}")
+        PLAYERS_DB = []
+
 # Discord API helpers
 async def get_discord_user_info(access_token: str):
     """Get detailed Discord user info including avatar"""
