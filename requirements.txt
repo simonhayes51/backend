@@ -8,4 +8,5 @@ pydantic==2.4.0
 itsdangerous
 matplotlib
 requests
-bs4
+beautifulsoup4
+httpx
