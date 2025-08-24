@@ -15,6 +15,7 @@ from typing import List, Optional
 import logging
 import requests
 from bs4 import BeautifulSoup
+from fastapi import HTTPException
 
 load_dotenv()
 
@@ -191,37 +192,43 @@ async def login():
 @app.get("/api/pricecheck")
 async def price_check(player_name: str, platform: str = "console"):
     """
-    Fetch the current FUTBIN price for a player by scraping their page.
-    player_name: Player's name as entered by the user.
-    platform: 'console' or 'pc'
+    Scrapes Futbin for a player's price.
+    Works with Console (PS/Xbox) or PC.
     """
     try:
-        # Format player name for URL search
-        search_name = player_name.replace(" ", "+").lower()
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/115.0.0.0 Safari/537.36"
+        }
 
-        # Search FUTBIN for the player
-        search_url = f"https://www.futbin.com/search?term={search_name}"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        search_resp = requests.get(search_url, headers=headers)
+        # Search for the player on Futbin
+        search_url = f"https://www.futbin.com/search?term={player_name.replace(' ', '%20')}"
+        resp = requests.get(search_url, headers=headers)
 
-        if search_resp.status_code != 200:
-            raise HTTPException(status_code=500, detail="Failed to fetch player data")
+        if resp.status_code != 200:
+            raise HTTPException(status_code=500, detail="Futbin search failed")
 
-        search_results = search_resp.json()
-        if not search_results:
-            raise HTTPException(status_code=404, detail="Player not found")
+        # Parse JSON response from search
+        try:
+            players = resp.json()
+        except:
+            raise HTTPException(status_code=404, detail="Player not found or Futbin returned unexpected data")
 
-        # Use the first search result
-        player_id = search_results[0]["id"]
+        if not players:
+            raise HTTPException(status_code=404, detail="No player found with that name")
+
+        # Use first player result
+        player_id = players[0]["id"]
         player_url = f"https://www.futbin.com/25/player/{player_id}"
-        page_resp = requests.get(player_url, headers=headers)
+        player_resp = requests.get(player_url, headers=headers)
 
-        if page_resp.status_code != 200:
+        if player_resp.status_code != 200:
             raise HTTPException(status_code=500, detail="Failed to load player page")
 
-        soup = BeautifulSoup(page_resp.text, "html.parser")
+        soup = BeautifulSoup(player_resp.text, "html.parser")
 
-        # Find price container based on platform
+        # Choose platform price container
         platform_map = {
             "console": "ps",
             "xbox": "xbox",
@@ -229,13 +236,13 @@ async def price_check(player_name: str, platform: str = "console"):
         }
         platform_key = platform_map.get(platform.lower(), "ps")
 
-        price_div = soup.find("div", {"id": f"ps" if platform_key == "ps" else platform_key})
+        price_div = soup.find("div", {"id": platform_key})
         if not price_div:
             raise HTTPException(status_code=404, detail="Price not available")
 
         return {
-            "player": search_results[0]["full_name"],
-            "rating": search_results[0]["rating"],
+            "player": players[0]["full_name"],
+            "rating": players[0]["rating"],
             "price": price_div.text.strip(),
             "platform": platform
         }
@@ -243,7 +250,7 @@ async def price_check(player_name: str, platform: str = "console"):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error fetching price: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
 # Enhanced OAuth callback with server verification
 @app.get("/api/callback")
