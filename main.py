@@ -14,6 +14,12 @@ from pydantic import BaseModel
 from typing import List, Optional
 import logging
 
+# ---------- NEW: extra imports for OAuth (extension) + JWT ----------
+import time, secrets, jwt
+from types import SimpleNamespace
+from urllib.parse import urlencode
+# -------------------------------------------------------------------
+
 load_dotenv()
 
 # Environment variable validation
@@ -29,6 +35,18 @@ DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
 DISCORD_REDIRECT_URI = os.getenv("DISCORD_REDIRECT_URI")
 SECRET_KEY = os.getenv("SECRET_KEY")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://frontend-production-ab5e.up.railway.app")
+
+# ---------- NEW: JWT + Discord endpoints for extension ----------
+JWT_PRIVATE_KEY = os.getenv("JWT_PRIVATE_KEY", "dev-secret-change-me")  # set on Railway
+JWT_ISSUER = os.getenv("JWT_ISSUER", "your-dashboard")
+JWT_TTL_SECONDS = int(os.getenv("JWT_TTL_SECONDS", "2592000"))  # 30 days
+
+DISCORD_OAUTH_AUTHORIZE = "https://discord.com/api/oauth2/authorize"
+DISCORD_OAUTH_TOKEN     = "https://discord.com/api/oauth2/token"
+DISCORD_USERS_ME        = "https://discord.com/api/users/@me"
+
+OAUTH_STATE = {}  # in-memory; fine for Railway single instance
+# -------------------------------------------------------------------
 
 # Discord server verification vars
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
@@ -55,6 +73,16 @@ class TradingGoal(BaseModel):
     target_date: Optional[str] = None
     goal_type: str = "profit"  # profit, trades_count, win_rate
     is_completed: bool = False
+
+# ---------- NEW: model for extension ingest ----------
+class ExtSale(BaseModel):
+    trade_id: int
+    player_name: str
+    card_version: Optional[str] = None
+    buy_price: Optional[int] = None
+    sell_price: int
+    timestamp_ms: int
+# ----------------------------------------------------
 
 # Global connection pool
 pool = None
@@ -132,12 +160,32 @@ async def lifespan(app: FastAPI):
                 completed_at TIMESTAMP
             )
         """)
-        
+
         # 🔧 trades indexes
         await conn.execute("DROP INDEX IF EXISTS idx_trades_date")  # remove bad expression index if it exists
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_user_ts ON trades(user_id, timestamp)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_tag ON trades(user_id, tag)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_platform ON trades(user_id, platform)")
+
+        # ---------- NEW: sales table for extension (append-only) ----------
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS fut_trades (
+              id           BIGSERIAL PRIMARY KEY,
+              discord_id   TEXT NOT NULL,
+              trade_id     BIGINT NOT NULL,
+              player_name  TEXT NOT NULL,
+              card_version TEXT,
+              buy_price    INTEGER,
+              sell_price   INTEGER NOT NULL,
+              ts           TIMESTAMP WITH TIME ZONE NOT NULL,
+              source       TEXT DEFAULT 'webapp'
+            )
+        """)
+        await conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS fut_trades_uidx
+            ON fut_trades (discord_id, trade_id)
+        """)
+        # ------------------------------------------------------------------
 
     yield
     # Shutdown
@@ -184,7 +232,31 @@ def get_current_user(request: Request) -> str:
         raise HTTPException(status_code=401, detail="Not authenticated")
     return user_id
 
-# OAuth Routes
+# ---------- NEW: JWT helpers for extension ----------
+def issue_extension_token(discord_id: str) -> str:
+    now = int(time.time())
+    payload = {
+        "sub": discord_id,
+        "scope": "trade:ingest",
+        "iat": now,
+        "exp": now + JWT_TTL_SECONDS,
+        "iss": JWT_ISSUER,
+    }
+    return jwt.encode(payload, JWT_PRIVATE_KEY, algorithm="HS256")
+
+def require_extension_jwt(request: Request):
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing Bearer token")
+    token = auth[7:]
+    try:
+        payload = jwt.decode(token, JWT_PRIVATE_KEY, algorithms=["HS256"], issuer=JWT_ISSUER)
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
+    return SimpleNamespace(discord_id=payload.get("sub"))
+# ----------------------------------------------------
+
+# OAuth Routes (dashboard)
 @app.get("/api/login")
 async def login():
     return RedirectResponse(
@@ -274,6 +346,66 @@ async def callback(request: Request):
 async def logout(request: Request):
     request.session.clear()
     return {"message": "Logged out successfully"}
+
+# ---------- NEW: OAuth for the Chrome extension ----------
+@app.get("/oauth/start")
+async def oauth_start(redirect_uri: str):
+    """
+    Called by the Chrome extension's options page:
+      const redirectUrl = chrome.identity.getRedirectURL("oauth2");
+      launchWebAuthFlow(url=`/oauth/start?redirect_uri=${redirectUrl}`)
+    """
+    if not redirect_uri.startswith("https://") or "chromiumapp.org" not in redirect_uri:
+        # keep it strict so only extension redirect URIs are accepted
+        raise HTTPException(400, "Invalid redirect_uri")
+
+    state = secrets.token_urlsafe(24)
+    OAUTH_STATE[state] = {"redirect_uri": redirect_uri, "ts": time.time()}
+
+    params = {
+        "client_id": DISCORD_CLIENT_ID,
+        "response_type": "code",
+        "redirect_uri": redirect_uri,
+        "scope": "identify",
+        "state": state,
+        "prompt": "consent"
+    }
+    return RedirectResponse(f"{DISCORD_OAUTH_AUTHORIZE}?{urlencode(params)}")
+
+@app.get("/oauth/callback")
+async def oauth_callback(code: str, state: str):
+    meta = OAUTH_STATE.pop(state, None)
+    if not meta:
+        raise HTTPException(400, "Invalid/expired state")
+    redirect_uri = meta["redirect_uri"]
+
+    data = {
+        "client_id": DISCORD_CLIENT_ID,
+        "client_secret": DISCORD_CLIENT_SECRET,
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": redirect_uri
+    }
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+
+    async with aiohttp.ClientSession() as s:
+        async with s.post(DISCORD_OAUTH_TOKEN, data=data, headers=headers) as r:
+            tok = await r.json()
+            if r.status != 200:
+                raise HTTPException(400, f"Token exchange failed: {tok}")
+            access_token = tok["access_token"]
+
+        async with s.get(DISCORD_USERS_ME, headers={"Authorization": f"Bearer {access_token}"}) as r2:
+            me = await r2.json()
+            if r2.status != 200:
+                raise HTTPException(400, f"Fetching user failed: {me}")
+
+    discord_id = me["id"]
+    jwt_token = issue_extension_token(discord_id)
+
+    # Send token back to the extension via fragment for the options page to read
+    return RedirectResponse(f"{redirect_uri}#token={jwt_token}&state={state}")
+# ----------------------------------------------------------
 
 # Enhanced user info endpoint
 @app.get("/api/me")
@@ -643,6 +775,36 @@ async def search_players(q: str = ""):
         logging.error(f"Player search error: {e}")
         return {"players": [], "error": str(e)}
 # ------------------------------------------------
+
+# ---------- NEW: Extension sales ingest (Bearer JWT, no session) ----------
+@app.post("/api/trades/ingest")
+async def ingest_sale(
+    sale: ExtSale,
+    auth = Depends(require_extension_jwt)
+):
+    """
+    Accepts sales from the Chrome extension.
+    De-dupes per (discord_id, trade_id).
+    """
+    ts = sale.timestamp_ms / 1000.0
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO fut_trades
+                  (discord_id, trade_id, player_name, card_version, buy_price, sell_price, ts, source)
+                VALUES
+                  ($1,$2,$3,$4,$5,$6, to_timestamp($7), 'webapp')
+                ON CONFLICT (discord_id, trade_id) DO NOTHING
+            """,
+            auth.discord_id, sale.trade_id, sale.player_name.strip(),
+            (sale.card_version or None),
+            sale.buy_price, sale.sell_price, ts)
+        return {"ok": True}
+    except Exception as e:
+        logging.error(f"Ingest error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to ingest sale")
+# -------------------------------------------------------------------------
+
 # Dashboard Logic
 async def fetch_dashboard_data(user_id: str, conn):
     try:
