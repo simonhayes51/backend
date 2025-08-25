@@ -616,40 +616,36 @@ async def search_players(
         return {"players": []}
     
     try:
-        sql = """
-            SELECT name, rating, version, card_id, image_url, player_slug, 
-                   player_url, created_at
-            FROM fut_players 
-            WHERE LOWER(name) LIKE LOWER($1) 
-            ORDER BY rating DESC, name ASC
-            LIMIT 20
-        """
+        # Check if table exists
+        table_check = await conn.fetchval(
+            "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'fut_players')"
+        )
         
-        rows = await conn.fetch(sql, f'%{query}%')
+        if not table_check:
+            return {"players": [], "error": "fut_players table does not exist"}
         
-        players = []
-        for row in rows:
-            players.append({
-                "id": row["card_id"],
-                "name": row["name"],
-                "rating": row["rating"],
-                "version": row["version"] or "Base",
-                "card_id": str(row["card_id"]),
-                "image_url": row["image_url"],
-                "player_slug": row["player_slug"],
-                "player_url": row["player_url"],
-                "club": "Unknown",
-                "nation": "Unknown", 
-                "position": "Unknown"
-            })
+        # Get column names to debug
+        columns = await conn.fetch(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = 'fut_players'"
+        )
+        column_names = [col['column_name'] for col in columns]
         
-        return {"players": players}
+        # Try a simple count first
+        count = await conn.fetchval("SELECT COUNT(*) FROM fut_players")
+        
+        return {
+            "players": [], 
+            "debug": {
+                "table_exists": table_check,
+                "columns": column_names,
+                "total_rows": count,
+                "query": query
+            }
+        }
         
     except Exception as e:
-        logging.error(f"Player search error: {e}")
-        raise HTTPException(status_code=500, detail="Search failed")
+        return {"players": [], "error": str(e), "error_type": type(e).__name__}
 # ------------------------------------------------
-
 # Dashboard Logic
 async def fetch_dashboard_data(user_id: str, conn):
     try:
