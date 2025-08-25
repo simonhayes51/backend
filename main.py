@@ -13,10 +13,6 @@ from contextlib import asynccontextmanager
 from pydantic import BaseModel
 from typing import List, Optional
 import logging
-import requests
-from bs4 import BeautifulSoup
-from fastapi import HTTPException
-from fastapi import Query
 
 load_dotenv()
 
@@ -61,27 +57,6 @@ class TradingGoal(BaseModel):
 
 # Global connection pool
 pool = None
-
-# Add this global variable near the top with your other globals
-PLAYERS_DB = []
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Startup
-    global pool, PLAYERS_DB
-    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
-    
-    # Add this players loading code
-    try:
-        with open("players_temp.json", "r", encoding="utf-8") as f:
-            PLAYERS_DB = json.load(f)
-            print(f"SUCCESS: Loaded {len(PLAYERS_DB)} players")
-    except FileNotFoundError:
-        print("ERROR: players_temp.json not found")
-        PLAYERS_DB = []
-    except Exception as e:
-        print(f"ERROR loading players: {e}")
-        PLAYERS_DB = []
 
 # Discord API helpers
 async def get_discord_user_info(access_token: str):
@@ -209,78 +184,6 @@ async def login():
     return RedirectResponse(
         f"https://discord.com/oauth2/authorize?client_id={DISCORD_CLIENT_ID}&redirect_uri={DISCORD_REDIRECT_URI}&response_type=code&scope=identify"
     )
-
-#Pricecheck Module
-@app.get("/api/pricecheck")
-async def price_check(
-    player_name: str = Query(...), 
-    platform: str = Query("console"),
-    user_id: str = Depends(get_current_user)
-):
-    print(f"Pricecheck request: '{player_name}', platform: '{platform}'")
-    print(f"PLAYERS_DB loaded: {len(PLAYERS_DB) if PLAYERS_DB else 0} players")
-    
-    try:
-        # Your existing search logic
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/115.0.0.0 Safari/537.36"
-            )
-        }
-
-        # Search for player in PLAYERS_DB first
-        player_match = None
-        search_term = player_name.lower()
-        
-        for player in PLAYERS_DB:
-            if search_term in f"{player['name']} {player['rating']}".lower():
-                player_match = player
-                break
-        
-        print(f"Player match found: {player_match is not None}")
-        
-        if not player_match:
-            raise HTTPException(status_code=404, detail="Player not found in database")
-        
-        # Continue with your FUTBIN scraping using player_match['id']
-        # ...
-
-        soup = BeautifulSoup(player_resp.text, "html.parser")
-
-        # Map platform to FUTBIN price containers
-        platform_map = {
-            "console": "ps",
-            "xbox": "xbox",
-            "pc": "pc"
-        }
-        platform_key = platform_map.get(platform.lower(), "ps")
-
-        # Find the correct price container
-        price_div = soup.find("div", {"id": platform_key})
-        if not price_div:
-            return {
-                "player": players[0]["full_name"],
-                "rating": players[0]["rating"],
-                "price": "N/A",
-                "platform": platform
-            }
-
-        # Extract price text safely
-        price = price_div.get_text(strip=True).replace(",", "")
-
-        return {
-            "player": players[0]["full_name"],
-            "rating": players[0]["rating"],
-            "price": price,
-            "platform": platform
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
 # Enhanced OAuth callback with server verification
 @app.get("/api/callback")
