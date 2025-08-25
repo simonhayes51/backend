@@ -266,7 +266,8 @@ async def login():
 # Enhanced OAuth callback with server verification
 @app.get("/api/callback")
 async def callback(request: Request):
-    code = request.query_params.get("code")
+    code  = request.query_params.get("code")
+    state = request.query_params.get("state")
     if not code:
         raise HTTPException(status_code=400, detail="Missing code")
 
@@ -276,71 +277,80 @@ async def callback(request: Request):
         "client_secret": DISCORD_CLIENT_SECRET,
         "grant_type": "authorization_code",
         "code": code,
-        "redirect_uri": DISCORD_REDIRECT_URI,
+        "redirect_uri": DISCORD_REDIRECT_URI,  # must match /oauth/start
     }
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
 
     try:
         async with aiohttp.ClientSession() as session:
-            # Get access token
+            # Exchange code -> access token
             async with session.post(token_url, data=data, headers=headers) as resp:
                 if resp.status != 200:
                     raise HTTPException(status_code=400, detail="OAuth token exchange failed")
                 token_data = await resp.json()
-                
-                if "access_token" not in token_data:
+                access_token = token_data.get("access_token")
+                if not access_token:
                     raise HTTPException(status_code=400, detail="OAuth failed")
-                access_token = token_data["access_token"]
 
-            # Get detailed user info
-            user_data = await get_discord_user_info(access_token)
-            if not user_data:
-                raise HTTPException(status_code=400, detail="Failed to fetch user data")
-                
-            user_id = user_data["id"]
-            
-            # Check server membership
-            is_member = await check_server_membership(user_id)
-            if not is_member:
-                return RedirectResponse(f"{FRONTEND_URL}/access-denied")
-            
-            # Store user info in session
-            username = f"{user_data['username']}#{user_data.get('discriminator', '0000')}"
-            avatar_url = (
-                f"https://cdn.discordapp.com/avatars/{user_id}/{user_data['avatar']}.png"
-                if user_data.get('avatar')
-                else f"https://cdn.discordapp.com/embed/avatars/{int(user_data.get('discriminator', '0')) % 5}.png"
+        # Get detailed user info
+        user_data = await get_discord_user_info(access_token)
+        if not user_data:
+            raise HTTPException(status_code=400, detail="Failed to fetch user data")
+
+        user_id = user_data["id"]
+
+        # ===== Extension flow: bounce back to the extension with #token =====
+        if state and state in OAUTH_STATE:
+            meta = OAUTH_STATE.pop(state)
+            jwt_token = issue_extension_token(user_id)
+            ext_redirect = meta["ext_redirect"]  # https://<EXT_ID>.chromiumapp.org/oauth2
+            return RedirectResponse(f"{ext_redirect}#token={jwt_token}&state={state}")
+
+        # ===== Normal website login flow (your existing logic) =====
+        # Optional: server membership check
+        is_member = await check_server_membership(user_id)
+        if not is_member:
+            return RedirectResponse(f"{FRONTEND_URL}/access-denied")
+
+        # Store user info in session
+        username = f"{user_data['username']}#{user_data.get('discriminator', '0000')}"
+        avatar_url = (
+            f"https://cdn.discordapp.com/avatars/{user_id}/{user_data['avatar']}.png"
+            if user_data.get('avatar')
+            else f"https://cdn.discordapp.com/embed/avatars/{int(user_data.get('discriminator', '0')) % 5}.png"
+        )
+        global_name = user_data.get('global_name') or user_data['username']
+
+        request.session["user_id"] = user_id
+        request.session["username"] = username
+        request.session["avatar_url"] = avatar_url
+        request.session["global_name"] = global_name
+
+        # Initialize user's portfolio and profile
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO portfolio (user_id, starting_balance) VALUES ($1, $2) "
+                "ON CONFLICT (user_id) DO NOTHING",
+                user_id, 0
             )
-            global_name = user_data.get('global_name') or user_data['username']
-            
-            request.session["user_id"] = user_id
-            request.session["username"] = username
-            request.session["avatar_url"] = avatar_url
-            request.session["global_name"] = global_name
-            
-            # Initialize user's portfolio and profile
-            async with pool.acquire() as conn:
-                await conn.execute(
-                    "INSERT INTO portfolio (user_id, starting_balance) VALUES ($1, $2) ON CONFLICT (user_id) DO NOTHING",
-                    user_id, 0
-                )
-                
-                # Store/update user profile
-                await conn.execute(
-                    """
-                    INSERT INTO user_profiles (user_id, username, avatar_url, global_name, updated_at) 
-                    VALUES ($1, $2, $3, $4, NOW())
-                    ON CONFLICT (user_id) 
-                    DO UPDATE SET username = $2, avatar_url = $3, global_name = $4, updated_at = NOW()
-                    """,
-                    user_id, username, avatar_url, global_name
-                )
-            
-            return RedirectResponse(f"{FRONTEND_URL}/?authenticated=true")
-            
+            await conn.execute(
+                """
+                INSERT INTO user_profiles (user_id, username, avatar_url, global_name, updated_at)
+                VALUES ($1, $2, $3, $4, NOW())
+                ON CONFLICT (user_id)
+                DO UPDATE SET username = $2, avatar_url = $3, global_name = $4, updated_at = NOW()
+                """,
+                user_id, username, avatar_url, global_name
+            )
+
+        return RedirectResponse(f"{FRONTEND_URL}/?authenticated=true")
+
+    except HTTPException:
+        raise
     except Exception as e:
         logging.error(f"OAuth error: {e}")
         raise HTTPException(status_code=500, detail="Authentication failed")
+
 
 @app.get("/api/logout")
 async def logout(request: Request):
@@ -349,9 +359,22 @@ async def logout(request: Request):
 
 # ---------- NEW: OAuth for the Chrome extension ----------
 # /oauth/start -> send user to Discord using your *server* redirect
+# Store extension redirects here
+OAUTH_STATE = {}
+
+def issue_extension_token(discord_id: str) -> str:
+    now = int(time.time())
+    payload = {
+        "sub": discord_id,
+        "scope": "trade:ingest",
+        "iat": now,
+        "exp": now + 60 * 60 * 24 * 30,  # 30 days
+        "iss": "fut-dashboard"
+    }
+    return jwt.encode(payload, JWT_PRIVATE_KEY, algorithm="HS256")
+
 @app.get("/oauth/start")
 async def oauth_start(redirect_uri: str):
-    # redirect_uri is the extension URL from chrome.identity.getRedirectURL("oauth2")
     if not redirect_uri.startswith("https://") or "chromiumapp.org" not in redirect_uri:
         raise HTTPException(400, "Invalid redirect_uri")
 
@@ -361,30 +384,60 @@ async def oauth_start(redirect_uri: str):
     params = {
         "client_id": DISCORD_CLIENT_ID,
         "response_type": "code",
-        "redirect_uri": DISCORD_REDIRECT_URI,   # <-- your registered site callback
+        "redirect_uri": DISCORD_REDIRECT_URI,   # your registered site callback
         "scope": "identify",
         "state": state,
         "prompt": "consent",
     }
     return RedirectResponse(f"{DISCORD_OAUTH_AUTHORIZE}?{urlencode(params)}")
 
-# /oauth/callback -> exchange code, mint JWT, bounce to extension with #token
 
-@app.get("/oauth/callback")
-async def oauth_callback(code: str, state: str):
-    meta = OAUTH_STATE.pop(state, None)
-    if not meta:
-        raise HTTPException(400, "Invalid/expired state")
-    ext_redirect = meta["ext_redirect"]
+@app.get("/api/callback")
+async def callback(request: Request):
+    code = request.query_params.get("code")
+    state = request.query_params.get("state")
+    if not code:
+        raise HTTPException(status_code=400, detail="Missing code")
 
+    # Exchange code for access token
+    token_url = "https://discord.com/api/oauth2/token"
     data = {
         "client_id": DISCORD_CLIENT_ID,
         "client_secret": DISCORD_CLIENT_SECRET,
         "grant_type": "authorization_code",
         "code": code,
-        "redirect_uri": DISCORD_REDIRECT_URI,   # must match /oauth/start
+        "redirect_uri": DISCORD_REDIRECT_URI,   # must match what we used in /oauth/start
     }
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(token_url, data=data, headers=headers) as resp:
+            if resp.status != 200:
+                raise HTTPException(status_code=400, detail="OAuth token exchange failed")
+            token_data = await resp.json()
+            access_token = token_data["access_token"]
+
+        # Get user info
+        async with session.get(
+            "https://discord.com/api/users/@me",
+            headers={"Authorization": f"Bearer {access_token}"}
+        ) as resp:
+            user_data = await resp.json()
+            if resp.status != 200:
+                raise HTTPException(status_code=400, detail="Failed to fetch user data")
+
+    user_id = user_data["id"]
+
+    # ✅ NEW: if this was triggered by the extension, bounce back with #token
+    if state and state in OAUTH_STATE:
+        meta = OAUTH_STATE.pop(state)
+        jwt_token = issue_extension_token(user_id)
+        ext_redirect = meta["ext_redirect"]   # chromiumapp.org URL
+        return RedirectResponse(f"{ext_redirect}#token={jwt_token}&state={state}")
+
+    # Otherwise, continue with your normal dashboard login flow
+    # (keep the rest of your existing session + DB code here)
+    # e.g. return RedirectResponse(f"{FRONTEND_URL}/?authenticated=true")
 
     async with aiohttp.ClientSession() as s:
         async with s.post(DISCORD_OAUTH_TOKEN, data=data, headers=headers) as r:
