@@ -23,6 +23,7 @@ if missing_vars:
     raise ValueError(f"Missing required environment variables: {missing_vars}")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
+PLAYER_DATABASE_URL = os.getenv("PLAYER_DATABASE_URL", "postgresql://postgres:FiwuZKPRyUKvzWMMqTWxfpRGtZrOYLCa@shuttle.proxy.rlwy.net:19669/railway")
 DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID")
 DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
 DISCORD_REDIRECT_URI = os.getenv("DISCORD_REDIRECT_URI")
@@ -57,6 +58,7 @@ class TradingGoal(BaseModel):
 
 # Global connection pool
 pool = None
+player_pool = None
 
 # Discord API helpers
 async def get_discord_user_info(access_token: str):
@@ -84,9 +86,11 @@ async def check_server_membership(user_id: str):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
-    global pool
+    global pool, player_pool
+    # Trading database connection
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+    # Player database connection  
+    player_pool = await asyncpg.create_pool(PLAYER_DATABASE_URL, min_size=1, max_size=10)
     
     # Create all required tables
     async with pool.acquire() as conn:
@@ -139,6 +143,8 @@ async def lifespan(app: FastAPI):
     # Shutdown
     if pool:
         await pool.close()
+    if player_pool:
+        await player_pool.close()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -605,37 +611,34 @@ async def delete_all_user_data(
 
 # --------- NEW: Player Search Endpoint ----------
 @app.get("/api/search-players")
-async def search_players(
-    q: str = "",
-    conn = Depends(get_db)
-):
-    """Search players - returns name, rating, and card_id for autocomplete"""
+async def search_players(q: str = ""):
     query = q.strip()
     
     if not query:
         return {"players": []}
     
     try:
-        sql = """
-            SELECT name, rating, card_id
-            FROM fut_players 
-            WHERE LOWER(name) LIKE LOWER($1) 
-            ORDER BY rating DESC, name ASC
-            LIMIT 20
-        """
-        
-        rows = await conn.fetch(sql, f'%{query}%')
-        
-        players = []
-        for row in rows:
-            players.append({
-                "name": row["name"],
-                "rating": row["rating"],
-                "card_id": str(row["card_id"])
-            })
-        
-        return {"players": players}
-        
+        async with player_pool.acquire() as conn:
+            sql = """
+                SELECT name, rating, card_id
+                FROM fut_players 
+                WHERE LOWER(name) LIKE LOWER($1) 
+                ORDER BY rating DESC, name ASC
+                LIMIT 20
+            """
+            
+            rows = await conn.fetch(sql, f'%{query}%')
+            
+            players = []
+            for row in rows:
+                players.append({
+                    "name": row["name"],
+                    "rating": row["rating"], 
+                    "card_id": str(row["card_id"])
+                })
+            
+            return {"players": players}
+            
     except Exception as e:
         logging.error(f"Player search error: {e}")
         return {"players": [], "error": str(e)}
