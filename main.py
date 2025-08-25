@@ -835,40 +835,43 @@ async def ingest_sale(
     """
     Accepts sales from the Chrome extension.
     De-dupes per (discord_id, trade_id) in fut_trades.
-    On first insert, also mirrors into the `trades` table for the dashboard.
+    On first insert, also mirrors into the `trades` table with your exact columns.
     """
     ts = sale.timestamp_ms / 1000.0
-    user_id = auth.discord_id
-    player = sale.player_name.strip()
-    version = sale.card_version or ""          # free text is fine
-    buy = int(sale.buy_price or 0)             # rewards may be unknown -> 0
+    user_id = auth.discord_id  # discord ID
+    player = (sale.player_name or "").strip()
+    version = (sale.card_version or "").strip()
+    buy = int(sale.buy_price or 0)               # unknown/reward -> 0
     sell = int(sale.sell_price)
     qty = 1
     platform = "Console"
     tag = "Auto"
+    notes = ""
+
+    # IMPORTANT: keep profit the same convention as your existing add_trade endpoint
     profit = (sell - buy) * qty
-    ea_tax = int(sell * qty * 0.05)
+    ea_tax = int(round(sell * qty * 0.05))
 
     try:
         async with pool.acquire() as conn:
             async with conn.transaction():
-                # 1) Raw log table with de-dupe
+                # 1) Raw log + de-dup
                 inserted = await conn.fetchrow("""
                     INSERT INTO fut_trades
                       (discord_id, trade_id, player_name, card_version, buy_price, sell_price, ts, source)
                     VALUES ($1,$2,$3,$4,$5,$6,to_timestamp($7),'webapp')
                     ON CONFLICT (discord_id, trade_id) DO NOTHING
                     RETURNING id
-                """, user_id, sale.trade_id, player, version or None, sale.buy_price, sell, ts)
+                """, user_id, sale.trade_id, player, (version or None), sale.buy_price, sell, ts)
 
-                # 2) Only mirror to `trades` if we actually inserted above
+                # 2) Mirror into `trades` only on first-seen sale
                 if inserted:
                     await conn.execute("""
                         INSERT INTO trades
-                          (user_id, player, version, buy, sell, quantity, platform, profit, ea_tax, tag, timestamp)
+                          (user_id, player, version, buy, sell, quantity, platform, tag, notes, ea_tax, profit, timestamp)
                         VALUES
-                          ($1,     $2,     $3,     $4,  $5,   $6,      $7,       $8,     $9,    $10, to_timestamp($11))
-                    """, user_id, player, version, buy, sell, qty, platform, profit, ea_tax, tag, ts)
+                          ($1,     $2,     $3,     $4,  $5,   $6,      $7,      $8,   $9,    $10,    $11,   to_timestamp($12))
+                    """, user_id, player, version, buy, sell, qty, platform, tag, notes, ea_tax, profit, ts)
 
         return {"ok": True, "mirrored_to_trades": bool(inserted)}
     except Exception as e:
