@@ -348,43 +348,41 @@ async def logout(request: Request):
     return {"message": "Logged out successfully"}
 
 # ---------- NEW: OAuth for the Chrome extension ----------
+# /oauth/start -> send user to Discord using your *server* redirect
 @app.get("/oauth/start")
 async def oauth_start(redirect_uri: str):
-    """
-    Called by the Chrome extension's options page:
-      const redirectUrl = chrome.identity.getRedirectURL("oauth2");
-      launchWebAuthFlow(url=`/oauth/start?redirect_uri=${redirectUrl}`)
-    """
+    # redirect_uri is the extension URL from chrome.identity.getRedirectURL("oauth2")
     if not redirect_uri.startswith("https://") or "chromiumapp.org" not in redirect_uri:
-        # keep it strict so only extension redirect URIs are accepted
         raise HTTPException(400, "Invalid redirect_uri")
 
     state = secrets.token_urlsafe(24)
-    OAUTH_STATE[state] = {"redirect_uri": redirect_uri, "ts": time.time()}
+    OAUTH_STATE[state] = {"ext_redirect": redirect_uri, "ts": time.time()}
 
     params = {
         "client_id": DISCORD_CLIENT_ID,
         "response_type": "code",
-        "redirect_uri": redirect_uri,
+        "redirect_uri": DISCORD_REDIRECT_URI,   # <-- your registered site callback
         "scope": "identify",
         "state": state,
-        "prompt": "consent"
+        "prompt": "consent",
     }
     return RedirectResponse(f"{DISCORD_OAUTH_AUTHORIZE}?{urlencode(params)}")
+
+# /oauth/callback -> exchange code, mint JWT, bounce to extension with #token
 
 @app.get("/oauth/callback")
 async def oauth_callback(code: str, state: str):
     meta = OAUTH_STATE.pop(state, None)
     if not meta:
         raise HTTPException(400, "Invalid/expired state")
-    redirect_uri = meta["redirect_uri"]
+    ext_redirect = meta["ext_redirect"]
 
     data = {
         "client_id": DISCORD_CLIENT_ID,
-        "client_secret": DISCORD_CLIENT_SECRET,
+        "client_secret": DISCORD_CLIENT_SECRET",
         "grant_type": "authorization_code",
         "code": code,
-        "redirect_uri": redirect_uri
+        "redirect_uri": DISCORD_REDIRECT_URI,   # must match /oauth/start
     }
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
 
@@ -402,9 +400,8 @@ async def oauth_callback(code: str, state: str):
 
     discord_id = me["id"]
     jwt_token = issue_extension_token(discord_id)
+    return RedirectResponse(f"{ext_redirect}#token={jwt_token}&state={state}")
 
-    # Send token back to the extension via fragment for the options page to read
-    return RedirectResponse(f"{redirect_uri}#token={jwt_token}&state={state}")
 # ----------------------------------------------------------
 
 # Enhanced user info endpoint
