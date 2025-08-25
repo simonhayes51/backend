@@ -23,13 +23,14 @@ if missing_vars:
     raise ValueError(f"Missing required environment variables: {missing_vars}")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
+PLAYER_DATABASE_URL = os.getenv("PLAYER_DATABASE_URL", "postgresql://postgres:FiwuZKPRyUKvzWMMqTWxfpRGtZrOYLCa@shuttle.proxy.rlwy.net:19669/railway")
 DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID")
 DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
 DISCORD_REDIRECT_URI = os.getenv("DISCORD_REDIRECT_URI")
 SECRET_KEY = os.getenv("SECRET_KEY")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://frontend-production-ab5e.up.railway.app")
 
-# New Discord server verification variables
+# Discord server verification vars
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 DISCORD_SERVER_ID = os.getenv("DISCORD_SERVER_ID")
 
@@ -57,6 +58,7 @@ class TradingGoal(BaseModel):
 
 # Global connection pool
 pool = None
+player_pool = None
 
 # Discord API helpers
 async def get_discord_user_info(access_token: str):
@@ -79,14 +81,16 @@ async def check_server_membership(user_id: str):
                 headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"}
             ) as resp:
                 return resp.status == 200  # 200 = member, 404 = not member
-    except Exception as e:
+    except Exception:
         return False  # Deny access on error
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
-    global pool
+    global pool, player_pool
+    # Trading database connection
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+    # Player database connection  
+    player_pool = await asyncpg.create_pool(PLAYER_DATABASE_URL, min_size=1, max_size=10)
     
     # Create all required tables
     async with pool.acquire() as conn:
@@ -129,43 +133,45 @@ async def lifespan(app: FastAPI):
             )
         """)
         
-        # Create indexes
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_user_settings_user_id ON user_settings(user_id)")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_user_profiles_user_id ON user_profiles(user_id)")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_trading_goals_user_id ON trading_goals(user_id)")
-        
         # 🔧 trades indexes
-        # Safe composite index for user + time filtering/sorting
         await conn.execute("DROP INDEX IF EXISTS idx_trades_date")  # remove bad expression index if it exists
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_user_ts ON trades(user_id, timestamp)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_tag ON trades(user_id, tag)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_platform ON trades(user_id, platform)")
 
-    
     yield
     # Shutdown
     if pool:
         await pool.close()
+    if player_pool:
+        await player_pool.close()
 
 app = FastAPI(lifespan=lifespan)
 
 # Get port from Railway environment
 PORT = int(os.getenv("PORT", 8000))
 
-# Middleware
-app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY)
+# ------------ Middleware (updated) ------------
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=SECRET_KEY,
+    same_site="none",   # allow cross-site cookies
+    https_only=True,    # cookies only over HTTPS
+)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         FRONTEND_URL,
-        "https://*.railway.app",  # Allow all Railway domains
         "http://localhost:5173",
         "http://localhost:3000",
     ],
+    allow_origin_regex=r"https://.*\.railway\.app",  # wildcard Railway subdomains
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# ----------------------------------------------
 
 # Dependencies
 async def get_db():
@@ -228,7 +234,11 @@ async def callback(request: Request):
             
             # Store user info in session
             username = f"{user_data['username']}#{user_data.get('discriminator', '0000')}"
-            avatar_url = f"https://cdn.discordapp.com/avatars/{user_id}/{user_data['avatar']}.png" if user_data.get('avatar') else f"https://cdn.discordapp.com/embed/avatars/{int(user_data.get('discriminator', '0')) % 5}.png"
+            avatar_url = (
+                f"https://cdn.discordapp.com/avatars/{user_id}/{user_data['avatar']}.png"
+                if user_data.get('avatar')
+                else f"https://cdn.discordapp.com/embed/avatars/{int(user_data.get('discriminator', '0')) % 5}.png"
+            )
             global_name = user_data.get('global_name') or user_data['username']
             
             request.session["user_id"] = user_id
@@ -294,7 +304,7 @@ async def get_user_settings(
             # Return default settings
             default_settings = UserSettings()
             return default_settings.dict()
-    except Exception as e:
+    except Exception:
         raise HTTPException(status_code=500, detail="Failed to fetch settings")
 
 @app.post("/api/settings")
@@ -314,7 +324,7 @@ async def update_user_settings(
             user_id, json.dumps(settings.dict())
         )
         return {"message": "Settings updated successfully"}
-    except Exception as e:
+    except Exception:
         raise HTTPException(status_code=500, detail="Failed to update settings")
 
 @app.post("/api/portfolio/balance")
@@ -334,7 +344,7 @@ async def update_starting_balance(
         )
         
         return {"message": "Starting balance updated successfully"}
-    except Exception as e:
+    except Exception:
         raise HTTPException(status_code=500, detail="Failed to update starting balance")
 
 # Trading goals endpoints
@@ -349,7 +359,7 @@ async def get_trading_goals(
             user_id
         )
         return {"goals": [dict(goal) for goal in goals]}
-    except Exception as e:
+    except Exception:
         raise HTTPException(status_code=500, detail="Failed to fetch goals")
 
 @app.post("/api/goals")
@@ -367,7 +377,7 @@ async def create_trading_goal(
             user_id, goal.title, goal.target_amount, goal.target_date, goal.goal_type, goal.is_completed
         )
         return {"message": "Goal created successfully"}
-    except Exception as e:
+    except Exception:
         raise HTTPException(status_code=500, detail="Failed to create goal")
 
 # Advanced analytics endpoint
@@ -377,7 +387,6 @@ async def get_advanced_analytics(
     conn = Depends(get_db)
 ):
     try:
-        # Daily profit trend (last 30 days)
         daily_profits = await conn.fetch("""
             SELECT 
                 DATE(timestamp) as date,
@@ -389,7 +398,6 @@ async def get_advanced_analytics(
             ORDER BY date
         """, user_id)
         
-        # Tag performance analysis
         tag_performance = await conn.fetch("""
             SELECT 
                 tag,
@@ -403,7 +411,6 @@ async def get_advanced_analytics(
             ORDER BY total_profit DESC
         """, user_id)
         
-        # Platform comparison
         platform_stats = await conn.fetch("""
             SELECT 
                 platform,
@@ -415,7 +422,6 @@ async def get_advanced_analytics(
             GROUP BY platform
         """, user_id)
         
-        # Monthly summary
         monthly_summary = await conn.fetch("""
             SELECT 
                 DATE_TRUNC('month', timestamp) as month,
@@ -481,8 +487,7 @@ async def bulk_edit_trades(
             WHERE user_id = ${param_count} AND id = ANY(${param_count + 1})
         """
         
-        result = await conn.execute(query, *params)
-        
+        await conn.execute(query, *params)
         return {"message": f"Updated {len(trade_ids)} trades successfully"}
         
     except Exception as e:
@@ -505,30 +510,24 @@ async def export_trades(
         trades_data = [dict(trade) for trade in trades]
         
         if format.lower() == "json":
-            # JSON export
             json_data = json.dumps(trades_data, indent=2, default=str)
-            
             return StreamingResponse(
                 io.BytesIO(json_data.encode()),
                 media_type="application/json",
                 headers={"Content-Disposition": "attachment; filename=trades_export.json"}
             )
-        
         else:
-            # CSV export
             output = io.StringIO()
             if trades_data:
                 writer = csv.DictWriter(output, fieldnames=trades_data[0].keys())
                 writer.writeheader()
                 writer.writerows(trades_data)
-            
             return StreamingResponse(
                 io.StringIO(output.getvalue()),
                 media_type="text/csv",
                 headers={"Content-Disposition": "attachment; filename=trades_export.csv"}
             )
-            
-    except Exception as e:
+    except Exception:
         raise HTTPException(status_code=500, detail="Failed to export data")
 
 # Data import endpoint
@@ -542,16 +541,12 @@ async def import_trades(
         contents = await file.read()
         
         if file.filename.endswith('.json'):
-            # JSON import
             data = json.loads(contents.decode('utf-8'))
             trades_to_import = data if isinstance(data, list) else [data]
-        
         elif file.filename.endswith('.csv'):
-            # CSV import
             csv_data = contents.decode('utf-8')
             reader = csv.DictReader(io.StringIO(csv_data))
             trades_to_import = list(reader)
-        
         else:
             raise HTTPException(status_code=400, detail="Unsupported file format")
         
@@ -560,7 +555,6 @@ async def import_trades(
         
         for trade_data in trades_to_import:
             try:
-                # Validate and clean data
                 player = trade_data.get('player', '').strip()
                 version = trade_data.get('version', '').strip()
                 buy = int(trade_data.get('buy', 0))
@@ -573,11 +567,9 @@ async def import_trades(
                     errors.append(f"Invalid trade data: {trade_data}")
                     continue
                 
-                # Calculate profit and tax
                 profit = (sell - buy) * quantity
                 ea_tax = int(sell * quantity * 0.05)
                 
-                # Insert trade
                 await conn.execute(
                     """
                     INSERT INTO trades (user_id, player, version, buy, sell, quantity, platform, profit, ea_tax, tag, timestamp)
@@ -594,7 +586,7 @@ async def import_trades(
         return {
             "message": f"Successfully imported {imported_count} trades",
             "imported_count": imported_count,
-            "errors": errors[:10]  # Limit error messages
+            "errors": errors[:10]
         }
         
     except Exception as e:
@@ -611,65 +603,73 @@ async def delete_all_user_data(
         raise HTTPException(status_code=400, detail="Confirmation required")
     
     try:
-        # Delete all trades
-        trades_deleted = await conn.fetchval(
-            "DELETE FROM trades WHERE user_id=$1",
-            user_id
-        )
-        
-        # Reset portfolio
-        await conn.execute(
-            "UPDATE portfolio SET starting_balance = 0 WHERE user_id=$1",
-            user_id
-        )
-        
-        return {
-            "message": "All data deleted successfully",
-            "trades_deleted": trades_deleted or 0
-        }
-        
-    except Exception as e:
+        await conn.execute("DELETE FROM trades WHERE user_id=$1", user_id)
+        await conn.execute("UPDATE portfolio SET starting_balance = 0 WHERE user_id=$1", user_id)
+        return {"message": "All data deleted successfully", "trades_deleted": 0}
+    except Exception:
         raise HTTPException(status_code=500, detail="Failed to delete data")
 
+# --------- NEW: Player Search Endpoint ----------
+@app.get("/api/search-players")
+async def search_players(q: str = ""):
+    query = q.strip()
+    
+    if not query:
+        return {"players": []}
+    
+    try:
+        async with player_pool.acquire() as conn:
+            sql = """
+                SELECT name, rating, card_id
+                FROM fut_players 
+                WHERE LOWER(name) LIKE LOWER($1) 
+                ORDER BY rating DESC, name ASC
+                LIMIT 20
+            """
+            
+            rows = await conn.fetch(sql, f'%{query}%')
+            
+            players = []
+            for row in rows:
+                players.append({
+                    "name": row["name"],
+                    "rating": row["rating"], 
+                    "card_id": str(row["card_id"])
+                })
+            
+            return {"players": players}
+            
+    except Exception as e:
+        logging.error(f"Player search error: {e}")
+        return {"players": [], "error": str(e)}
+# ------------------------------------------------
 # Dashboard Logic
 async def fetch_dashboard_data(user_id: str, conn):
     try:
-        # Fetch portfolio
         portfolio = await conn.fetchrow(
             "SELECT starting_balance FROM portfolio WHERE user_id=$1", 
             user_id
         )
-        
-        # Fetch aggregate stats
         stats = await conn.fetchrow(
             "SELECT COALESCE(SUM(profit),0) AS total_profit, COALESCE(SUM(ea_tax),0) AS total_tax, COUNT(*) as total_trades FROM trades WHERE user_id=$1",
             user_id,
         )
-
-        # Fetch recent trades
         trades = await conn.fetch(
             "SELECT player, version, buy, sell, quantity, platform, profit, ea_tax, tag, timestamp "
             "FROM trades WHERE user_id=$1 ORDER BY timestamp DESC LIMIT 10",
             user_id,
         )
-
-        # Calculate metrics
         all_trades = await conn.fetch(
             "SELECT profit FROM trades WHERE user_id=$1 ORDER BY timestamp DESC",
             user_id,
         )
-        
         win_count = len([t for t in all_trades if t["profit"] and t["profit"] > 0])
         win_rate = round((win_count / len(all_trades)) * 100, 1) if all_trades else 0
-
-        # Most used tag
         tag_stats = await conn.fetch(
             "SELECT tag, COUNT(*) as count FROM trades WHERE user_id=$1 GROUP BY tag ORDER BY count DESC LIMIT 1",
             user_id
         )
         most_used_tag = tag_stats[0]["tag"] if tag_stats else "N/A"
-
-        # Best trade
         best_trade = await conn.fetchrow(
             "SELECT * FROM trades WHERE user_id=$1 ORDER BY profit DESC LIMIT 1",
             user_id
@@ -715,14 +715,11 @@ async def add_trade(
 ):
     try:
         data = await request.json()
-        
-        # Validate required fields
         required_fields = ["player", "version", "buy", "sell", "quantity", "platform", "tag"]
         missing_fields = [field for field in required_fields if field not in data or data[field] == ""]
         if missing_fields:
             raise HTTPException(status_code=400, detail=f"Missing required fields: {missing_fields}")
 
-        # Validate and convert numeric fields
         try:
             quantity = int(data["quantity"])
             buy = int(data["buy"])
@@ -732,11 +729,9 @@ async def add_trade(
         except (ValueError, TypeError):
             raise HTTPException(status_code=400, detail="Invalid numeric values")
 
-        # Calculate profit and tax
         profit = (sell - buy) * quantity
         ea_tax = int(sell * quantity * 0.05)
 
-        # Insert trade
         await conn.execute(
             """
             INSERT INTO trades (user_id, player, version, buy, sell, quantity, platform, profit, ea_tax, tag, timestamp)
@@ -800,7 +795,6 @@ async def delete_trade(
 @app.get("/health")
 async def health_check():
     try:
-        # Test database connection
         if pool:
             async with pool.acquire() as conn:
                 await conn.fetchval("SELECT 1")
@@ -809,6 +803,54 @@ async def health_check():
             return {"status": "unhealthy", "database": "disconnected"}
     except Exception as e:
         return {"status": "unhealthy", "database": "disconnected", "error": str(e)}
+
+@app.get("/api/fut-player-definition/{card_id}")
+async def get_player_definition(card_id: str):
+    """Proxy for FUT.GG player definition API"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"https://www.fut.gg/api/fut/player-item-definitions/25/{card_id}/",
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Accept": "application/json, text/plain, */*",
+                    "Accept-Language": "en-GB,en;q=0.9",
+                    "Referer": "https://www.fut.gg/",
+                    "Origin": "https://www.fut.gg"
+                }
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data
+                else:
+                    return {"error": f"API returned status {resp.status}"}
+    except Exception as e:
+        logging.error(f"Player definition fetch error: {e}")
+        return {"error": str(e)}
+
+@app.get("/api/fut-player-price/{card_id}")
+async def get_player_price(card_id: str):
+    """Proxy for FUT.GG player price API"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"https://www.fut.gg/api/fut/player-prices/25/{card_id}",
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Accept": "application/json, text/plain, */*",
+                    "Accept-Language": "en-GB,en;q=0.9",
+                    "Referer": "https://www.fut.gg/",
+                    "Origin": "https://www.fut.gg"
+                }
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data
+                else:
+                    return {"error": f"API returned status {resp.status}"}
+    except Exception as e:
+        logging.error(f"Player price fetch error: {e}")
+        return {"error": str(e)}
 
 @app.get("/")
 async def root():
