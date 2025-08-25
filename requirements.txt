@@ -10,3 +10,4 @@ matplotlib
 requests
 beautifulsoup4
 httpx
+PyJWT==2.9.0
