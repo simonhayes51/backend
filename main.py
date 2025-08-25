@@ -609,42 +609,36 @@ async def search_players(
     q: str = "",
     conn = Depends(get_db)
 ):
-    """Search players from fut_players table - public endpoint"""
+    """Search players - returns name, rating, and card_id for autocomplete"""
     query = q.strip()
     
     if not query:
         return {"players": []}
     
     try:
-        # Check if table exists
-        table_check = await conn.fetchval(
-            "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'fut_players')"
-        )
+        sql = """
+            SELECT name, rating, card_id
+            FROM fut_players 
+            WHERE LOWER(name) LIKE LOWER($1) 
+            ORDER BY rating DESC, name ASC
+            LIMIT 20
+        """
         
-        if not table_check:
-            return {"players": [], "error": "fut_players table does not exist"}
+        rows = await conn.fetch(sql, f'%{query}%')
         
-        # Get column names to debug
-        columns = await conn.fetch(
-            "SELECT column_name FROM information_schema.columns WHERE table_name = 'fut_players'"
-        )
-        column_names = [col['column_name'] for col in columns]
+        players = []
+        for row in rows:
+            players.append({
+                "name": row["name"],
+                "rating": row["rating"],
+                "card_id": str(row["card_id"])
+            })
         
-        # Try a simple count first
-        count = await conn.fetchval("SELECT COUNT(*) FROM fut_players")
-        
-        return {
-            "players": [], 
-            "debug": {
-                "table_exists": table_check,
-                "columns": column_names,
-                "total_rows": count,
-                "query": query
-            }
-        }
+        return {"players": players}
         
     except Exception as e:
-        return {"players": [], "error": str(e), "error_type": type(e).__name__}
+        logging.error(f"Player search error: {e}")
+        return {"players": [], "error": str(e)}
 # ------------------------------------------------
 # Dashboard Logic
 async def fetch_dashboard_data(user_id: str, conn):
