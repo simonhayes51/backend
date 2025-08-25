@@ -209,51 +209,67 @@ async def login():
 # Add this after your OAuth routes
 @app.get("/api/pricecheck")
 async def price_check(
-    player_name: str = Query(...), 
+    request: Request,
+    player_name: str = Query(...),
     platform: str = Query("console"),
-    user_id: str = Depends(get_current_user)
+    user_id: str = Depends(get_current_user)  # ✅ Authentication intact
 ):
+    """
+    Fetch player price data from FUTBIN.
+    Works the same as Discord bot pricecheck.py but fully dashboard-compatible.
+    """
     try:
-        # Search for player in PLAYERS_DB
-        player_match = None
-        search_term = player_name.lower()
-        
-        for player in PLAYERS_DB:
-            if search_term in f"{player['name']} {player['rating']}".lower():
-                player_match = player
-                break
-        
-        if not player_match:
+        # Find matching player by name + rating
+        matched_player = next(
+            (p for p in PLAYERS_DB if f"{p['name'].lower()} {p['rating']}" == player_name.lower()), None
+        )
+        if not matched_player:
             raise HTTPException(status_code=404, detail="Player not found")
-        
-        # Scrape FUTBIN using player ID
-        player_url = f"https://www.futbin.com/25/player/{player_match['id']}"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        }
-        
-        response = requests.get(player_url, headers=headers)
+
+        player_id = matched_player["id"]
+        player_name_clean = matched_player["name"]
+        slug = player_name_clean.replace(" ", "-").lower()
+        futbin_url = f"https://www.futbin.com/25/player/{player_id}/{slug}"
+
+        # Scrape FUTBIN prices like in your bot
+        headers = {"User-Agent": "Mozilla/5.0"}
+        response = requests.get(futbin_url, headers=headers)
         if response.status_code != 200:
-            raise HTTPException(status_code=500, detail="Failed to fetch price data")
-        
+            raise HTTPException(status_code=500, detail="Failed to fetch FUTBIN data")
+
         soup = BeautifulSoup(response.text, "html.parser")
-        
-        # Find price based on platform
-        platform_map = {"console": "ps", "pc": "pc"}
-        platform_key = platform_map.get(platform.lower(), "ps")
-        
-        price_div = soup.find("div", {"id": platform_key})
-        price = price_div.get_text(strip=True) if price_div else "N/A"
-        
+        prices_wrapper = soup.find("div", class_="lowest-prices-wrapper")
+        if not prices_wrapper:
+            raise HTTPException(status_code=500, detail="Could not find prices on FUTBIN")
+
+        price_elements = prices_wrapper.find_all("div", class_="lowest-price")
+
+        def get_price_text(index):
+            if len(price_elements) > index:
+                return price_elements[index].text.strip().replace(",", "").replace("\n", "")
+            return "0"
+
+        # Console = PS + Xbox
+        if platform.lower() == "console":
+            ps_price = get_price_text(0)
+            xbox_price = get_price_text(1)
+            price = ps_price if ps_price != "0" else xbox_price
+        elif platform.lower() == "pc":
+            price = get_price_text(2)
+        else:
+            price = "0"
+
+        # Clean output format
+        price = "N/A" if price == "0" or price == "" else f"{int(price):,}"
+
         return {
-            "player": player_match["name"],
-            "rating": player_match["rating"],
+            "player": player_name_clean,
+            "rating": matched_player["rating"],
+            "platform": platform.capitalize(),
             "price": price,
-            "platform": platform,
-            "club": player_match.get("club", "Unknown"),
-            "nation": player_match.get("nation", "Unknown")
+            "source": "FUTBIN"
         }
-        
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Price check failed: {str(e)}")
 
