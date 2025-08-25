@@ -13,6 +13,9 @@ from contextlib import asynccontextmanager
 from pydantic import BaseModel
 from typing import List, Optional
 import logging
+import requests
+from bs4 import BeautifulSoup
+from fastapi import Query
 
 load_dotenv()
 
@@ -57,6 +60,7 @@ class TradingGoal(BaseModel):
 
 # Global connection pool
 pool = None
+PLAYERS_DB = []
 
 # Discord API helpers
 async def get_discord_user_info(access_token: str):
@@ -81,6 +85,23 @@ async def check_server_membership(user_id: str):
                 return resp.status == 200  # 200 = member, 404 = not member
     except Exception as e:
         return False  # Deny access on error
+        
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global pool, PLAYERS_DB
+    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+    
+    # Load players database
+    try:
+        with open("players_temp.json", "r", encoding="utf-8") as f:
+            PLAYERS_DB = json.load(f)
+            print(f"SUCCESS: Loaded {len(PLAYERS_DB)} players")
+    except FileNotFoundError:
+        print("ERROR: players_temp.json not found")
+        PLAYERS_DB = []
+    except Exception as e:
+        print(f"ERROR loading players: {e}")
+        PLAYERS_DB = []
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -185,6 +206,57 @@ async def login():
         f"https://discord.com/oauth2/authorize?client_id={DISCORD_CLIENT_ID}&redirect_uri={DISCORD_REDIRECT_URI}&response_type=code&scope=identify"
     )
 
+# Add this after your OAuth routes
+@app.get("/api/pricecheck")
+async def price_check(
+    player_name: str = Query(...), 
+    platform: str = Query("console"),
+    user_id: str = Depends(get_current_user)
+):
+    try:
+        # Search for player in PLAYERS_DB
+        player_match = None
+        search_term = player_name.lower()
+        
+        for player in PLAYERS_DB:
+            if search_term in f"{player['name']} {player['rating']}".lower():
+                player_match = player
+                break
+        
+        if not player_match:
+            raise HTTPException(status_code=404, detail="Player not found")
+        
+        # Scrape FUTBIN using player ID
+        player_url = f"https://www.futbin.com/25/player/{player_match['id']}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        }
+        
+        response = requests.get(player_url, headers=headers)
+        if response.status_code != 200:
+            raise HTTPException(status_code=500, detail="Failed to fetch price data")
+        
+        soup = BeautifulSoup(response.text, "html.parser")
+        
+        # Find price based on platform
+        platform_map = {"console": "ps", "pc": "pc"}
+        platform_key = platform_map.get(platform.lower(), "ps")
+        
+        price_div = soup.find("div", {"id": platform_key})
+        price = price_div.get_text(strip=True) if price_div else "N/A"
+        
+        return {
+            "player": player_match["name"],
+            "rating": player_match["rating"],
+            "price": price,
+            "platform": platform,
+            "club": player_match.get("club", "Unknown"),
+            "nation": player_match.get("nation", "Unknown")
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Price check failed: {str(e)}")
+
 # Enhanced OAuth callback with server verification
 @app.get("/api/callback")
 async def callback(request: Request):
@@ -277,6 +349,7 @@ async def get_current_user_info(request: Request, user_id: str = Depends(get_cur
     }
 
 # Settings endpoints
+# Replace your existing settings GET endpoint with this:
 @app.get("/api/settings")
 async def get_user_settings(
     user_id: str = Depends(get_current_user),
@@ -288,12 +361,16 @@ async def get_user_settings(
             user_id
         )
         
+        # Always merge with defaults to ensure all fields exist
+        default_settings = UserSettings().dict()
+        
         if settings:
-            return settings["settings"]
+            # Merge saved settings with defaults
+            saved_settings = settings["settings"]
+            merged_settings = {**default_settings, **saved_settings}
+            return merged_settings
         else:
-            # Return default settings
-            default_settings = UserSettings()
-            return default_settings.dict()
+            return default_settings
     except Exception as e:
         raise HTTPException(status_code=500, detail="Failed to fetch settings")
 
