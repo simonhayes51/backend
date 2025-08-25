@@ -1,7 +1,4 @@
 import os
-
-load_dotenv()
-
 app = FastAPI()
 
 @app.get("/")
