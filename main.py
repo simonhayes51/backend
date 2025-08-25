@@ -607,38 +607,44 @@ async def delete_all_user_data(
 @app.get("/api/search-players")
 async def search_players(
     q: str = "",
-    user_id: str = Depends(get_current_user),
     conn = Depends(get_db)
 ):
-    """Search players from fut_players table by name substring"""
+    """Search players from fut_players table - public endpoint"""
     query = q.strip()
+    
     if not query:
         return {"players": []}
+    
     try:
-        rows = await conn.fetch(
-            """
-            SELECT name, rating, version, card_id, image_url, player_slug, player_url, created_at
+        sql = """
+            SELECT name, rating, version, card_id, image_url, player_slug, 
+                   player_url, created_at
             FROM fut_players 
-            WHERE LOWER(name) LIKE LOWER($1)
+            WHERE LOWER(name) LIKE LOWER($1) 
             ORDER BY rating DESC, name ASC
             LIMIT 20
-            """,
-            f"%{query}%"
-        )
-        players = [{
-            "id": r["card_id"],
-            "name": r["name"],
-            "rating": r["rating"],
-            "version": r["version"] or "Base",
-            "card_id": str(r["card_id"]),
-            "image_url": r["image_url"],
-            "player_slug": r["player_slug"],
-            "player_url": r["player_url"],
-            "club": "Unknown",
-            "nation": "Unknown",
-            "position": "Unknown"
-        } for r in rows]
+        """
+        
+        rows = await conn.fetch(sql, f'%{query}%')
+        
+        players = []
+        for row in rows:
+            players.append({
+                "id": row["card_id"],
+                "name": row["name"],
+                "rating": row["rating"],
+                "version": row["version"] or "Base",
+                "card_id": str(row["card_id"]),
+                "image_url": row["image_url"],
+                "player_slug": row["player_slug"],
+                "player_url": row["player_url"],
+                "club": "Unknown",
+                "nation": "Unknown", 
+                "position": "Unknown"
+            })
+        
         return {"players": players}
+        
     except Exception as e:
         logging.error(f"Player search error: {e}")
         raise HTTPException(status_code=500, detail="Search failed")
