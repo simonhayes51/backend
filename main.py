@@ -200,9 +200,8 @@ async def callback(request: Request):
 @app.get("/api/pricecheck")
 async def price_check(
     player_name: str = Query(...),
-    platform: str = Query("console"),
-    user_id: str = Depends(get_current_user)
-):
+    platform: str = Query("console")
+):  # 👈 REMOVED AUTH CHECK HERE ✅
     try:
         # Match player by name + rating
         matched_player = next(
