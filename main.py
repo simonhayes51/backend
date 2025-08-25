@@ -804,6 +804,54 @@ async def health_check():
     except Exception as e:
         return {"status": "unhealthy", "database": "disconnected", "error": str(e)}
 
+@app.get("/api/fut-player-definition/{card_id}")
+async def get_player_definition(card_id: str):
+    """Proxy for FUT.GG player definition API"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"https://www.fut.gg/api/fut/player-item-definitions/25/{card_id}/",
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Accept": "application/json, text/plain, */*",
+                    "Accept-Language": "en-GB,en;q=0.9",
+                    "Referer": "https://www.fut.gg/",
+                    "Origin": "https://www.fut.gg"
+                }
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data
+                else:
+                    return {"error": f"API returned status {resp.status}"}
+    except Exception as e:
+        logging.error(f"Player definition fetch error: {e}")
+        return {"error": str(e)}
+
+@app.get("/api/fut-player-price/{card_id}")
+async def get_player_price(card_id: str):
+    """Proxy for FUT.GG player price API"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"https://www.fut.gg/api/fut/player-prices/25/{card_id}",
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Accept": "application/json, text/plain, */*",
+                    "Accept-Language": "en-GB,en;q=0.9",
+                    "Referer": "https://www.fut.gg/",
+                    "Origin": "https://www.fut.gg"
+                }
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data
+                else:
+                    return {"error": f"API returned status {resp.status}"}
+    except Exception as e:
+        logging.error(f"Player price fetch error: {e}")
+        return {"error": str(e)}
+
 @app.get("/")
 async def root():
     return {"message": "FUT Dashboard API", "status": "healthy"}
