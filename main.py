@@ -38,7 +38,7 @@ FRONTEND_URL = os.getenv("FRONTEND_URL", "https://frontend-production-ab5e.up.ra
 
 # ---------- NEW: JWT + Discord endpoints for extension ----------
 JWT_PRIVATE_KEY = os.getenv("JWT_PRIVATE_KEY", "dev-secret-change-me")  # set on Railway
-JWT_ISSUER = os.getenv("JWT_ISSUER", "your-dashboard")
+JWT_ISSUER = os.getenv("JWT_ISSUER", "fut-dashboard")  # Updated to match token generation
 JWT_TTL_SECONDS = int(os.getenv("JWT_TTL_SECONDS", "2592000"))  # 30 days
 
 DISCORD_OAUTH_AUTHORIZE = "https://discord.com/api/oauth2/authorize"
@@ -103,6 +103,251 @@ async def get_discord_user_info(access_token: str):
 async def check_server_membership(user_id: str):
     """Check if user is a member of the required Discord server"""
     try:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                # 1) Raw log + de-dup
+                inserted = await conn.fetchrow("""
+                    INSERT INTO fut_trades
+                      (discord_id, trade_id, player_name, card_version, buy_price, sell_price, ts, source)
+                    VALUES ($1,$2,$3,$4,$5,$6,to_timestamp($7),'webapp')
+                    ON CONFLICT (discord_id, trade_id) DO NOTHING
+                    RETURNING id
+                """, user_id, sale.trade_id, player, (version or None), sale.buy_price, sell, ts)
+
+                # 2) Mirror into `trades` only on first-seen sale - now includes trade_id
+                if inserted:
+                    await conn.execute("""
+                        INSERT INTO trades
+                          (user_id, player, version, buy, sell, quantity, platform, tag, notes, ea_tax, profit, timestamp, trade_id)
+                        VALUES
+                          ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, to_timestamp($12), $13)
+                        ON CONFLICT (user_id, trade_id) DO NOTHING
+                    """, user_id, player, version, buy, sell, qty, platform, tag, notes, ea_tax, profit, ts, sale.trade_id)
+
+        return {"ok": True, "mirrored_to_trades": bool(inserted)}
+    except Exception as e:
+        logging.error(f"Ingest error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to ingest sale")
+
+# -------------------------------------------------------------------------
+
+# Dashboard Logic
+async def fetch_dashboard_data(user_id: str, conn):
+    try:
+        portfolio = await conn.fetchrow(
+            "SELECT starting_balance FROM portfolio WHERE user_id=$1", 
+            user_id
+        )
+        stats = await conn.fetchrow(
+            "SELECT COALESCE(SUM(profit),0) AS total_profit, COALESCE(SUM(ea_tax),0) AS total_tax, COUNT(*) as total_trades FROM trades WHERE user_id=$1",
+            user_id,
+        )
+        trades = await conn.fetch(
+            "SELECT player, version, buy, sell, quantity, platform, profit, ea_tax, tag, timestamp "
+            "FROM trades WHERE user_id=$1 ORDER BY timestamp DESC LIMIT 10",
+            user_id,
+        )
+        all_trades = await conn.fetch(
+            "SELECT profit FROM trades WHERE user_id=$1 ORDER BY timestamp DESC",
+            user_id,
+        )
+        win_count = len([t for t in all_trades if t["profit"] and t["profit"] > 0])
+        win_rate = round((win_count / len(all_trades)) * 100, 1) if all_trades else 0
+        tag_stats = await conn.fetch(
+            "SELECT tag, COUNT(*) as count FROM trades WHERE user_id=$1 GROUP BY tag ORDER BY count DESC LIMIT 1",
+            user_id
+        )
+        most_used_tag = tag_stats[0]["tag"] if tag_stats else "N/A"
+        best_trade = await conn.fetchrow(
+            "SELECT * FROM trades WHERE user_id=$1 ORDER BY profit DESC LIMIT 1",
+            user_id
+        )
+
+        return {
+            "netProfit": stats["total_profit"] or 0,
+            "taxPaid": stats["total_tax"] or 0,
+            "startingBalance": portfolio["starting_balance"] if portfolio else 0,
+            "trades": [dict(row) for row in trades],
+            "profile": {
+                "totalProfit": stats["total_profit"] or 0,
+                "tradesLogged": stats["total_trades"] or 0,
+                "winRate": win_rate,
+                "mostUsedTag": most_used_tag,
+                "bestTrade": dict(best_trade) if best_trade else None,
+            }
+        }
+    except Exception as e:
+        logging.error(f"Dashboard fetch error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch dashboard data")
+
+# Protected API Routes
+@app.get("/api/dashboard")
+async def get_dashboard(
+    user_id: str = Depends(get_current_user),
+    conn = Depends(get_db)
+):
+    return await fetch_dashboard_data(user_id, conn)
+
+@app.get("/api/profile")
+async def get_profile(
+    user_id: str = Depends(get_current_user),
+    conn = Depends(get_db)
+):
+    return await fetch_dashboard_data(user_id, conn)
+
+@app.post("/api/trades")
+async def add_trade(
+    request: Request,
+    user_id: str = Depends(get_current_user),
+    conn = Depends(get_db)
+):
+    try:
+        data = await request.json()
+        required_fields = ["player", "version", "buy", "sell", "quantity", "platform", "tag"]
+        missing_fields = [field for field in required_fields if field not in data or data[field] == ""]
+        if missing_fields:
+            raise HTTPException(status_code=400, detail=f"Missing required fields: {missing_fields}")
+
+        try:
+            quantity = int(data["quantity"])
+            buy = int(data["buy"])
+            sell = int(data["sell"])
+            if quantity <= 0 or buy <= 0 or sell <= 0:
+                raise ValueError("Numeric values must be positive")
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="Invalid numeric values")
+
+        profit = (sell - buy) * quantity
+        ea_tax = int(sell * quantity * 0.05)
+
+        await conn.execute(
+            """
+            INSERT INTO trades (user_id, player, version, buy, sell, quantity, platform, profit, ea_tax, tag, timestamp)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
+            """,
+            user_id,
+            data["player"],
+            data["version"],
+            buy,
+            sell,
+            quantity,
+            data["platform"],
+            profit,
+            ea_tax,
+            data["tag"]
+        )
+        
+        return {"message": "Trade added successfully!", "profit": profit, "ea_tax": ea_tax}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Add trade error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to add trade")
+
+@app.get("/api/trades")
+async def get_all_trades(
+    user_id: str = Depends(get_current_user),
+    conn = Depends(get_db)
+):
+    try:
+        trades = await conn.fetch(
+            "SELECT * FROM trades WHERE user_id=$1 ORDER BY timestamp DESC",
+            user_id
+        )
+        return {"trades": [dict(row) for row in trades]}
+    except Exception as e:
+        logging.error(f"Get trades error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch trades")
+
+@app.delete("/api/trades/{trade_id}")
+async def delete_trade(
+    trade_id: int,
+    user_id: str = Depends(get_current_user),
+    conn = Depends(get_db)
+):
+    try:
+        result = await conn.execute(
+            "DELETE FROM trades WHERE id=$1 AND user_id=$2",
+            trade_id, user_id
+        )
+        if result == "DELETE 0":
+            raise HTTPException(status_code=404, detail="Trade not found")
+        return {"message": "Trade deleted successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Delete trade error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to delete trade")
+
+@app.get("/health")
+async def health_check():
+    try:
+        if pool:
+            async with pool.acquire() as conn:
+                await conn.fetchval("SELECT 1")
+            return {"status": "healthy", "database": "connected"}
+        else:
+            return {"status": "unhealthy", "database": "disconnected"}
+    except Exception as e:
+        return {"status": "unhealthy", "database": "disconnected", "error": str(e)}
+
+@app.get("/api/fut-player-definition/{card_id}")
+async def get_player_definition(card_id: str):
+    """Proxy for FUT.GG player definition API"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"https://www.fut.gg/api/fut/player-item-definitions/25/{card_id}/",
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Accept": "application/json, text/plain, */*",
+                    "Accept-Language": "en-GB,en;q=0.9",
+                    "Referer": "https://www.fut.gg/",
+                    "Origin": "https://www.fut.gg"
+                }
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data
+                else:
+                    return {"error": f"API returned status {resp.status}"}
+    except Exception as e:
+        logging.error(f"Player definition fetch error: {e}")
+        return {"error": str(e)}
+
+@app.get("/api/fut-player-price/{card_id}")
+async def get_player_price(card_id: str):
+    """Proxy for FUT.GG player price API"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"https://www.fut.gg/api/fut/player-prices/25/{card_id}",
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Accept": "application/json, text/plain, */*",
+                    "Accept-Language": "en-GB,en;q=0.9",
+                    "Referer": "https://www.fut.gg/",
+                    "Origin": "https://www.fut.gg"
+                }
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data
+                else:
+                    return {"error": f"API returned status {resp.status}"}
+    except Exception as e:
+        logging.error(f"Player price fetch error: {e}")
+        return {"error": str(e)}
+
+@app.get("/")
+async def root():
+    return {"message": "FUT Dashboard API", "status": "healthy"}
+
+# For Railway deployment
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=PORT):
         async with aiohttp.ClientSession() as session:
             async with session.get(
                 f"https://discord.com/api/guilds/{DISCORD_SERVER_ID}/members/{user_id}",
@@ -159,6 +404,15 @@ async def lifespan(app: FastAPI):
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 completed_at TIMESTAMP
             )
+        """)
+
+        # Add trade_id column to trades table for duplicate prevention
+        await conn.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS trade_id BIGINT")
+        
+        # Create unique constraint to prevent duplicates
+        await conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS trades_user_trade_uidx 
+            ON trades (user_id, trade_id)
         """)
 
         # 🔧 trades indexes
@@ -358,21 +612,6 @@ async def logout(request: Request):
     return {"message": "Logged out successfully"}
 
 # ---------- NEW: OAuth for the Chrome extension ----------
-# /oauth/start -> send user to Discord using your *server* redirect
-# Store extension redirects here
-OAUTH_STATE = {}
-
-def issue_extension_token(discord_id: str) -> str:
-    now = int(time.time())
-    payload = {
-        "sub": discord_id,
-        "scope": "trade:ingest",
-        "iat": now,
-        "exp": now + 60 * 60 * 24 * 30,  # 30 days
-        "iss": "fut-dashboard"
-    }
-    return jwt.encode(payload, JWT_PRIVATE_KEY, algorithm="HS256")
-
 @app.get("/oauth/start")
 async def oauth_start(redirect_uri: str):
     if not redirect_uri.startswith("https://") or "chromiumapp.org" not in redirect_uri:
@@ -390,70 +629,6 @@ async def oauth_start(redirect_uri: str):
         "prompt": "consent",
     }
     return RedirectResponse(f"{DISCORD_OAUTH_AUTHORIZE}?{urlencode(params)}")
-
-
-@app.get("/api/callback")
-async def callback(request: Request):
-    code = request.query_params.get("code")
-    state = request.query_params.get("state")
-    if not code:
-        raise HTTPException(status_code=400, detail="Missing code")
-
-    # Exchange code for access token
-    token_url = "https://discord.com/api/oauth2/token"
-    data = {
-        "client_id": DISCORD_CLIENT_ID,
-        "client_secret": DISCORD_CLIENT_SECRET,
-        "grant_type": "authorization_code",
-        "code": code,
-        "redirect_uri": DISCORD_REDIRECT_URI,   # must match what we used in /oauth/start
-    }
-    headers = {"Content-Type": "application/x-www-form-urlencoded"}
-
-    async with aiohttp.ClientSession() as session:
-        async with session.post(token_url, data=data, headers=headers) as resp:
-            if resp.status != 200:
-                raise HTTPException(status_code=400, detail="OAuth token exchange failed")
-            token_data = await resp.json()
-            access_token = token_data["access_token"]
-
-        # Get user info
-        async with session.get(
-            "https://discord.com/api/users/@me",
-            headers={"Authorization": f"Bearer {access_token}"}
-        ) as resp:
-            user_data = await resp.json()
-            if resp.status != 200:
-                raise HTTPException(status_code=400, detail="Failed to fetch user data")
-
-    user_id = user_data["id"]
-
-    # ✅ NEW: if this was triggered by the extension, bounce back with #token
-    if state and state in OAUTH_STATE:
-        meta = OAUTH_STATE.pop(state)
-        jwt_token = issue_extension_token(user_id)
-        ext_redirect = meta["ext_redirect"]   # chromiumapp.org URL
-        return RedirectResponse(f"{ext_redirect}#token={jwt_token}&state={state}")
-
-    # Otherwise, continue with your normal dashboard login flow
-    # (keep the rest of your existing session + DB code here)
-    # e.g. return RedirectResponse(f"{FRONTEND_URL}/?authenticated=true")
-
-    async with aiohttp.ClientSession() as s:
-        async with s.post(DISCORD_OAUTH_TOKEN, data=data, headers=headers) as r:
-            tok = await r.json()
-            if r.status != 200:
-                raise HTTPException(400, f"Token exchange failed: {tok}")
-            access_token = tok["access_token"]
-
-        async with s.get(DISCORD_USERS_ME, headers={"Authorization": f"Bearer {access_token}"}) as r2:
-            me = await r2.json()
-            if r2.status != 200:
-                raise HTTPException(400, f"Fetching user failed: {me}")
-
-    discord_id = me["id"]
-    jwt_token = issue_extension_token(discord_id)
-    return RedirectResponse(f"{ext_redirect}#token={jwt_token}&state={state}")
 
 # ----------------------------------------------------------
 
@@ -852,248 +1027,4 @@ async def ingest_sale(
     profit = (sell - buy) * qty
     ea_tax = int(round(sell * qty * 0.05))
 
-    try:
-        async with pool.acquire() as conn:
-            async with conn.transaction():
-                # 1) Raw log + de-dup
-                inserted = await conn.fetchrow("""
-                    INSERT INTO fut_trades
-                      (discord_id, trade_id, player_name, card_version, buy_price, sell_price, ts, source)
-                    VALUES ($1,$2,$3,$4,$5,$6,to_timestamp($7),'webapp')
-                    ON CONFLICT (discord_id, trade_id) DO NOTHING
-                    RETURNING id
-                """, user_id, sale.trade_id, player, (version or None), sale.buy_price, sell, ts)
-
-                # 2) Mirror into `trades` only on first-seen sale
-                if inserted:
-                    await conn.execute("""
-                        INSERT INTO trades
-                          (user_id, player, version, buy, sell, quantity, platform, tag, notes, ea_tax, profit, timestamp)
-                        VALUES
-                          ($1,     $2,     $3,     $4,  $5,   $6,      $7,      $8,   $9,    $10,    $11,   to_timestamp($12))
-                    """, user_id, player, version, buy, sell, qty, platform, tag, notes, ea_tax, profit, ts)
-
-        return {"ok": True, "mirrored_to_trades": bool(inserted)}
-    except Exception as e:
-        logging.error(f"Ingest error: {e}")
-        raise HTTPException(status_code=500, detail="Failed to ingest sale")
-
-# -------------------------------------------------------------------------
-
-# Dashboard Logic
-async def fetch_dashboard_data(user_id: str, conn):
-    try:
-        portfolio = await conn.fetchrow(
-            "SELECT starting_balance FROM portfolio WHERE user_id=$1", 
-            user_id
-        )
-        stats = await conn.fetchrow(
-            "SELECT COALESCE(SUM(profit),0) AS total_profit, COALESCE(SUM(ea_tax),0) AS total_tax, COUNT(*) as total_trades FROM trades WHERE user_id=$1",
-            user_id,
-        )
-        trades = await conn.fetch(
-            "SELECT player, version, buy, sell, quantity, platform, profit, ea_tax, tag, timestamp "
-            "FROM trades WHERE user_id=$1 ORDER BY timestamp DESC LIMIT 10",
-            user_id,
-        )
-        all_trades = await conn.fetch(
-            "SELECT profit FROM trades WHERE user_id=$1 ORDER BY timestamp DESC",
-            user_id,
-        )
-        win_count = len([t for t in all_trades if t["profit"] and t["profit"] > 0])
-        win_rate = round((win_count / len(all_trades)) * 100, 1) if all_trades else 0
-        tag_stats = await conn.fetch(
-            "SELECT tag, COUNT(*) as count FROM trades WHERE user_id=$1 GROUP BY tag ORDER BY count DESC LIMIT 1",
-            user_id
-        )
-        most_used_tag = tag_stats[0]["tag"] if tag_stats else "N/A"
-        best_trade = await conn.fetchrow(
-            "SELECT * FROM trades WHERE user_id=$1 ORDER BY profit DESC LIMIT 1",
-            user_id
-        )
-
-        return {
-            "netProfit": stats["total_profit"] or 0,
-            "taxPaid": stats["total_tax"] or 0,
-            "startingBalance": portfolio["starting_balance"] if portfolio else 0,
-            "trades": [dict(row) for row in trades],
-            "profile": {
-                "totalProfit": stats["total_profit"] or 0,
-                "tradesLogged": stats["total_trades"] or 0,
-                "winRate": win_rate,
-                "mostUsedTag": most_used_tag,
-                "bestTrade": dict(best_trade) if best_trade else None,
-            }
-        }
-    except Exception as e:
-        logging.error(f"Dashboard fetch error: {e}")
-        raise HTTPException(status_code=500, detail="Failed to fetch dashboard data")
-
-# Protected API Routes
-@app.get("/api/dashboard")
-async def get_dashboard(
-    user_id: str = Depends(get_current_user),
-    conn = Depends(get_db)
-):
-    return await fetch_dashboard_data(user_id, conn)
-
-@app.get("/api/profile")
-async def get_profile(
-    user_id: str = Depends(get_current_user),
-    conn = Depends(get_db)
-):
-    return await fetch_dashboard_data(user_id, conn)
-
-@app.post("/api/trades")
-async def add_trade(
-    request: Request,
-    user_id: str = Depends(get_current_user),
-    conn = Depends(get_db)
-):
-    try:
-        data = await request.json()
-        required_fields = ["player", "version", "buy", "sell", "quantity", "platform", "tag"]
-        missing_fields = [field for field in required_fields if field not in data or data[field] == ""]
-        if missing_fields:
-            raise HTTPException(status_code=400, detail=f"Missing required fields: {missing_fields}")
-
-        try:
-            quantity = int(data["quantity"])
-            buy = int(data["buy"])
-            sell = int(data["sell"])
-            if quantity <= 0 or buy <= 0 or sell <= 0:
-                raise ValueError("Numeric values must be positive")
-        except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="Invalid numeric values")
-
-        profit = (sell - buy) * quantity
-        ea_tax = int(sell * quantity * 0.05)
-
-        await conn.execute(
-            """
-            INSERT INTO trades (user_id, player, version, buy, sell, quantity, platform, profit, ea_tax, tag, timestamp)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
-            """,
-            user_id,
-            data["player"],
-            data["version"],
-            buy,
-            sell,
-            quantity,
-            data["platform"],
-            profit,
-            ea_tax,
-            data["tag"]
-        )
-        
-        return {"message": "Trade added successfully!", "profit": profit, "ea_tax": ea_tax}
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logging.error(f"Add trade error: {e}")
-        raise HTTPException(status_code=500, detail="Failed to add trade")
-
-@app.get("/api/trades")
-async def get_all_trades(
-    user_id: str = Depends(get_current_user),
-    conn = Depends(get_db)
-):
-    try:
-        trades = await conn.fetch(
-            "SELECT * FROM trades WHERE user_id=$1 ORDER BY timestamp DESC",
-            user_id
-        )
-        return {"trades": [dict(row) for row in trades]}
-    except Exception as e:
-        logging.error(f"Get trades error: {e}")
-        raise HTTPException(status_code=500, detail="Failed to fetch trades")
-
-@app.delete("/api/trades/{trade_id}")
-async def delete_trade(
-    trade_id: int,
-    user_id: str = Depends(get_current_user),
-    conn = Depends(get_db)
-):
-    try:
-        result = await conn.execute(
-            "DELETE FROM trades WHERE id=$1 AND user_id=$2",
-            trade_id, user_id
-        )
-        if result == "DELETE 0":
-            raise HTTPException(status_code=404, detail="Trade not found")
-        return {"message": "Trade deleted successfully"}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logging.error(f"Delete trade error: {e}")
-        raise HTTPException(status_code=500, detail="Failed to delete trade")
-
-@app.get("/health")
-async def health_check():
-    try:
-        if pool:
-            async with pool.acquire() as conn:
-                await conn.fetchval("SELECT 1")
-            return {"status": "healthy", "database": "connected"}
-        else:
-            return {"status": "unhealthy", "database": "disconnected"}
-    except Exception as e:
-        return {"status": "unhealthy", "database": "disconnected", "error": str(e)}
-
-@app.get("/api/fut-player-definition/{card_id}")
-async def get_player_definition(card_id: str):
-    """Proxy for FUT.GG player definition API"""
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"https://www.fut.gg/api/fut/player-item-definitions/25/{card_id}/",
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                    "Accept": "application/json, text/plain, */*",
-                    "Accept-Language": "en-GB,en;q=0.9",
-                    "Referer": "https://www.fut.gg/",
-                    "Origin": "https://www.fut.gg"
-                }
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return data
-                else:
-                    return {"error": f"API returned status {resp.status}"}
-    except Exception as e:
-        logging.error(f"Player definition fetch error: {e}")
-        return {"error": str(e)}
-
-@app.get("/api/fut-player-price/{card_id}")
-async def get_player_price(card_id: str):
-    """Proxy for FUT.GG player price API"""
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"https://www.fut.gg/api/fut/player-prices/25/{card_id}",
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                    "Accept": "application/json, text/plain, */*",
-                    "Accept-Language": "en-GB,en;q=0.9",
-                    "Referer": "https://www.fut.gg/",
-                    "Origin": "https://www.fut.gg"
-                }
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return data
-                else:
-                    return {"error": f"API returned status {resp.status}"}
-    except Exception as e:
-        logging.error(f"Player price fetch error: {e}")
-        return {"error": str(e)}
-
-@app.get("/")
-async def root():
-    return {"message": "FUT Dashboard API", "status": "healthy"}
-
-# For Railway deployment
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    try
