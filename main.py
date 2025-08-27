@@ -637,11 +637,16 @@ async def list_watch_items(user_id: str = Depends(get_current_user)):
             if not watches:
                 return {"ok": True, "items": []}
 
-            card_ids = [w["card_id"] for w in watches]
+            # ✅ pass BIGINT array to ANY()
+            card_ids = [int(w["card_id"]) for w in watches if w.get("card_id") is not None]
 
             async with player_pool.acquire() as pconn:
                 meta_rows = await pconn.fetch(
-                    "SELECT card_id, name, rating, club, nation FROM fut_players WHERE card_id = ANY($1)",
+                    """
+                    SELECT card_id, name, rating, club, nation
+                    FROM fut_players
+                    WHERE card_id = ANY($1::bigint[])
+                    """,
                     card_ids,
                 )
 
@@ -723,9 +728,14 @@ async def refresh_watch_item(watch_id: int, user_id: str = Depends(get_current_u
                 change_pct = round((change / int(w["started_price"])) * 100, 2)
 
             async with player_pool.acquire() as pconn:
+                # ✅ explicit BIGINT bind for single lookup
                 meta = await pconn.fetchrow(
-                    "SELECT card_id, name, rating, club, nation FROM fut_players WHERE card_id=$1",
-                    w["card_id"],
+                    """
+                    SELECT card_id, name, rating, club, nation
+                    FROM fut_players
+                    WHERE card_id = $1::bigint
+                    """,
+                    int(w["card_id"]),
                 )
             meta_dict = dict(meta) if meta else {}
 
