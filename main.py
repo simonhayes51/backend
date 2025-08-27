@@ -28,6 +28,8 @@ if missing_vars:
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 PLAYER_DATABASE_URL = os.getenv("PLAYER_DATABASE_URL", "postgresql://postgres:FiwuZKPRyUKvzWMMqTWxfpRGtZrOYLCa@shuttle.proxy.rlwy.net:19669/railway")
+WATCHLIST_DATABASE_URL = os.getenv("WATCHLIST_DATABASE_URL", DATABASE_URL)  # 👈 new (falls back to main DB)
+
 DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID")
 DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
 DISCORD_REDIRECT_URI = os.getenv("DISCORD_REDIRECT_URI")
@@ -89,17 +91,18 @@ class WatchlistCreate(BaseModel):
     notes: Optional[str] = None
 
 # --------- POOLS & LIFESPAN ---------
-pool = None
-player_pool = None
-watchlist_pool = None
+pool = None               # main app DB
+player_pool = None        # static players DB
+watchlist_pool = None     # watchlist DB
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global pool, player_pool
+    global pool, player_pool, watchlist_pool
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
     player_pool = await asyncpg.create_pool(PLAYER_DATABASE_URL, min_size=1, max_size=10)
+    watchlist_pool = await asyncpg.create_pool(WATCHLIST_DATABASE_URL, min_size=1, max_size=10)
 
-    # Create tables / indexes
+    # Create tables / indexes (main app)
     async with pool.acquire() as conn:
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS user_settings (
@@ -135,9 +138,7 @@ async def lifespan(app: FastAPI):
             )
         """)
         await conn.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS trade_id BIGINT")
-        await conn.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS trades_user_trade_uidx ON trades (user_id, trade_id)
-        """)
+        await conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS trades_user_trade_uidx ON trades (user_id, trade_id)""")
         await conn.execute("DROP INDEX IF EXISTS idx_trades_date")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_user_ts ON trades(user_id, timestamp)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_tag ON trades(user_id, tag)")
@@ -155,11 +156,11 @@ async def lifespan(app: FastAPI):
               source       TEXT DEFAULT 'webapp'
             )
         """)
-        await conn.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS fut_trades_uidx ON fut_trades (discord_id, trade_id)
-        """)
-        # --- Watchlist table ---
-        await conn.execute("""
+        await conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS fut_trades_uidx ON fut_trades (discord_id, trade_id)""")
+
+    # Create tables / indexes (watchlist DB)
+    async with watchlist_pool.acquire() as wconn:
+        await wconn.execute("""
             CREATE TABLE IF NOT EXISTS watchlist (
               id SERIAL PRIMARY KEY,
               user_id TEXT NOT NULL,
@@ -174,8 +175,8 @@ async def lifespan(app: FastAPI):
               notes TEXT
             )
         """)
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_watchlist_user ON watchlist(user_id)")
-        await conn.execute("""
+        await wconn.execute("CREATE INDEX IF NOT EXISTS idx_watchlist_user ON watchlist(user_id)")
+        await wconn.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS idx_watchlist_unique
             ON watchlist(user_id, card_id, platform)
         """)
@@ -183,10 +184,9 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        if pool:
-            await pool.close()
-        if player_pool:
-            await player_pool.close()
+        if pool: await pool.close()
+        if player_pool: await player_pool.close()
+        if watchlist_pool: await watchlist_pool.close()
 
 # --------- APP (create BEFORE routes) ---------
 app = FastAPI(lifespan=lifespan)
@@ -211,9 +211,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --------- DEPENDENCIES & HELPERS (must exist before routes) ---------
+# --------- DEPENDENCIES & HELPERS ---------
 async def get_db():
     async with pool.acquire() as connection:
+        yield connection
+
+async def get_watchlist_db():
+    async with watchlist_pool.acquire() as connection:
         yield connection
 
 def get_current_user(request: Request) -> str:
@@ -224,19 +228,14 @@ def get_current_user(request: Request) -> str:
 
 async def get_discord_user_info(access_token: str):
     async with aiohttp.ClientSession() as session:
-        async with session.get(
-            DISCORD_USERS_ME,
-            headers={"Authorization": f"Bearer {access_token}"}
-        ) as resp:
+        async with session.get(DISCORD_USERS_ME, headers={"Authorization": f"Bearer {access_token}"}) as resp:
             if resp.status != 200:
                 return None
             return await resp.json()
 
 async def check_server_membership(user_id: str) -> bool:
-    """Return True if the user is in your server, else False.
-       If you don't need this check, just 'return True' here."""
     if not (DISCORD_BOT_TOKEN and DISCORD_SERVER_ID):
-        return True  # skip check if not configured
+        return True
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
@@ -269,11 +268,11 @@ async def fetch_price(card_id: int, platform: str) -> Dict[str, Any]:
     platform: 'ps' or 'xbox'
     Returns: {"price": int|None, "isExtinct": bool, "updatedAt": str|None}
     """
-    platform = platform.lower()
+    platform = (platform or "").lower()
     key = f"{card_id}|{platform}"
     now = time.time()
 
-    # short TTL cache to keep things snappy
+    # short TTL cache
     if key in _price_cache and (now - _price_cache[key]["at"] < PRICE_CACHE_TTL):
         c = _price_cache[key]
         return {"price": c["price"], "isExtinct": c["isExtinct"], "updatedAt": c["updatedAt"]}
@@ -296,7 +295,6 @@ async def fetch_price(card_id: int, platform: str) -> Dict[str, Any]:
                 raise HTTPException(status_code=502, detail="Failed to fetch price")
             data = await r.json()
 
-    # Normalise (your working mapping has data.data.currentPrice)
     current = (data.get("data") or {}).get("currentPrice") or {}
     price = current.get("price")
     is_extinct = current.get("isExtinct", False)
@@ -305,7 +303,7 @@ async def fetch_price(card_id: int, platform: str) -> Dict[str, Any]:
     _price_cache[key] = {"at": now, "price": price, "isExtinct": is_extinct, "updatedAt": updated_at}
     return {"price": price, "isExtinct": is_extinct, "updatedAt": updated_at}
 
-# --------- ROUTES (now safe to define) ---------
+# --------- ROUTES ---------
 @app.get("/")
 async def root():
     return {"message": "FUT Dashboard API", "status": "healthy"}
@@ -429,7 +427,7 @@ async def oauth_start(redirect_uri: str):
     }
     return RedirectResponse(f"{DISCORD_OAUTH_AUTHORIZE}?{urlencode(params)}")
 
-# --- Your existing business routes (dashboard, trades, settings, goals, analytics, bulk, export/import, search) ---
+# --- Business routes (dashboard, trades, settings, goals, analytics, bulk, export/import, search) ---
 
 # Dashboard helper
 async def fetch_dashboard_data(user_id: str, conn):
@@ -550,7 +548,7 @@ async def get_player_price(card_id: str):
 
 # --------- WATCHLIST ROUTES ---------
 @app.post("/api/watchlist")
-async def add_watch_item(payload: WatchlistCreate, user_id: str = Depends(get_current_user), conn = Depends(get_db)):
+async def add_watch_item(payload: WatchlistCreate, user_id: str = Depends(get_current_user), conn = Depends(get_watchlist_db)):
     live = await fetch_price(payload.card_id, payload.platform)
     start_price = live["price"] if isinstance(live["price"], int) else 0
 
@@ -575,75 +573,110 @@ async def add_watch_item(payload: WatchlistCreate, user_id: str = Depends(get_cu
         live["price"] if isinstance(live["price"], int) else None,
         payload.notes,
     )
-    return {"ok": True, "id": row["id"]}
+    return {"ok": True, "id": row["id"], "start_price": start_price, "is_extinct": live.get("isExtinct", False)}
 
 @app.get("/api/watchlist")
-async def list_watch_items(user_id: str = Depends(get_current_user), conn = Depends(get_db)):
+async def list_watch_items(user_id: str = Depends(get_current_user), conn = Depends(get_watchlist_db)):
+    # 1) Load user's watchlist rows
     rows = await conn.fetch("SELECT * FROM watchlist WHERE user_id=$1 ORDER BY started_at DESC", user_id)
+    watches = [dict(r) for r in rows]
+    if not watches:
+        return {"ok": True, "items": []}
+
+    # 2) Pull player meta from PLAYER DB (join via code)
+    card_ids = [w["card_id"] for w in watches]
+    async with player_pool.acquire() as pconn:
+        meta_rows = await pconn.fetch(
+            "SELECT card_id, name, rating, club, nation FROM fut_players WHERE card_id = ANY($1)",
+            card_ids
+        )
+    meta_map = {int(m["card_id"]): {k: m[k] for k in ("name", "rating", "club", "nation")} for m in meta_rows}
+
+    # 3) Enrich each with live price + change/% + static meta
     enriched = []
-    for r in rows:
-        live = await fetch_price(r["card_id"], r["platform"])
-        live_price = live["price"] if isinstance(live["price"], int) else None
+    for w in watches:
+        live = await fetch_price(w["card_id"], w["platform"])
+        live_price = live.get("price")
         change = change_pct = None
-        if live_price is not None and r["started_price"] > 0:
-            change = live_price - r["started_price"]
-            change_pct = round((change / r["started_price"]) * 100, 2)
+        if (isinstance(live_price, int) or isinstance(live_price, float)) and (w["started_price"] and w["started_price"] > 0):
+            change = int(live_price) - int(w["started_price"])
+            change_pct = round((change / int(w["started_price"])) * 100, 2)
+
+        m = meta_map.get(int(w["card_id"]), {})
         enriched.append({
-            "id": r["id"],
-            "card_id": r["card_id"],
-            "player_name": r["player_name"],
-            "version": r["version"],
-            "platform": r["platform"],
-            "started_price": r["started_price"],
-            "started_at": r["started_at"].isoformat(),
-            "current_price": live_price,
+            "id": w["id"],
+            "card_id": w["card_id"],
+            "player_name": w["player_name"],
+            "version": w["version"],
+            "platform": w["platform"],
+            "started_price": w["started_price"],
+            "started_at": w["started_at"].isoformat(),
+            "current_price": live_price if isinstance(live_price, int) else None,
             "is_extinct": live.get("isExtinct", False),
             "updated_at": live.get("updatedAt"),
             "change": change,
             "change_pct": change_pct,
-            "notes": r["notes"],
+            "notes": w["notes"],
+            # static meta
+            "name": m.get("name"),
+            "rating": m.get("rating"),
+            "club": m.get("club"),
+            "nation": m.get("nation"),
         })
     return {"ok": True, "items": enriched}
 
 @app.delete("/api/watchlist/{watch_id}")
-async def delete_watch_item(watch_id: int, user_id: str = Depends(get_current_user), conn = Depends(get_db)):
+async def delete_watch_item(watch_id: int, user_id: str = Depends(get_current_user), conn = Depends(get_watchlist_db)):
     res = await conn.execute("DELETE FROM watchlist WHERE id=$1 AND user_id=$2", watch_id, user_id)
     if res == "DELETE 0":
         raise HTTPException(status_code=404, detail="Watch item not found")
     return {"ok": True}
 
 @app.post("/api/watchlist/{watch_id}/refresh")
-async def refresh_watch_item(watch_id: int, user_id: str = Depends(get_current_user), conn = Depends(get_db)):
-    r = await conn.fetchrow("SELECT * FROM watchlist WHERE id=$1 AND user_id=$2", watch_id, user_id)
-    if not r:
+async def refresh_watch_item(watch_id: int, user_id: str = Depends(get_current_user), conn = Depends(get_watchlist_db)):
+    w = await conn.fetchrow("SELECT * FROM watchlist WHERE id=$1 AND user_id=$2", watch_id, user_id)
+    if not w:
         raise HTTPException(status_code=404, detail="Watch item not found")
 
-    live = await fetch_price(r["card_id"], r["platform"])
-    live_price = live["price"] if isinstance(live["price"], int) else None
+    live = await fetch_price(w["card_id"], w["platform"])
+    live_price = live.get("price") if isinstance(live.get("price"), int) else None
 
     await conn.execute("UPDATE watchlist SET last_price=$1, last_checked=NOW() WHERE id=$2", live_price, watch_id)
 
     change = change_pct = None
-    if live_price is not None and r["started_price"] > 0:
-        change = live_price - r["started_price"]
-        change_pct = round((change / r["started_price"]) * 100, 2)
+    if live_price is not None and w["started_price"] > 0:
+        change = int(live_price) - int(w["started_price"])
+        change_pct = round((change / int(w["started_price"])) * 100, 2)
+
+    # optional: enrich with static meta on the refresh response too
+    async with player_pool.acquire() as pconn:
+        meta = await pconn.fetchrow(
+            "SELECT card_id, name, rating, club, nation FROM fut_players WHERE card_id=$1",
+            w["card_id"]
+        )
+    meta_dict = dict(meta) if meta else {}
 
     return {
         "ok": True,
         "item": {
-            "id": r["id"],
-            "card_id": r["card_id"],
-            "player_name": r["player_name"],
-            "version": r["version"],
-            "platform": r["platform"],
-            "started_price": r["started_price"],
-            "started_at": r["started_at"].isoformat(),
+            "id": w["id"],
+            "card_id": w["card_id"],
+            "player_name": w["player_name"],
+            "version": w["version"],
+            "platform": w["platform"],
+            "started_price": w["started_price"],
+            "started_at": w["started_at"].isoformat(),
             "current_price": live_price,
             "is_extinct": live.get("isExtinct", False),
             "updated_at": live.get("updatedAt"),
             "change": change,
             "change_pct": change_pct,
-            "notes": r["notes"],
+            "notes": w["notes"],
+            # static meta
+            "name": meta_dict.get("name"),
+            "rating": meta_dict.get("rating"),
+            "club": meta_dict.get("club"),
+            "nation": meta_dict.get("nation"),
         }
     }
 
@@ -873,7 +906,7 @@ async def ingest_sale(sale: ExtSale, auth = Depends(require_extension_jwt)):
         logging.error(f"Ingest error: {e}")
         raise HTTPException(status_code=500, detail="Failed to ingest sale")
 
-# ---- entrypoint (valid Python) ----
+# ---- entrypoint ----
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=PORT)
