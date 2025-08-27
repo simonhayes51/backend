@@ -19,6 +19,8 @@ from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
+from app.routers.squad import router as squad_router
+app.include_router(squad_router, prefix="/api")
 
 load_dotenv()
 
