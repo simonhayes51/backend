@@ -19,8 +19,6 @@ from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
-from app.routers.squad import router as squad_router
-app.include_router(squad_router, prefix="/api")
 
 load_dotenv()
 
@@ -218,12 +216,15 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 # --------- MIDDLEWARE ---------
+# Session cookie must be cross-site for FE<->BE split
 app.add_middleware(
     SessionMiddleware,
     secret_key=SECRET_KEY,
     same_site="none",
     https_only=True,
 )
+
+# CORS with exact frontend + Railway wildcard; credentials enabled
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -231,10 +232,12 @@ app.add_middleware(
         "http://localhost:5173",
         "http://localhost:3000",
     ],
-    allow_origin_regex=r"https://.*\.railway\.app",
+    allow_origin_regex=r"^https://.*\.railway\.app$",
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET","POST","PUT","PATCH","DELETE","OPTIONS"],
+    allow_headers=["Authorization","Content-Type","X-Requested-With","Accept"],
+    expose_headers=["Content-Disposition"],
+    max_age=600,
 )
 
 # --------- DEPENDENCIES & HELPERS ---------
@@ -456,8 +459,6 @@ async def oauth_start(redirect_uri: str):
         "prompt": "consent",
     }
     return RedirectResponse(f"{DISCORD_OAUTH_AUTHORIZE}?{urlencode(params)}")
-
-# --- Business routes (dashboard, trades, settings, goals, analytics, bulk, export/import, search) ---
 
 # Dashboard helper
 async def fetch_dashboard_data(user_id: str, conn):
@@ -809,7 +810,6 @@ async def get_user_settings(user_id: str = Depends(get_current_user), conn=Depen
         """, user_id)
         
         if settings_row:
-            # Convert database row to dictionary matching frontend expectations
             return {
                 "default_platform": settings_row["default_platform"],
                 "custom_tags": settings_row["custom_tags"] or [],
@@ -822,12 +822,9 @@ async def get_user_settings(user_id: str = Depends(get_current_user), conn=Depen
                 "visible_widgets": settings_row["visible_widgets"] or ["profit", "tax", "balance", "trades"]
             }
         else:
-            # Return default settings if none exist
-            default_settings = UserSettings()
-            return default_settings.dict()
+            return UserSettings().dict()
     except Exception as e:
         logging.error(f"Error fetching user settings: {e}")
-        # Return defaults on error
         return UserSettings().dict()
 
 @app.post("/api/settings")
@@ -1186,6 +1183,10 @@ async def ingest_sale(sale: ExtSale, auth=Depends(require_extension_jwt)):
     except Exception as e:
         logging.error(f"Ingest error: {e}")
         raise HTTPException(status_code=500, detail="Failed to ingest sale")
+
+# --------- Include Squad Builder router LAST (after app + middleware exist) ---------
+from app.routers.squad import router as squad_router  # noqa: E402
+app.include_router(squad_router, prefix="/api")
 
 # ---- entrypoint ----
 if __name__ == "__main__":
