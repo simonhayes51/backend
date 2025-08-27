@@ -334,7 +334,7 @@ async def callback(request: Request):
     token_url = "https://discord.com/api/oauth2/token"
     data = {
         "client_id": DISCORD_CLIENT_ID,
-        "client_secret": DISCORD_CLIENT_SECRET,
+        "client_secret": DISCORD_CLIENT_SECRET",
         "grant_type": "authorization_code",
         "code": code,
         "redirect_uri": DISCORD_REDIRECT_URI,
@@ -577,13 +577,11 @@ async def add_watch_item(payload: WatchlistCreate, user_id: str = Depends(get_cu
 
 @app.get("/api/watchlist")
 async def list_watch_items(user_id: str = Depends(get_current_user), conn = Depends(get_watchlist_db)):
-    # 1) Load user's watchlist rows
     rows = await conn.fetch("SELECT * FROM watchlist WHERE user_id=$1 ORDER BY started_at DESC", user_id)
     watches = [dict(r) for r in rows]
     if not watches:
         return {"ok": True, "items": []}
 
-    # 2) Pull player meta from PLAYER DB (join via code)
     card_ids = [w["card_id"] for w in watches]
     async with player_pool.acquire() as pconn:
         meta_rows = await pconn.fetch(
@@ -592,7 +590,6 @@ async def list_watch_items(user_id: str = Depends(get_current_user), conn = Depe
         )
     meta_map = {int(m["card_id"]): {k: m[k] for k in ("name", "rating", "club", "nation")} for m in meta_rows}
 
-    # 3) Enrich each with live price + change/% + static meta
     enriched = []
     for w in watches:
         live = await fetch_price(w["card_id"], w["platform"])
@@ -617,7 +614,6 @@ async def list_watch_items(user_id: str = Depends(get_current_user), conn = Depe
             "change": change,
             "change_pct": change_pct,
             "notes": w["notes"],
-            # static meta
             "name": m.get("name"),
             "rating": m.get("rating"),
             "club": m.get("club"),
@@ -648,7 +644,6 @@ async def refresh_watch_item(watch_id: int, user_id: str = Depends(get_current_u
         change = int(live_price) - int(w["started_price"])
         change_pct = round((change / int(w["started_price"])) * 100, 2)
 
-    # optional: enrich with static meta on the refresh response too
     async with player_pool.acquire() as pconn:
         meta = await pconn.fetchrow(
             "SELECT card_id, name, rating, club, nation FROM fut_players WHERE card_id=$1",
@@ -672,7 +667,6 @@ async def refresh_watch_item(watch_id: int, user_id: str = Depends(get_current_u
             "change": change,
             "change_pct": change_pct,
             "notes": w["notes"],
-            # static meta
             "name": meta_dict.get("name"),
             "rating": meta_dict.get("rating"),
             "club": meta_dict.get("club"),
@@ -848,21 +842,50 @@ async def delete_all_user_data(confirm: bool = False, user_id: str = Depends(get
     await conn.execute("UPDATE portfolio SET starting_balance = 0 WHERE user_id=$1", user_id)
     return {"message": "All data deleted successfully", "trades_deleted": 0}
 
-# Search players
+# Search players  ✅ (updated for your columns; also supports card_id search)
 @app.get("/api/search-players")
 async def search_players(q: str = ""):
-    q = q.strip()
+    q = (q or "").strip()
     if not q:
         return {"players": []}
     try:
         async with player_pool.acquire() as conn:
             rows = await conn.fetch(
-                """SELECT name, rating, card_id FROM fut_players 
-                   WHERE LOWER(name) LIKE LOWER($1) 
-                   ORDER BY rating DESC, name ASC LIMIT 20""",
+                """
+                SELECT
+                  card_id,
+                  name,
+                  rating,
+                  version,
+                  image_url,
+                  club,
+                  nation,
+                  position,
+                  price
+                FROM fut_players
+                WHERE
+                  LOWER(name) LIKE LOWER($1)        -- by name
+                  OR card_id::text LIKE $1          -- or by id
+                ORDER BY rating DESC NULLS LAST, name ASC
+                LIMIT 20
+                """,
                 f"%{q}%"
             )
-        return {"players": [{"name": r["name"], "rating": r["rating"], "card_id": str(r["card_id"])} for r in rows]}
+        players = [
+            {
+                "card_id": int(r["card_id"]),
+                "name": r["name"],
+                "rating": r["rating"],
+                "version": r["version"],
+                "image_url": r["image_url"],
+                "club": r["club"],
+                "nation": r["nation"],
+                "position": r["position"],
+                "price": r["price"],
+            }
+            for r in rows
+        ]
+        return {"players": players}
     except Exception as e:
         logging.error(f"Player search error: {e}")
         return {"players": [], "error": str(e)}
