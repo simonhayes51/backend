@@ -27,8 +27,9 @@ if missing_vars:
     raise ValueError(f"Missing required environment variables: {missing_vars}")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-PLAYER_DATABASE_URL = os.getenv("PLAYER_DATABASE_URL", "postgresql://postgres:FiwuZKPRyUKvzWMMqTWxfpRGtZrOYLCa@shuttle.proxy.rlwy.net:19669/railway")
-WATCHLIST_DATABASE_URL = os.getenv("WATCHLIST_DATABASE_URL", DATABASE_URL)  # 👈 new (falls back to main DB)
+# ✅ DEFAULT PLAYER DB TO MAIN DB (so fut_players is visible)
+PLAYER_DATABASE_URL = os.getenv("PLAYER_DATABASE_URL", DATABASE_URL)
+WATCHLIST_DATABASE_URL = os.getenv("WATCHLIST_DATABASE_URL", DATABASE_URL)
 
 DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID")
 DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
@@ -98,9 +99,19 @@ watchlist_pool = None     # watchlist DB
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global pool, player_pool, watchlist_pool
+
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
-    player_pool = await asyncpg.create_pool(PLAYER_DATABASE_URL, min_size=1, max_size=10)
-    watchlist_pool = await asyncpg.create_pool(WATCHLIST_DATABASE_URL, min_size=1, max_size=10)
+
+    # ✅ Reuse pool when URLs match (prevents mis-pointing and double close)
+    if PLAYER_DATABASE_URL == DATABASE_URL:
+        player_pool = pool
+    else:
+        player_pool = await asyncpg.create_pool(PLAYER_DATABASE_URL, min_size=1, max_size=10)
+
+    if WATCHLIST_DATABASE_URL == DATABASE_URL:
+        watchlist_pool = pool
+    else:
+        watchlist_pool = await asyncpg.create_pool(WATCHLIST_DATABASE_URL, min_size=1, max_size=10)
 
     # Create tables / indexes (main app)
     async with pool.acquire() as conn:
@@ -184,9 +195,11 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        if pool: await pool.close()
-        if player_pool: await player_pool.close()
-        if watchlist_pool: await watchlist_pool.close()
+        # Close each unique pool once
+        to_close = {pool, player_pool, watchlist_pool}
+        for p in to_close:
+            if p is not None:
+                await p.close()
 
 # --------- APP (create BEFORE routes) ---------
 app = FastAPI(lifespan=lifespan)
@@ -334,6 +347,7 @@ async def callback(request: Request):
     token_url = "https://discord.com/api/oauth2/token"
     data = {
         "client_id": DISCORD_CLIENT_ID,
+        # ✅ fixed stray quote typo here
         "client_secret": DISCORD_CLIENT_SECRET,
         "grant_type": "authorization_code",
         "code": code,
@@ -842,7 +856,7 @@ async def delete_all_user_data(confirm: bool = False, user_id: str = Depends(get
     await conn.execute("UPDATE portfolio SET starting_balance = 0 WHERE user_id=$1", user_id)
     return {"message": "All data deleted successfully", "trades_deleted": 0}
 
-# Search players  ✅ (updated for your columns; also supports card_id search)
+# Search players  ✅ (matches your fut_players columns; id or name)
 @app.get("/api/search-players")
 async def search_players(q: str = ""):
     q = (q or "").strip()
