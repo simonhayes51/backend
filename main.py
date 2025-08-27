@@ -20,6 +20,8 @@ from contextlib import asynccontextmanager
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 
+logging.basicConfig(level=logging.INFO)
+
 load_dotenv()
 
 # --------- ENV ---------
@@ -460,6 +462,8 @@ async def oauth_start(redirect_uri: str):
     }
     return RedirectResponse(f"{DISCORD_OAUTH_AUTHORIZE}?{urlencode(params)}")
 
+# --- Business routes (dashboard, trades, settings, goals, analytics, bulk, export/import, search) ---
+
 # Dashboard helper
 async def fetch_dashboard_data(user_id: str, conn):
     portfolio = await conn.fetchrow("SELECT starting_balance FROM portfolio WHERE user_id=$1", user_id)
@@ -810,6 +814,7 @@ async def get_user_settings(user_id: str = Depends(get_current_user), conn=Depen
         """, user_id)
         
         if settings_row:
+            # Convert database row to dictionary matching frontend expectations
             return {
                 "default_platform": settings_row["default_platform"],
                 "custom_tags": settings_row["custom_tags"] or [],
@@ -822,9 +827,12 @@ async def get_user_settings(user_id: str = Depends(get_current_user), conn=Depen
                 "visible_widgets": settings_row["visible_widgets"] or ["profit", "tax", "balance", "trades"]
             }
         else:
-            return UserSettings().dict()
+            # Return default settings if none exist
+            default_settings = UserSettings()
+            return default_settings.dict()
     except Exception as e:
         logging.error(f"Error fetching user settings: {e}")
+        # Return defaults on error
         return UserSettings().dict()
 
 @app.post("/api/settings")
@@ -1184,9 +1192,13 @@ async def ingest_sale(sale: ExtSale, auth=Depends(require_extension_jwt)):
         logging.error(f"Ingest error: {e}")
         raise HTTPException(status_code=500, detail="Failed to ingest sale")
 
-# --------- Include Squad Builder router LAST (after app + middleware exist) ---------
-from app.routers.squad import router as squad_router  # noqa: E402
-app.include_router(squad_router, prefix="/api")
+# --------- Try to include Squad Builder router LAST (optional) ---------
+try:
+    from app.routers.squad import router as squad_router  # type: ignore
+    app.include_router(squad_router, prefix="/api")
+    logging.info("✅ Squad router loaded")
+except Exception as e:
+    logging.warning("⚠️ Squad router not loaded: %s", e)
 
 # ---- entrypoint ----
 if __name__ == "__main__":
