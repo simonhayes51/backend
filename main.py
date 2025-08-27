@@ -29,7 +29,7 @@ if missing_vars:
     raise ValueError(f"Missing required environment variables: {missing_vars}")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-# ✅ DEFAULT PLAYER DB TO MAIN DB (so fut_players is visible)
+# DEFAULT PLAYER DB TO MAIN DB (so fut_players is visible)
 PLAYER_DATABASE_URL = os.getenv("PLAYER_DATABASE_URL", DATABASE_URL)
 WATCHLIST_DATABASE_URL = os.getenv("WATCHLIST_DATABASE_URL", DATABASE_URL)
 
@@ -105,7 +105,7 @@ async def lifespan(app: FastAPI):
 
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
 
-    # ✅ Reuse pool when URLs match (prevents mis-pointing and double close)
+    # Reuse pool when URLs match (prevents mis-pointing and double close)
     if PLAYER_DATABASE_URL == DATABASE_URL:
         player_pool = pool
     else:
@@ -119,10 +119,18 @@ async def lifespan(app: FastAPI):
     # Create tables / indexes (main app)
     async with pool.acquire() as conn:
         await conn.execute("""
-            CREATE TABLE IF NOT EXISTS user_settings (
+            CREATE TABLE IF NOT EXISTS usersettings (
                 id SERIAL PRIMARY KEY,
                 user_id VARCHAR(255) UNIQUE NOT NULL,
-                settings JSONB DEFAULT '{}',
+                default_platform VARCHAR(50) DEFAULT 'Console',
+                custom_tags JSONB DEFAULT '[]',
+                currency_format VARCHAR(20) DEFAULT 'coins',
+                theme VARCHAR(20) DEFAULT 'dark',
+                timezone VARCHAR(50) DEFAULT 'UTC',
+                date_format VARCHAR(10) DEFAULT 'US',
+                include_tax_in_profit BOOLEAN DEFAULT true,
+                default_chart_range VARCHAR(10) DEFAULT '30d',
+                visible_widgets JSONB DEFAULT '["profit", "tax", "balance", "trades"]',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
@@ -778,24 +786,89 @@ async def get_current_user_info(request: Request, user_id: str = Depends(get_cur
         "authenticated": True,
     }
 
-# Settings
+# Settings - Updated to use usersettings table
 @app.get("/api/settings")
 async def get_user_settings(user_id: str = Depends(get_current_user), conn=Depends(get_db)):
-    settings = await conn.fetchrow("SELECT settings FROM user_settings WHERE user_id=$1", user_id)
-    return settings["settings"] if settings else UserSettings().dict()
+    """Get user settings from usersettings table, return defaults if none exist"""
+    try:
+        settings_row = await conn.fetchrow("""
+            SELECT 
+                default_platform, 
+                custom_tags, 
+                currency_format, 
+                theme, 
+                timezone, 
+                date_format, 
+                include_tax_in_profit, 
+                default_chart_range, 
+                visible_widgets
+            FROM usersettings 
+            WHERE user_id = $1
+        """, user_id)
+        
+        if settings_row:
+            # Convert database row to dictionary matching frontend expectations
+            return {
+                "default_platform": settings_row["default_platform"],
+                "custom_tags": settings_row["custom_tags"] or [],
+                "currency_format": settings_row["currency_format"],
+                "theme": settings_row["theme"],
+                "timezone": settings_row["timezone"],
+                "date_format": settings_row["date_format"],
+                "include_tax_in_profit": settings_row["include_tax_in_profit"],
+                "default_chart_range": settings_row["default_chart_range"],
+                "visible_widgets": settings_row["visible_widgets"] or ["profit", "tax", "balance", "trades"]
+            }
+        else:
+            # Return default settings if none exist
+            default_settings = UserSettings()
+            return default_settings.dict()
+    except Exception as e:
+        logging.error(f"Error fetching user settings: {e}")
+        # Return defaults on error
+        return UserSettings().dict()
 
 @app.post("/api/settings")
 async def update_user_settings(settings: UserSettings, user_id: str = Depends(get_current_user), conn=Depends(get_db)):
-    await conn.execute(
-        """
-        INSERT INTO user_settings (user_id, settings, updated_at)
-        VALUES ($1, $2, NOW())
-        ON CONFLICT (user_id) DO UPDATE SET settings = $2, updated_at = NOW()
-        """,
-        user_id,
-        json.dumps(settings.dict()),
-    )
-    return {"message": "Settings updated successfully"}
+    """Update user settings in usersettings table"""
+    try:
+        await conn.execute(
+            """
+            INSERT INTO usersettings (
+                user_id, default_platform, custom_tags, currency_format, theme, 
+                timezone, date_format, include_tax_in_profit, default_chart_range, 
+                visible_widgets, updated_at
+            ) 
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+            ON CONFLICT (user_id) 
+            DO UPDATE SET 
+                default_platform = EXCLUDED.default_platform,
+                custom_tags = EXCLUDED.custom_tags,
+                currency_format = EXCLUDED.currency_format,
+                theme = EXCLUDED.theme,
+                timezone = EXCLUDED.timezone,
+                date_format = EXCLUDED.date_format,
+                include_tax_in_profit = EXCLUDED.include_tax_in_profit,
+                default_chart_range = EXCLUDED.default_chart_range,
+                visible_widgets = EXCLUDED.visible_widgets,
+                updated_at = NOW()
+            """,
+            user_id,
+            settings.default_platform,
+            json.dumps(settings.custom_tags),
+            settings.currency_format,
+            settings.theme,
+            settings.timezone,
+            settings.date_format,
+            settings.include_tax_in_profit,
+            settings.default_chart_range,
+            json.dumps(settings.visible_widgets)
+        )
+        
+        return {"message": "Settings updated successfully"}
+    except Exception as e:
+        logging.error(f"Error updating user settings: {e}")
+        raise HTTPException(status_code=500, detail="Failed to update settings")
 
 @app.post("/api/portfolio/balance")
 async def update_starting_balance(request: Request, user_id: str = Depends(get_current_user), conn=Depends(get_db)):
@@ -1001,7 +1074,7 @@ async def delete_all_user_data(confirm: bool = False, user_id: str = Depends(get
     await conn.execute("UPDATE portfolio SET starting_balance = 0 WHERE user_id=$1", user_id)
     return {"message": "All data deleted successfully", "trades_deleted": 0}
 
-# Search players  ✅ (matches your fut_players columns; id or name)
+# Search players
 @app.get("/api/search-players")
 async def search_players(q: str = ""):
     q = (q or "").strip()
