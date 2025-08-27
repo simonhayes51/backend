@@ -16,7 +16,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 
 load_dotenv()
 
@@ -48,6 +48,11 @@ OAUTH_STATE = {}
 if not SECRET_KEY:
     raise ValueError("SECRET_KEY environment variable is required")
 
+# --------- FUT.GG / Watchlist config ---------
+FUTGG_BASE = "https://www.fut.gg/api/fut/player-prices/25"
+PRICE_CACHE_TTL = 5  # seconds
+_price_cache: Dict[str, Dict[str, Any]] = {}  # {(card_id|platform): {"at": ts, "price": int|None, "isExtinct": bool, "updatedAt": str|None}}
+
 # --------- MODELS ---------
 class UserSettings(BaseModel):
     default_platform: Optional[str] = "Console"
@@ -74,6 +79,14 @@ class ExtSale(BaseModel):
     buy_price: Optional[int] = None
     sell_price: int
     timestamp_ms: int
+
+# Watchlist payload
+class WatchlistCreate(BaseModel):
+    card_id: int
+    player_name: str
+    version: Optional[str] = None
+    platform: str  # "ps" | "xbox"
+    notes: Optional[str] = None
 
 # --------- POOLS & LIFESPAN ---------
 pool = None
@@ -143,6 +156,27 @@ async def lifespan(app: FastAPI):
         """)
         await conn.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS fut_trades_uidx ON fut_trades (discord_id, trade_id)
+        """)
+        # --- Watchlist table ---
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS watchlist (
+              id SERIAL PRIMARY KEY,
+              user_id TEXT NOT NULL,
+              card_id BIGINT NOT NULL,
+              player_name TEXT NOT NULL,
+              version TEXT,
+              platform TEXT NOT NULL,         -- 'ps' | 'xbox'
+              started_price INTEGER NOT NULL,
+              started_at TIMESTAMP NOT NULL DEFAULT NOW(),
+              last_price INTEGER,
+              last_checked TIMESTAMP,
+              notes TEXT
+            )
+        """)
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_watchlist_user ON watchlist(user_id)")
+        await conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_watchlist_unique
+            ON watchlist(user_id, card_id, platform)
         """)
 
     try:
@@ -227,6 +261,48 @@ def require_extension_jwt(request: Request):
     except Exception as e:
         raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
     return SimpleNamespace(discord_id=payload.get("sub"))
+
+# --------- FUT.GG price fetch (watchlist helper) ---------
+async def fetch_price(card_id: int, platform: str) -> Dict[str, Any]:
+    """
+    platform: 'ps' or 'xbox'
+    Returns: {"price": int|None, "isExtinct": bool, "updatedAt": str|None}
+    """
+    platform = platform.lower()
+    key = f"{card_id}|{platform}"
+    now = time.time()
+
+    # short TTL cache to keep things snappy
+    if key in _price_cache and (now - _price_cache[key]["at"] < PRICE_CACHE_TTL):
+        c = _price_cache[key]
+        return {"price": c["price"], "isExtinct": c["isExtinct"], "updatedAt": c["updatedAt"]}
+
+    url = f"{FUTGG_BASE}/{card_id}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-GB,en;q=0.9",
+        "Referer": "https://www.fut.gg/",
+        "Origin": "https://www.fut.gg",
+    }
+
+    async with aiohttp.ClientSession() as sess:
+        async with sess.get(url, headers=headers) as r:
+            if r.status != 200:
+                cached = _price_cache.get(key)
+                if cached:
+                    return {"price": cached["price"], "isExtinct": cached["isExtinct"], "updatedAt": cached["updatedAt"]}
+                raise HTTPException(status_code=502, detail="Failed to fetch price")
+            data = await r.json()
+
+    # Normalise (your working mapping has data.data.currentPrice)
+    current = (data.get("data") or {}).get("currentPrice") or {}
+    price = current.get("price")
+    is_extinct = current.get("isExtinct", False)
+    updated_at = current.get("priceUpdatedAt")
+
+    _price_cache[key] = {"at": now, "price": price, "isExtinct": is_extinct, "updatedAt": updated_at}
+    return {"price": price, "isExtinct": is_extinct, "updatedAt": updated_at}
 
 # --------- ROUTES (now safe to define) ---------
 @app.get("/")
@@ -352,8 +428,7 @@ async def oauth_start(redirect_uri: str):
     }
     return RedirectResponse(f"{DISCORD_OAUTH_AUTHORIZE}?{urlencode(params)}")
 
-# --- Your existing business routes (now safe): dashboard, trades, settings, goals, analytics, bulk, export/import, search ---
-# (I kept your implementations; only the order changed)
+# --- Your existing business routes (dashboard, trades, settings, goals, analytics, bulk, export/import, search) ---
 
 # Dashboard helper
 async def fetch_dashboard_data(user_id: str, conn):
@@ -471,6 +546,105 @@ async def get_player_price(card_id: str):
     except Exception as e:
         logging.error(f"Player price fetch error: {e}")
         return {"error": str(e)}
+
+# --------- WATCHLIST ROUTES ---------
+@app.post("/api/watchlist")
+async def add_watch_item(payload: WatchlistCreate, user_id: str = Depends(get_current_user), conn = Depends(get_db)):
+    live = await fetch_price(payload.card_id, payload.platform)
+    start_price = live["price"] if isinstance(live["price"], int) else 0
+
+    row = await conn.fetchrow(
+        """
+        INSERT INTO watchlist (user_id, card_id, player_name, version, platform, started_price, last_price, last_checked, notes)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,NOW(),$8)
+        ON CONFLICT (user_id, card_id, platform) DO UPDATE
+          SET player_name=EXCLUDED.player_name,
+              version=EXCLUDED.version,
+              notes=EXCLUDED.notes,
+              last_price=EXCLUDED.last_price,
+              last_checked=NOW()
+        RETURNING id
+        """,
+        user_id,
+        payload.card_id,
+        payload.player_name,
+        payload.version,
+        payload.platform.lower(),
+        start_price,
+        live["price"] if isinstance(live["price"], int) else None,
+        payload.notes,
+    )
+    return {"ok": True, "id": row["id"]}
+
+@app.get("/api/watchlist")
+async def list_watch_items(user_id: str = Depends(get_current_user), conn = Depends(get_db)):
+    rows = await conn.fetch("SELECT * FROM watchlist WHERE user_id=$1 ORDER BY started_at DESC", user_id)
+    enriched = []
+    for r in rows:
+        live = await fetch_price(r["card_id"], r["platform"])
+        live_price = live["price"] if isinstance(live["price"], int) else None
+        change = change_pct = None
+        if live_price is not None and r["started_price"] > 0:
+            change = live_price - r["started_price"]
+            change_pct = round((change / r["started_price"]) * 100, 2)
+        enriched.append({
+            "id": r["id"],
+            "card_id": r["card_id"],
+            "player_name": r["player_name"],
+            "version": r["version"],
+            "platform": r["platform"],
+            "started_price": r["started_price"],
+            "started_at": r["started_at"].isoformat(),
+            "current_price": live_price,
+            "is_extinct": live.get("isExtinct", False),
+            "updated_at": live.get("updatedAt"),
+            "change": change,
+            "change_pct": change_pct,
+            "notes": r["notes"],
+        })
+    return {"ok": True, "items": enriched}
+
+@app.delete("/api/watchlist/{watch_id}")
+async def delete_watch_item(watch_id: int, user_id: str = Depends(get_current_user), conn = Depends(get_db)):
+    res = await conn.execute("DELETE FROM watchlist WHERE id=$1 AND user_id=$2", watch_id, user_id)
+    if res == "DELETE 0":
+        raise HTTPException(status_code=404, detail="Watch item not found")
+    return {"ok": True}
+
+@app.post("/api/watchlist/{watch_id}/refresh")
+async def refresh_watch_item(watch_id: int, user_id: str = Depends(get_current_user), conn = Depends(get_db)):
+    r = await conn.fetchrow("SELECT * FROM watchlist WHERE id=$1 AND user_id=$2", watch_id, user_id)
+    if not r:
+        raise HTTPException(status_code=404, detail="Watch item not found")
+
+    live = await fetch_price(r["card_id"], r["platform"])
+    live_price = live["price"] if isinstance(live["price"], int) else None
+
+    await conn.execute("UPDATE watchlist SET last_price=$1, last_checked=NOW() WHERE id=$2", live_price, watch_id)
+
+    change = change_pct = None
+    if live_price is not None and r["started_price"] > 0:
+        change = live_price - r["started_price"]
+        change_pct = round((change / r["started_price"]) * 100, 2)
+
+    return {
+        "ok": True,
+        "item": {
+            "id": r["id"],
+            "card_id": r["card_id"],
+            "player_name": r["player_name"],
+            "version": r["version"],
+            "platform": r["platform"],
+            "started_price": r["started_price"],
+            "started_at": r["started_at"].isoformat(),
+            "current_price": live_price,
+            "is_extinct": live.get("isExtinct", False),
+            "updated_at": live.get("updatedAt"),
+            "change": change,
+            "change_pct": change_pct,
+            "notes": r["notes"],
+        }
+    }
 
 # Me
 @app.get("/api/me")
