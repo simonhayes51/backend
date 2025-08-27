@@ -1,5 +1,3 @@
-Correct any indentation errors in this script:
-
 import os
 import json
 import asyncpg
@@ -7,7 +5,9 @@ import aiohttp
 import csv
 import io
 import logging
-import time, secrets, jwt
+import time
+import secrets
+import jwt
 from types import SimpleNamespace
 from urllib.parse import urlencode
 
@@ -48,7 +48,7 @@ DISCORD_OAUTH_AUTHORIZE = "https://discord.com/api/oauth2/authorize"
 DISCORD_USERS_ME = "https://discord.com/api/users/@me"
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 DISCORD_SERVER_ID = os.getenv("DISCORD_SERVER_ID")
-OAUTH_STATE = {}
+OAUTH_STATE: Dict[str, Dict[str, Any]] = {}
 
 if not SECRET_KEY:
     raise ValueError("SECRET_KEY environment variable is required")
@@ -56,7 +56,8 @@ if not SECRET_KEY:
 # --------- FUT.GG / Watchlist config ---------
 FUTGG_BASE = "https://www.fut.gg/api/fut/player-prices/25"
 PRICE_CACHE_TTL = 5  # seconds
-_price_cache: Dict[str, Dict[str, Any]] = {}  # {(card_id|platform): {"at": ts, "price": int|None, "isExtinct": bool, "updatedAt": str|None}}
+# {(card_id|platform): {"at": ts, "price": int|None, "isExtinct": bool, "updatedAt": str|None}}
+_price_cache: Dict[str, Dict[str, Any]] = {}
 
 # --------- MODELS ---------
 class UserSettings(BaseModel):
@@ -151,7 +152,7 @@ async def lifespan(app: FastAPI):
             )
         """)
         await conn.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS trade_id BIGINT")
-        await conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS trades_user_trade_uidx ON trades (user_id, trade_id)""")
+        await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS trades_user_trade_uidx ON trades (user_id, trade_id)")
         await conn.execute("DROP INDEX IF EXISTS idx_trades_date")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_user_ts ON trades(user_id, timestamp)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_tag ON trades(user_id, tag)")
@@ -169,7 +170,7 @@ async def lifespan(app: FastAPI):
               source       TEXT DEFAULT 'webapp'
             )
         """)
-        await conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS fut_trades_uidx ON fut_trades (discord_id, trade_id)""")
+        await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS fut_trades_uidx ON fut_trades (discord_id, trade_id)")
 
     # Create tables / indexes (watchlist DB)
     async with watchlist_pool.acquire() as wconn:
@@ -341,7 +342,7 @@ async def login():
 
 @app.get("/api/callback")
 async def callback(request: Request):
-    code  = request.query_params.get("code")
+    code = request.query_params.get("code")
     state = request.query_params.get("state")
     if not code:
         raise HTTPException(status_code=400, detail="Missing code")
@@ -349,7 +350,6 @@ async def callback(request: Request):
     token_url = "https://discord.com/api/oauth2/token"
     data = {
         "client_id": DISCORD_CLIENT_ID,
-        # ✅ fixed stray quote typo here
         "client_secret": DISCORD_CLIENT_SECRET,
         "grant_type": "authorization_code",
         "code": code,
@@ -402,7 +402,8 @@ async def callback(request: Request):
             await conn.execute(
                 "INSERT INTO portfolio (user_id, starting_balance) VALUES ($1, $2) "
                 "ON CONFLICT (user_id) DO NOTHING",
-                user_id, 0
+                user_id,
+                0,
             )
             await conn.execute(
                 """
@@ -411,7 +412,10 @@ async def callback(request: Request):
                 ON CONFLICT (user_id)
                 DO UPDATE SET username = $2, avatar_url = $3, global_name = $4, updated_at = NOW()
                 """,
-                user_id, username, avatar_url, global_name
+                user_id,
+                username,
+                avatar_url,
+                global_name,
             )
 
         return RedirectResponse(f"{FRONTEND_URL}/?authenticated=true")
@@ -460,7 +464,10 @@ async def fetch_dashboard_data(user_id: str, conn):
     all_trades = await conn.fetch("SELECT profit FROM trades WHERE user_id=$1 ORDER BY timestamp DESC", user_id)
     win_count = len([t for t in all_trades if t["profit"] and t["profit"] > 0])
     win_rate = round((win_count / len(all_trades)) * 100, 1) if all_trades else 0
-    tag_stats = await conn.fetch("SELECT tag, COUNT(*) as count FROM trades WHERE user_id=$1 GROUP BY tag ORDER BY count DESC LIMIT 1", user_id)
+    tag_stats = await conn.fetch(
+        "SELECT tag, COUNT(*) as count FROM trades WHERE user_id=$1 GROUP BY tag ORDER BY count DESC LIMIT 1",
+        user_id,
+    )
     most_used_tag = tag_stats[0]["tag"] if tag_stats else "N/A"
     best_trade = await conn.fetchrow("SELECT * FROM trades WHERE user_id=$1 ORDER BY profit DESC LIMIT 1", user_id)
     return {
@@ -474,46 +481,64 @@ async def fetch_dashboard_data(user_id: str, conn):
             "winRate": win_rate,
             "mostUsedTag": most_used_tag,
             "bestTrade": dict(best_trade) if best_trade else None,
-        }
+        },
     }
 
 @app.get("/api/dashboard")
-async def get_dashboard(user_id: str = Depends(get_current_user), conn = Depends(get_db)):
+async def get_dashboard(user_id: str = Depends(get_current_user), conn=Depends(get_db)):
     return await fetch_dashboard_data(user_id, conn)
 
 @app.get("/api/profile")
-async def get_profile(user_id: str = Depends(get_current_user), conn = Depends(get_db)):
+async def get_profile(user_id: str = Depends(get_current_user), conn=Depends(get_db)):
     return await fetch_dashboard_data(user_id, conn)
 
 @app.post("/api/trades")
-async def add_trade(request: Request, user_id: str = Depends(get_current_user), conn = Depends(get_db)):
+async def add_trade(request: Request, user_id: str = Depends(get_current_user), conn=Depends(get_db)):
     data = await request.json()
     required_fields = ["player", "version", "buy", "sell", "quantity", "platform", "tag"]
     missing_fields = [f for f in required_fields if f not in data or data[f] == ""]
     if missing_fields:
         raise HTTPException(status_code=400, detail=f"Missing required fields: {missing_fields}")
+
     try:
-        quantity = int(data["quantity"]); buy = int(data["buy"]); sell = int(data["sell"])
+        quantity = int(data["quantity"])
+        buy = int(data["buy"])
+        sell = int(data["sell"])
         if quantity <= 0 or buy <= 0 or sell <= 0:
             raise ValueError()
     except (ValueError, TypeError):
         raise HTTPException(status_code=400, detail="Invalid numeric values")
+
     profit = (sell - buy) * quantity
     ea_tax = int(sell * quantity * 0.05)
+
     await conn.execute(
-        """INSERT INTO trades (user_id, player, version, buy, sell, quantity, platform, profit, ea_tax, tag, timestamp)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())""",
-        user_id, data["player"], data["version"], buy, sell, quantity, data["platform"], profit, ea_tax, data["tag"]
+        """
+        INSERT INTO trades (
+            user_id, player, version, buy, sell, quantity, platform, profit, ea_tax, tag, timestamp
+        )
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
+        """,
+        user_id,
+        data["player"],
+        data["version"],
+        buy,
+        sell,
+        quantity,
+        data["platform"],
+        profit,
+        ea_tax,
+        data["tag"],
     )
     return {"message": "Trade added successfully!", "profit": profit, "ea_tax": ea_tax}
 
 @app.get("/api/trades")
-async def get_all_trades(user_id: str = Depends(get_current_user), conn = Depends(get_db)):
+async def get_all_trades(user_id: str = Depends(get_current_user), conn=Depends(get_db)):
     rows = await conn.fetch("SELECT * FROM trades WHERE user_id=$1 ORDER BY timestamp DESC", user_id)
     return {"trades": [dict(r) for r in rows]}
 
 @app.delete("/api/trades/{trade_id}")
-async def delete_trade(trade_id: int, user_id: str = Depends(get_current_user), conn = Depends(get_db)):
+async def delete_trade(trade_id: int, user_id: str = Depends(get_current_user), conn=Depends(get_db)):
     result = await conn.execute("DELETE FROM trades WHERE id=$1 AND user_id=$2", trade_id, user_id)
     if result == "DELETE 0":
         raise HTTPException(status_code=404, detail="Trade not found")
@@ -531,8 +556,8 @@ async def get_player_definition(card_id: str):
                     "Accept": "application/json, text/plain, */*",
                     "Accept-Language": "en-GB,en;q=0.9",
                     "Referer": "https://www.fut.gg/",
-                    "Origin": "https://www.fut.gg"
-                }
+                    "Origin": "https://www.fut.gg",
+                },
             ) as resp:
                 if resp.status == 200:
                     return await resp.json()
@@ -552,8 +577,8 @@ async def get_player_price(card_id: str):
                     "Accept": "application/json, text/plain, */*",
                     "Accept-Language": "en-GB,en;q=0.9",
                     "Referer": "https://www.fut.gg/",
-                    "Origin": "https://www.fut.gg"
-                }
+                    "Origin": "https://www.fut.gg",
+                },
             ) as resp:
                 if resp.status == 200:
                     return await resp.json()
@@ -562,7 +587,7 @@ async def get_player_price(card_id: str):
         logging.error(f"Player price fetch error: {e}")
         return {"error": str(e)}
 
-# --------- WATCHLIST ROUTES (FIXED) ---------
+# --------- WATCHLIST ROUTES ---------
 @app.post("/api/watchlist")
 async def add_watch_item(payload: WatchlistCreate, user_id: str = Depends(get_current_user)):
     try:
@@ -572,7 +597,9 @@ async def add_watch_item(payload: WatchlistCreate, user_id: str = Depends(get_cu
 
             row = await conn.fetchrow(
                 """
-                INSERT INTO watchlist (user_id, card_id, player_name, version, platform, started_price, last_price, last_checked, notes)
+                INSERT INTO watchlist (
+                    user_id, card_id, player_name, version, platform, started_price, last_price, last_checked, notes
+                )
                 VALUES ($1,$2,$3,$4,$5,$6,$7,NOW(),$8)
                 ON CONFLICT (user_id, card_id, platform) DO UPDATE
                   SET player_name=EXCLUDED.player_name,
@@ -591,7 +618,12 @@ async def add_watch_item(payload: WatchlistCreate, user_id: str = Depends(get_cu
                 live["price"] if isinstance(live["price"], int) else None,
                 payload.notes,
             )
-            return {"ok": True, "id": row["id"], "start_price": start_price, "is_extinct": live.get("isExtinct", False)}
+            return {
+                "ok": True,
+                "id": row["id"],
+                "start_price": start_price,
+                "is_extinct": live.get("isExtinct", False),
+            }
     except Exception as e:
         print(f"Watchlist POST error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -606,19 +638,25 @@ async def list_watch_items(user_id: str = Depends(get_current_user)):
                 return {"ok": True, "items": []}
 
             card_ids = [w["card_id"] for w in watches]
+
             async with player_pool.acquire() as pconn:
                 meta_rows = await pconn.fetch(
                     "SELECT card_id, name, rating, club, nation FROM fut_players WHERE card_id = ANY($1)",
-                    card_ids
+                    card_ids,
                 )
-            meta_map = {int(m["card_id"]): {k: m[k] for k in ("name", "rating", "club", "nation")} for m in meta_rows}
+
+            meta_map = {
+                int(m["card_id"]): {k: m[k] for k in ("name", "rating", "club", "nation")}
+                for m in meta_rows
+            }
 
             enriched = []
             for w in watches:
                 live = await fetch_price(w["card_id"], w["platform"])
                 live_price = live.get("price")
-                change = change_pct = None
-                if (isinstance(live_price, int) or isinstance(live_price, float)) and (w["started_price"] and w["started_price"] > 0):
+                change = None
+                change_pct = None
+                if (isinstance(live_price, (int, float)) and w["started_price"] and w["started_price"] > 0):
                     change = int(live_price) - int(w["started_price"])
                     change_pct = round((change / int(w["started_price"])) * 100, 2)
 
@@ -672,9 +710,14 @@ async def refresh_watch_item(watch_id: int, user_id: str = Depends(get_current_u
             live = await fetch_price(w["card_id"], w["platform"])
             live_price = live.get("price") if isinstance(live.get("price"), int) else None
 
-            await conn.execute("UPDATE watchlist SET last_price=$1, last_checked=NOW() WHERE id=$2", live_price, watch_id)
+            await conn.execute(
+                "UPDATE watchlist SET last_price=$1, last_checked=NOW() WHERE id=$2",
+                live_price,
+                watch_id,
+            )
 
-            change = change_pct = None
+            change = None
+            change_pct = None
             if live_price is not None and w["started_price"] > 0:
                 change = int(live_price) - int(w["started_price"])
                 change_pct = round((change / int(w["started_price"])) * 100, 2)
@@ -682,7 +725,7 @@ async def refresh_watch_item(watch_id: int, user_id: str = Depends(get_current_u
             async with player_pool.acquire() as pconn:
                 meta = await pconn.fetchrow(
                     "SELECT card_id, name, rating, club, nation FROM fut_players WHERE card_id=$1",
-                    w["card_id"]
+                    w["card_id"],
                 )
             meta_dict = dict(meta) if meta else {}
 
@@ -706,7 +749,7 @@ async def refresh_watch_item(watch_id: int, user_id: str = Depends(get_current_u
                     "rating": meta_dict.get("rating"),
                     "club": meta_dict.get("club"),
                     "nation": meta_dict.get("nation"),
-                }
+                },
             }
     except HTTPException:
         raise
@@ -722,77 +765,100 @@ async def get_current_user_info(request: Request, user_id: str = Depends(get_cur
         "username": request.session.get("username"),
         "avatar_url": request.session.get("avatar_url"),
         "global_name": request.session.get("global_name"),
-        "authenticated": True
+        "authenticated": True,
     }
 
 # Settings
 @app.get("/api/settings")
-async def get_user_settings(user_id: str = Depends(get_current_user), conn = Depends(get_db)):
+async def get_user_settings(user_id: str = Depends(get_current_user), conn=Depends(get_db)):
     settings = await conn.fetchrow("SELECT settings FROM user_settings WHERE user_id=$1", user_id)
     return settings["settings"] if settings else UserSettings().dict()
 
 @app.post("/api/settings")
-async def update_user_settings(settings: UserSettings, user_id: str = Depends(get_current_user), conn = Depends(get_db)):
+async def update_user_settings(settings: UserSettings, user_id: str = Depends(get_current_user), conn=Depends(get_db)):
     await conn.execute(
-        """INSERT INTO user_settings (user_id, settings, updated_at)
-           VALUES ($1, $2, NOW())
-           ON CONFLICT (user_id) DO UPDATE SET settings = $2, updated_at = NOW()""",
-        user_id, json.dumps(settings.dict())
+        """
+        INSERT INTO user_settings (user_id, settings, updated_at)
+        VALUES ($1, $2, NOW())
+        ON CONFLICT (user_id) DO UPDATE SET settings = $2, updated_at = NOW()
+        """,
+        user_id,
+        json.dumps(settings.dict()),
     )
     return {"message": "Settings updated successfully"}
 
 @app.post("/api/portfolio/balance")
-async def update_starting_balance(request: Request, user_id: str = Depends(get_current_user), conn = Depends(get_db)):
+async def update_starting_balance(request: Request, user_id: str = Depends(get_current_user), conn=Depends(get_db)):
     data = await request.json()
     starting_balance = int(data.get("starting_balance", 0))
     await conn.execute(
         "INSERT INTO portfolio (user_id, starting_balance) VALUES ($1, $2) "
         "ON CONFLICT (user_id) DO UPDATE SET starting_balance = $2",
-        user_id, starting_balance
+        user_id,
+        starting_balance,
     )
     return {"message": "Starting balance updated successfully"}
 
 # Goals
 @app.get("/api/goals")
-async def get_trading_goals(user_id: str = Depends(get_current_user), conn = Depends(get_db)):
+async def get_trading_goals(user_id: str = Depends(get_current_user), conn=Depends(get_db)):
     goals = await conn.fetch("SELECT * FROM trading_goals WHERE user_id=$1 ORDER BY created_at DESC", user_id)
     return {"goals": [dict(g) for g in goals]}
 
 @app.post("/api/goals")
-async def create_trading_goal(goal: TradingGoal, user_id: str = Depends(get_current_user), conn = Depends(get_db)):
+async def create_trading_goal(goal: TradingGoal, user_id: str = Depends(get_current_user), conn=Depends(get_db)):
     await conn.execute(
-        """INSERT INTO trading_goals (user_id, title, target_amount, target_date, goal_type, is_completed, created_at)
-           VALUES ($1, $2, $3, $4, $5, $6, NOW())""",
-        user_id, goal.title, goal.target_amount, goal.target_date, goal.goal_type, goal.is_completed
+        """
+        INSERT INTO trading_goals (user_id, title, target_amount, target_date, goal_type, is_completed, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, NOW())
+        """,
+        user_id,
+        goal.title,
+        goal.target_amount,
+        goal.target_date,
+        goal.goal_type,
+        goal.is_completed,
     )
     return {"message": "Goal created successfully"}
 
 # Analytics
 @app.get("/api/analytics/advanced")
-async def get_advanced_analytics(user_id: str = Depends(get_current_user), conn = Depends(get_db)):
-    daily_profits = await conn.fetch("""
+async def get_advanced_analytics(user_id: str = Depends(get_current_user), conn=Depends(get_db)):
+    daily_profits = await conn.fetch(
+        """
         SELECT DATE(timestamp) as date, COALESCE(SUM(profit), 0) as daily_profit, COUNT(*) as trades_count
         FROM trades WHERE user_id=$1 AND timestamp >= NOW() - INTERVAL '30 days'
         GROUP BY DATE(timestamp) ORDER BY date
-    """, user_id)
-    tag_performance = await conn.fetch("""
+        """,
+        user_id,
+    )
+    tag_performance = await conn.fetch(
+        """
         SELECT tag, COUNT(*) as trade_count, COALESCE(SUM(profit), 0) as total_profit,
                COALESCE(AVG(profit), 0) as avg_profit,
                COUNT(CASE WHEN profit > 0 THEN 1 END) * 100.0 / COUNT(*) as win_rate
         FROM trades WHERE user_id=$1 AND tag IS NOT NULL AND tag != ''
         GROUP BY tag ORDER BY total_profit DESC
-    """, user_id)
-    platform_stats = await conn.fetch("""
+        """,
+        user_id,
+    )
+    platform_stats = await conn.fetch(
+        """
         SELECT platform, COUNT(*) as trade_count, COALESCE(SUM(profit), 0) as total_profit,
                COALESCE(AVG(profit), 0) as avg_profit
         FROM trades WHERE user_id=$1 GROUP BY platform
-    """, user_id)
-    monthly_summary = await conn.fetch("""
+        """,
+        user_id,
+    )
+    monthly_summary = await conn.fetch(
+        """
         SELECT DATE_TRUNC('month', timestamp) as month, COUNT(*) as trades_count,
                COALESCE(SUM(profit), 0) as total_profit, COALESCE(SUM(ea_tax), 0) as total_tax
         FROM trades WHERE user_id=$1
         GROUP BY DATE_TRUNC('month', timestamp) ORDER BY month DESC LIMIT 12
-    """, user_id)
+        """,
+        user_id,
+    )
     return {
         "daily_profits": [dict(r) for r in daily_profits],
         "tag_performance": [dict(r) for r in tag_performance],
@@ -802,80 +868,123 @@ async def get_advanced_analytics(user_id: str = Depends(get_current_user), conn 
 
 # Bulk update
 @app.put("/api/trades/bulk")
-async def bulk_edit_trades(request: Request, user_id: str = Depends(get_current_user), conn = Depends(get_db)):
+async def bulk_edit_trades(request: Request, user_id: str = Depends(get_current_user), conn=Depends(get_db)):
     data = await request.json()
-    trade_ids = data.get('trade_ids', [])
-    updates = data.get('updates', {})
+    trade_ids = data.get("trade_ids", [])
+    updates = data.get("updates", {})
     if not trade_ids or not updates:
         raise HTTPException(status_code=400, detail="trade_ids and updates required")
-    set_clauses, params = [], []
-    if 'tag' in updates:
-        set_clauses.append(f"tag = ${len(params)+1}"); params.append(updates['tag'])
-    if 'platform' in updates:
-        set_clauses.append(f"platform = ${len(params)+1}"); params.append(updates['platform'])
+
+    set_clauses = []
+    params: List[Any] = []
+
+    if "tag" in updates:
+        set_clauses.append(f"tag = ${len(params)+1}")
+        params.append(updates["tag"])
+    if "platform" in updates:
+        set_clauses.append(f"platform = ${len(params)+1}")
+        params.append(updates["platform"])
+
     if not set_clauses:
         raise HTTPException(status_code=400, detail="No valid updates provided")
+
     params.extend([user_id, trade_ids])
-    query = f"""UPDATE trades SET {', '.join(set_clauses)} WHERE user_id = ${len(params)-1} AND id = ANY(${len(params)})"""
+
+    query = (
+        f"UPDATE trades SET {', '.join(set_clauses)} "
+        f"WHERE user_id = ${len(params)-1} AND id = ANY(${len(params)})"
+    )
+
     await conn.execute(query, *params)
     return {"message": f"Updated {len(trade_ids)} trades successfully"}
 
 # Export
 @app.get("/api/export/trades")
-async def export_trades(format: str = "csv", user_id: str = Depends(get_current_user), conn = Depends(get_db)):
+async def export_trades(format: str = "csv", user_id: str = Depends(get_current_user), conn=Depends(get_db)):
     rows = await conn.fetch("SELECT * FROM trades WHERE user_id=$1 ORDER BY timestamp DESC", user_id)
     data = [dict(r) for r in rows]
     if format.lower() == "json":
         blob = json.dumps(data, indent=2, default=str).encode()
-        return StreamingResponse(io.BytesIO(blob), media_type="application/json",
-                                 headers={"Content-Disposition": "attachment; filename=trades_export.json"})
+        return StreamingResponse(
+            io.BytesIO(blob),
+            media_type="application/json",
+            headers={"Content-Disposition": "attachment; filename=trades_export.json"},
+        )
+
     output = io.StringIO()
     if data:
         writer = csv.DictWriter(output, fieldnames=data[0].keys())
         writer.writeheader()
         writer.writerows(data)
-    return StreamingResponse(io.StringIO(output.getvalue()), media_type="text/csv",
-                             headers={"Content-Disposition": "attachment; filename=trades_export.csv"})
+
+    return StreamingResponse(
+        io.StringIO(output.getvalue()),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=trades_export.csv"},
+    )
 
 # Import
 @app.post("/api/import/trades")
-async def import_trades(file: UploadFile = File(...), user_id: str = Depends(get_current_user), conn = Depends(get_db)):
+async def import_trades(file: UploadFile = File(...), user_id: str = Depends(get_current_user), conn=Depends(get_db)):
     contents = await file.read()
-    if file.filename.endswith('.json'):
-        payload = json.loads(contents.decode('utf-8'))
+    if file.filename.endswith(".json"):
+        payload = json.loads(contents.decode("utf-8"))
         trades_to_import = payload if isinstance(payload, list) else [payload]
-    elif file.filename.endswith('.csv'):
-        reader = csv.DictReader(io.StringIO(contents.decode('utf-8')))
+    elif file.filename.endswith(".csv"):
+        reader = csv.DictReader(io.StringIO(contents.decode("utf-8")))
         trades_to_import = list(reader)
     else:
         raise HTTPException(status_code=400, detail="Unsupported file format")
 
-    imported_count, errors = 0, []
+    imported_count = 0
+    errors: List[str] = []
+
     for t in trades_to_import:
         try:
-            player = t.get('player', '').strip()
-            version = t.get('version', '').strip()
-            buy = int(t.get('buy', 0)); sell = int(t.get('sell', 0))
-            quantity = int(t.get('quantity', 1))
-            platform = t.get('platform', 'Console').strip()
-            tag = t.get('tag', '').strip()
+            player = t.get("player", "").strip()
+            version = t.get("version", "").strip()
+            buy = int(t.get("buy", 0))
+            sell = int(t.get("sell", 0))
+            quantity = int(t.get("quantity", 1))
+            platform = t.get("platform", "Console").strip()
+            tag = t.get("tag", "").strip()
+
             if not player or not version or buy <= 0 or sell <= 0:
-                errors.append(f"Invalid trade data: {t}"); continue
+                errors.append(f"Invalid trade data: {t}")
+                continue
+
             profit = (sell - buy) * quantity
             ea_tax = int(sell * quantity * 0.05)
+
             await conn.execute(
-                """INSERT INTO trades (user_id, player, version, buy, sell, quantity, platform, profit, ea_tax, tag, timestamp)
-                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())""",
-                user_id, player, version, buy, sell, quantity, platform, profit, ea_tax, tag
+                """
+                INSERT INTO trades (user_id, player, version, buy, sell, quantity, platform, profit, ea_tax, tag, timestamp)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
+                """,
+                user_id,
+                player,
+                version,
+                buy,
+                sell,
+                quantity,
+                platform,
+                profit,
+                ea_tax,
+                tag,
             )
             imported_count += 1
         except Exception as e:
             errors.append(f"Error importing trade {t}: {str(e)}")
-    return {"message": f"Successfully imported {imported_count} trades", "imported_count": imported_count, "errors": errors[:10]}
+
+    return {
+        "message": f"Successfully imported {imported_count} trades",
+        "imported_count": imported_count,
+        "errors": errors[:10],
+    }
 
 # Delete all
 @app.delete("/api/data/delete-all")
-async def delete_all_user_data(confirm: bool = False, user_id: str = Depends(get_current_user), conn = Depends(get_db)):
+async def delete_all_user_data(confirm: bool = False, user_id: str = Depends(get_current_user), conn=Depends(get_db)):
     if not confirm:
         raise HTTPException(status_code=400, detail="Confirmation required")
     await conn.execute("DELETE FROM trades WHERE user_id=$1", user_id)
@@ -904,12 +1013,12 @@ async def search_players(q: str = ""):
                   price
                 FROM fut_players
                 WHERE
-                  LOWER(name) LIKE LOWER($1)        -- by name
-                  OR card_id::text LIKE $1          -- or by id
+                  LOWER(name) LIKE LOWER($1)
+                  OR card_id::text LIKE $1
                 ORDER BY rating DESC NULLS LAST, name ASC
                 LIMIT 20
                 """,
-                f"%{q}%"
+                f"%{q}%",
             )
         players = [
             {
@@ -932,7 +1041,7 @@ async def search_players(q: str = ""):
 
 # Extension ingest
 @app.post("/api/trades/ingest")
-async def ingest_sale(sale: ExtSale, auth = Depends(require_extension_jwt)):
+async def ingest_sale(sale: ExtSale, auth=Depends(require_extension_jwt)):
     ts = sale.timestamp_ms / 1000.0
     user_id = auth.discord_id
     player = (sale.player_name or "").strip()
@@ -948,22 +1057,46 @@ async def ingest_sale(sale: ExtSale, auth = Depends(require_extension_jwt)):
     try:
         async with pool.acquire() as conn:
             async with conn.transaction():
-                inserted = await conn.fetchrow("""
+                inserted = await conn.fetchrow(
+                    """
                     INSERT INTO fut_trades
                       (discord_id, trade_id, player_name, card_version, buy_price, sell_price, ts, source)
                     VALUES ($1,$2,$3,$4,$5,$6,to_timestamp($7),'webapp')
                     ON CONFLICT (discord_id, trade_id) DO NOTHING
                     RETURNING id
-                """, user_id, sale.trade_id, player, (version or None), buy, sell, ts)
+                    """,
+                    user_id,
+                    sale.trade_id,
+                    player,
+                    (version or None),
+                    buy,
+                    sell,
+                    ts,
+                )
 
                 if inserted:
-                    await conn.execute("""
+                    await conn.execute(
+                        """
                         INSERT INTO trades
                           (user_id, player, version, buy, sell, quantity, platform, tag, notes, ea_tax, profit, timestamp, trade_id)
                         VALUES
                           ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, to_timestamp($12), $13)
                         ON CONFLICT (user_id, trade_id) DO NOTHING
-                    """, user_id, player, version, buy, sell, qty, platform, tag, "", ea_tax, profit, ts, sale.trade_id)
+                        """,
+                        user_id,
+                        player,
+                        version,
+                        buy,
+                        sell,
+                        qty,
+                        platform,
+                        tag,
+                        "",
+                        ea_tax,
+                        profit,
+                        ts,
+                        sale.trade_id,
+                    )
         return {"ok": True, "mirrored_to_trades": bool(inserted)}
     except Exception as e:
         logging.error(f"Ingest error: {e}")
