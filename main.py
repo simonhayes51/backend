@@ -91,6 +91,7 @@ class WatchlistCreate(BaseModel):
 # --------- POOLS & LIFESPAN ---------
 pool = None
 player_pool = None
+watchlist_pool = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
