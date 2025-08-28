@@ -8,6 +8,8 @@ import logging
 import time
 import secrets
 import jwt
+from app.services.price_history import get_price_history
+
 from types import SimpleNamespace
 from urllib.parse import urlencode
 
@@ -364,6 +366,20 @@ async def login():
     return RedirectResponse(
         f"https://discord.com/oauth2/authorize?client_id={DISCORD_CLIENT_ID}&redirect_uri={DISCORD_REDIRECT_URI}&response_type=code&scope=identify"
     )
+
+@app.get("/api/price-history")
+async def price_history(playerId: int, platform: str = "ps", tf: str = "today"):
+    """
+    Returns: { "points": [ { "t": ISO_8601_UTC, "price": int }, ... ] }
+    """
+    if playerId <= 0:
+        raise HTTPException(status_code=400, detail="playerId must be a positive integer")
+    try:
+        return await get_price_history(playerId, platform, tf)
+    except Exception as e:
+        # If upstream site blocks or errors, surface a clean 502
+        raise HTTPException(status_code=502, detail=f"Upstream error: {e}")
+
 
 @app.get("/api/callback")
 async def callback(request: Request):
