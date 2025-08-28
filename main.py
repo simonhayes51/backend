@@ -1141,41 +1141,44 @@ async def delete_all_user_data(confirm: bool = False, user_id: str = Depends(get
     await conn.execute("UPDATE portfolio SET starting_balance = 0 WHERE user_id=$1", user_id)
     return {"message": "All data deleted successfully", "trades_deleted": 0}
 
-# Search players (supports optional position filtering via ?pos=ST)
+# --- Search players (supports q and/or pos, parses altposition) ---
+from typing import Optional
+
 @app.get("/api/search-players")
 async def search_players(q: str = "", pos: Optional[str] = None):
     q = (q or "").strip()
-    # if nothing to search, keep it cheap
-    if not q:
-        return {"players": []}
+    p = (pos or "").strip().upper() or None
 
     try:
         async with player_pool.acquire() as conn:
-            # base filter: name or card_id textual match
-            where_clauses = [
-                "(LOWER(name) LIKE LOWER($1) OR card_id::text LIKE $1)"
-            ]
-            params = [f"%{q}%"]
+            where = []
+            params = []
 
-            # optional position filter (server-side), matches primary position or any token in altposition
-            # altposition can be CSV/pipe/semicolon/etc — we split using a regex
-            if pos:
-                params.append(pos.strip().upper())
-                where_clauses.append(
-                    """
-                    (
-                      UPPER(position) = $2
-                      OR (
-                        altposition IS NOT NULL
-                        AND EXISTS (
-                          SELECT 1
-                          FROM regexp_split_to_table(altposition, '[,;/|\\s]+') AS ap
-                          WHERE UPPER(TRIM(ap)) = $2
-                        )
-                      )
+            if q:
+                where.append(f"(LOWER(name) LIKE LOWER($1) OR card_id::text LIKE $1)")
+                params.append(f"%{q}%")
+
+            if p:
+                # Reuse the same bind index for UPPER(TRIM(ap)) and UPPER(position)
+                params.append(p)
+                idx = len(params)
+                where.append(f"""
+                (
+                  UPPER(position) = ${idx}
+                  OR (
+                    COALESCE(altposition, '') <> ''
+                    AND EXISTS (
+                      SELECT 1
+                      FROM regexp_split_to_table(altposition, '[,;/|\\s]+') ap
+                      WHERE UPPER(TRIM(ap)) = ${idx}
                     )
-                    """
+                  )
                 )
+                """)
+
+            if not where:
+                # Avoid returning the whole table if no constraints
+                return {"players": []}
 
             sql = f"""
                 SELECT
@@ -1188,35 +1191,35 @@ async def search_players(q: str = "", pos: Optional[str] = None):
                   league,
                   nation,
                   position,
+                  altposition,
                   price
                 FROM fut_players
-                WHERE {" AND ".join(where_clauses)}
+                WHERE {' AND '.join(where)}
                 ORDER BY rating DESC NULLS LAST, name ASC
-                LIMIT 40
+                LIMIT 50
             """
 
             rows = await conn.fetch(sql, *params)
 
-        players = [
-            {
-                "card_id": int(r["card_id"]),
-                "name": r["name"],
-                "rating": r["rating"],
-                "version": r["version"],
-                "image_url": r["image_url"],
-                "club": r["club"],
-                "league": r["league"],
-                "nation": r["nation"],
-                "position": r["position"],        # primary
-                "altposition": r["altposition"],  # CSV or NULL; frontend handles both
-                "price": r["price"],
-            }
-            for r in rows
-        ]
+        players = [{
+            "card_id": int(r["card_id"]),
+            "name": r["name"],
+            "rating": r["rating"],
+            "version": r["version"],
+            "image_url": r["image_url"],
+            "club": r["club"],
+            "league": r["league"],
+            "nation": r["nation"],
+            "position": r["position"],
+            "altposition": r["altposition"],
+            "price": r["price"],
+        } for r in rows]
+
         return {"players": players}
     except Exception as e:
         logging.error(f"Player search error: {e}")
         return {"players": [], "error": str(e)}
+
 
 
 # --------- Try to include Squad Builder router LAST (optional) ---------
