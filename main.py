@@ -88,6 +88,18 @@ class ExtSale(BaseModel):
     sell_price: int
     timestamp_ms: int
 
+# --- Trade update payload (partial fields allowed)
+class TradeUpdate(BaseModel):
+    player: Optional[str] = None
+    version: Optional[str] = None
+    quantity: Optional[int] = None
+    buy: Optional[int] = None
+    sell: Optional[int] = None
+    platform: Optional[str] = None
+    tag: Optional[str] = None
+    notes: Optional[str] = None
+    timestamp: Optional[str] = None  # ISO8601 string
+
 # Watchlist payload
 class WatchlistCreate(BaseModel):
     card_id: int
@@ -551,6 +563,106 @@ async def add_trade(request: Request, user_id: str = Depends(get_current_user), 
 async def get_all_trades(user_id: str = Depends(get_current_user), conn=Depends(get_db)):
     rows = await conn.fetch("SELECT * FROM trades WHERE user_id=$1 ORDER BY timestamp DESC", user_id)
     return {"trades": [dict(r) for r in rows]}
+
+# --- NEW: update routes ---
+@app.put("/api/trades/{id}")
+async def update_trade(
+    id: int,
+    payload: TradeUpdate,
+    user_id: str = Depends(get_current_user),
+    conn=Depends(get_db),
+):
+    """Update a trade by primary key id for the current user and return the updated row."""
+    data = payload.model_dump(exclude_none=True)
+    if not data:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    # Build dynamic SET clause
+    fields, values = [], []
+    for col, val in data.items():
+        fields.append(f"{col} = ${len(values)+1}")
+        values.append(val)
+
+    q = f"""
+        UPDATE trades
+           SET {', '.join(fields)}
+         WHERE id = ${len(values)+1}
+           AND user_id = ${len(values)+2}
+     RETURNING id, user_id, player, version, quantity, buy, sell, platform, tag, notes, ea_tax, profit, timestamp, trade_id
+    """
+    values.extend([id, user_id])
+    row = await conn.fetchrow(q, *values)
+    if not row:
+        raise HTTPException(status_code=404, detail="Trade not found")
+
+    # Recompute tax/profit on server (source of truth)
+    sell = int(row["sell"] or 0)
+    buy  = int(row["buy"] or 0)
+    qty  = int(row["quantity"] or 1)
+    ea_tax = int(round(sell * qty * 0.05))
+    profit = (sell - buy) * qty  # if profit-after-tax: (sell - buy)*qty - ea_tax
+
+    row2 = await conn.fetchrow(
+        """
+        UPDATE trades
+           SET ea_tax = $1,
+               profit = $2
+         WHERE id = $3
+           AND user_id = $4
+     RETURNING id, user_id, player, version, quantity, buy, sell, platform, tag, notes, ea_tax, profit, timestamp, trade_id
+        """,
+        ea_tax, profit, id, user_id
+    )
+    return dict(row2)
+
+@app.put("/api/trades/by-trade-id/{trade_id}")
+async def update_trade_by_trade_id(
+    trade_id: int,
+    payload: TradeUpdate,
+    user_id: str = Depends(get_current_user),
+    conn=Depends(get_db),
+):
+    """Update a trade using the EA trade_id for the current user."""
+    data = payload.model_dump(exclude_none=True)
+    if not data:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    fields, values = [], []
+    for col, val in data.items():
+        fields.append(f"{col} = ${len(values)+1}")
+        values.append(val)
+
+    q = f"""
+        UPDATE trades
+           SET {', '.join(fields)}
+         WHERE trade_id = ${len(values)+1}
+           AND user_id  = ${len(values)+2}
+     RETURNING id, user_id, player, version, quantity, buy, sell, platform, tag, notes, ea_tax, profit, timestamp, trade_id
+    """
+    values.extend([trade_id, user_id])
+    row = await conn.fetchrow(q, *values)
+    if not row:
+        raise HTTPException(status_code=404, detail="Trade not found")
+
+    sell = int(row["sell"] or 0)
+    buy  = int(row["buy"] or 0)
+    qty  = int(row["quantity"] or 1)
+    ea_tax = int(round(sell * qty * 0.05))
+    profit = (sell - buy) * qty  # or (sell - buy)*qty - ea_tax
+
+    row2 = await conn.fetchrow(
+        """
+        UPDATE trades
+           SET ea_tax = $1,
+               profit = $2
+         WHERE trade_id = $3
+           AND user_id  = $4
+     RETURNING id, user_id, player, version, quantity, buy, sell, platform, tag, notes, ea_tax, profit, timestamp, trade_id
+        """,
+        ea_tax, profit, trade_id, user_id
+    )
+    return dict(row2)
+# --- END update routes ---
 
 @app.delete("/api/trades/{trade_id}")
 async def delete_trade(trade_id: int, user_id: str = Depends(get_current_user), conn=Depends(get_db)):
