@@ -1142,78 +1142,38 @@ async def delete_all_user_data(confirm: bool = False, user_id: str = Depends(get
     return {"message": "All data deleted successfully", "trades_deleted": 0}
 
 # Search players
+# main.py /api/search-players
 @app.get("/api/search-players")
 async def search_players(q: str = "", pos: str = ""):
-    """
-    Search by name/card_id (q) and/or filter by a target slot position (pos).
-    Works even if 'altposition' column does NOT exist yet.
-    When 'altposition' exists, it can be either text[] or comma-separated text.
-    Always returns 'positions' as an array of canonical codes.
-    """
     q = (q or "").strip()
-    pos = (pos or "").strip().upper()
+    pos = (pos or "").strip()
+    if not q and not pos:
+        return {"players": []}
 
-    # Find out if altposition column exists and whether it's an array
-    has_alt = False
-    alt_is_array = False
-    try:
-        async with player_pool.acquire() as conn:
-            meta = await conn.fetchrow("""
-                SELECT data_type, udt_name
-                FROM information_schema.columns
-                WHERE table_name = 'fut_players' AND column_name = 'altposition'
-                LIMIT 1
-            """)
-            if meta:
-                has_alt = True
-                # ARRAY types usually report udt_name like '_text'
-                alt_is_array = (meta["data_type"] == "ARRAY") or (str(meta["udt_name"] or "").startswith("_"))
+    base_sql = """
+        SELECT card_id, name, rating, version, image_url,
+               club, nation, league, position, altposition, price
+        FROM fut_players
+        WHERE 1=1
+    """
+    params = []
+    if q:
+        base_sql += " AND (LOWER(name) LIKE LOWER($1) OR card_id::text LIKE $1)"
+        params.append(f"%{q}%")
 
-            # Build a SELECT that only includes 'altposition' if it exists
-            select_cols = """
-                card_id, name, rating, version, image_url,
-                club, league, nation, position
-            """
-            if has_alt:
-                select_cols += ", altposition"
+    # simple positional filter: either primary position OR altposition contains it
+    if pos:
+        idx = len(params) + 1
+        base_sql += f" AND (UPPER(position) = UPPER(${idx}) OR (altposition IS NOT NULL AND UPPER(altposition)::text LIKE UPPER(${idx+1})))"
+        params.extend([pos, f"%{pos}%"])
 
-            # Basic WHERE (name or id). If no q, allow all so pos-only queries still work.
-            where_sql = "TRUE"
-            params = []
-            if q:
-                where_sql = "(LOWER(name) LIKE LOWER($1) OR card_id::text LIKE $1)"
-                params.append(f"%{q}%")
+    base_sql += " ORDER BY rating DESC NULLS LAST, name ASC LIMIT 20"
 
-            sql = f"""
-                SELECT {select_cols}
-                FROM fut_players
-                WHERE {where_sql}
-                ORDER BY rating DESC NULLS LAST, name ASC
-                LIMIT 200
-            """
-            rows = await conn.fetch(sql, *params)
+    async with player_pool.acquire() as conn:
+        rows = await conn.fetch(base_sql, *params)
 
-    except Exception as e:
-        logging.error(f"Player search error: {e}")
-        return {"players": [], "error": str(e)}
-
-    # Normalize positions (main + alt if present)
-    def norm(p):
-        return (str(p).strip().upper()) if p else None
-
-    players = []
-    for r in rows:
-        main_pos = norm(r["position"])
-
-        alt_positions = []
-        if has_alt:
-            raw = r["altposition"]
-            if raw is not None:
-                if alt_is_array and isinstance(raw, (list, tuple)):
-                    alt_positions = [norm(x) for x in raw if x]
-                elif isinstance(raw, str):
-                    alt_positions = [norm(x) for x in raw.split(",") if x.strip()]
-                # else: unknown type → ignore
+    players = [dict(r) for r in rows]
+    return {"players": players}
 
         # De-dupe, keep order
         positions = []
