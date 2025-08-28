@@ -1188,7 +1188,6 @@ async def search_players(q: str = "", pos: Optional[str] = None):
                   league,
                   nation,
                   position,
-                  altposition,
                   price
                 FROM fut_players
                 WHERE {" AND ".join(where_clauses)}
