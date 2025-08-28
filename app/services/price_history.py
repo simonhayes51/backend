@@ -1,19 +1,20 @@
 # app/services/price_history.py
-import re
-import json
+# FUT.GG-only price history for the chart, derived from completedAuctions.
+# Returns: {"points": [{"t": ISO_UTC, "price": int}, ...]}
+
+from __future__ import annotations
+
 import aiohttp
-from bs4 import BeautifulSoup
-from typing import List, Dict
+from typing import Dict, List, Tuple
+from datetime import datetime, timezone
+from collections import defaultdict
 
-HEADERS = {
-    "Accept": "text/html,application/xhtml+xml",
-    "User-Agent": "Mozilla/5.0 (compatible; FUTDashboard/1.0)",
-}
+FUTGG_PRICE_URL = "https://www.fut.gg/api/fut/player-prices/25/{card_id}"
+TIMEOUT_SECS = 12
+CACHE_TTL_SECS = 120  # short cache; we're showing recent trends
 
-FUTBIN_PLAYER_URL = "https://www.futbin.com/25/player/{card_id}"
-
-# Simple timeframe gate (you can refine server-side if you want)
-TF_TO_HOURS = {
+# How far back each pill goes, and how coarse to bucket the points
+TF_TO_WINDOW_HOURS = {
     "today": 24,
     "3d": 72,
     "week": 24 * 7,
@@ -21,77 +22,120 @@ TF_TO_HOURS = {
     "year": 24 * 365,
 }
 
-async def _fetch_html(url: str) -> str:
-    timeout = aiohttp.ClientTimeout(total=10)
-    async with aiohttp.ClientSession(timeout=timeout, headers=HEADERS) as sess:
+TF_TO_BUCKET_SECONDS = {
+    "today": 30 * 60,      # 30 minutes
+    "3d":    60 * 60,      # 1 hour
+    "week":  2 * 60 * 60,  # 2 hours
+    "month": 6 * 60 * 60,  # 6 hours
+    "year":  24 * 60 * 60, # 1 day
+}
+
+GG_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-GB,en;q=0.9",
+    "Origin": "https://www.fut.gg",
+    "Referer": "https://www.fut.gg/",
+}
+
+# -------- tiny in-memory cache --------
+_cache: Dict[str, Dict] = {}
+
+def _now() -> int:
+    import time
+    return int(time.time())
+
+def _cache_get(key: str):
+    v = _cache.get(key)
+    if not v or _now() - v["at"] > CACHE_TTL_SECS:
+        return None
+    return v["points"]
+
+def _cache_set(key: str, points):
+    _cache[key] = {"at": _now(), "points": points}
+
+# -------- helpers --------
+def _iso(ts_ms: int) -> str:
+    return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).isoformat()
+
+def _bucket(ts_ms: int, bucket_seconds: int) -> int:
+    s = ts_ms // 1000
+    b = s - (s % bucket_seconds)
+    return b * 1000  # back to ms
+
+def _window_cutoff(now_ms: int, tf: str) -> int:
+    hours = TF_TO_WINDOW_HOURS.get(tf, 24)
+    return now_ms - hours * 3600 * 1000
+
+def _median(nums: List[int]) -> int:
+    if not nums:
+        return 0
+    nums = sorted(nums)
+    mid = len(nums) // 2
+    return nums[mid] if len(nums) % 2 else (nums[mid - 1] + nums[mid]) // 2
+
+# -------- FUT.GG fetch --------
+async def _fetch_futgg_data(card_id: int) -> Dict:
+    url = FUTGG_PRICE_URL.format(card_id=card_id)
+    timeout = aiohttp.ClientTimeout(total=TIMEOUT_SECS)
+    async with aiohttp.ClientSession(timeout=timeout, headers=GG_HEADERS) as sess:
         async with sess.get(url) as r:
-            r.raise_for_status()
-            return await r.text()
+            if r.status != 200:
+                raise RuntimeError(f"FUT.GG status {r.status}")
+            return await r.json()
 
-def _extract_series_data(html: str) -> List[List[float]]:
-    """
-    FUTBIN renders a Highcharts config in inline scripts. We extract the first
-    'data: [[ts, price], ...]' array we find. Your bot used the 2nd highcharts
-    wrapper; this regex approach avoids DOM traversal on the server.
-    """
-    # Narrow to the price graph container if present for faster regex (optional)
-    # Otherwise just search whole html.
-    # Find the longest plausible 'data: [...]'
-    data_blocks = re.findall(r"data\s*:\s*(\[\s*\[.*?\]\s*\])", html, flags=re.DOTALL)
-    if not data_blocks:
-        return []
-
-    # Pick the block with the most pairs (usually the price series)
-    best = max(data_blocks, key=lambda s: s.count("],"))
-    # Clean trailing commas, then JSON-load
-    # The content should be pure JSON-like [[1693000000000, 18500], ...]
-    cleaned = re.sub(r",\s*([\]\}])", r"\1", best)
-    try:
-        arr = json.loads(cleaned)
-        # Ensure each is [timestamp(ms|s), price]
-        series = []
-        for row in arr:
-            if not (isinstance(row, list) and len(row) >= 2):
-                continue
-            ts, price = row[0], row[1]
-            if isinstance(ts, (int, float)) and isinstance(price, (int, float)):
-                # Convert seconds → ms if needed
-                if ts < 10_000_000_000:  # likely seconds
-                    ts = int(ts * 1000)
-                series.append([int(ts), int(price)])
-        return series
-    except Exception:
-        return []
-
-def _slice_by_timeframe(series: List[List[float]], tf: str) -> List[List[float]]:
-    if not series:
-        return series
-    hours = TF_TO_HOURS.get(tf, 24)
-    # Keep last N hours of data
-    # series is chronological; if not, sort by ts
-    series = sorted(series, key=lambda x: x[0])
-    cutoff = series[-1][0] - hours * 3600 * 1000
-    return [row for row in series if row[0] >= cutoff]
-
+# -------- public API --------
 async def get_price_history(card_id: int, platform: str = "ps", tf: str = "today") -> Dict:
     """
-    Returns { points: [{ t: ISO_STRING, price: int }, ...] }
-    Note: FUTBIN charts are per-console; we’re scraping the default console line used on page.
-    If you later need strict PS/Xbox selection, target the console toggle script block.
+    Build history from FUT.GG completed auctions, bucketed per timeframe.
+    Shape: {"points":[{"t": ISO_UTC, "price": int}, ...]}
     """
-    url = FUTBIN_PLAYER_URL.format(card_id=card_id)
-    html = await _fetch_html(url)
-    soup = BeautifulSoup(html, "html.parser")
+    cache_key = f"{card_id}|{tf}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return {"points": cached}
 
-    # Try to prefer the second highcharts block like your bot did by scoping:
-    # but regex already grabbed the richest data block above.
-    series = _extract_series_data(html)
-    series = _slice_by_timeframe(series, tf)
+    data = await _fetch_futgg_data(card_id)
+    auctions = (data.get("data") or {}).get("completedAuctions") or []
 
-    points = [{"t": __ts_to_iso(ts), "price": price} for ts, price in series]
+    # Parse auctions -> (ts_ms, price)
+    pairs: List[Tuple[int, int]] = []
+    for a in auctions:
+        price = a.get("soldPrice")
+        sd = a.get("soldDate")
+        if not price or not sd:
+            continue
+        try:
+            dt = datetime.fromisoformat(sd.replace("Z", "+00:00"))
+            ts_ms = int(dt.timestamp() * 1000)
+            pairs.append((ts_ms, int(price)))
+        except Exception:
+            continue
+
+    # If nothing to show, return empty
+    if not pairs:
+        _cache_set(cache_key, [])
+        return {"points": []}
+
+    pairs.sort(key=lambda x: x[0])
+    now_ms = pairs[-1][0]
+    cutoff = _window_cutoff(now_ms, tf)
+    pairs = [p for p in pairs if p[0] >= cutoff]
+
+    # Bucket and take median per bucket to smooth noise
+    bucket_seconds = TF_TO_BUCKET_SECONDS.get(tf, 30 * 60)
+    by_bucket: Dict[int, List[int]] = defaultdict(list)
+    for ts, price in pairs:
+        by_bucket[_bucket(ts, bucket_seconds)].append(price)
+
+    series: List[Tuple[int, int]] = [(b, _median(vals)) for b, vals in by_bucket.items()]
+    series.sort(key=lambda x: x[0])
+
+    # Light downsampling cap (keep payload reasonable)
+    if len(series) > 600:
+        step = max(1, len(series) // 600)
+        series = series[::step]
+
+    points = [{"t": _iso(ts), "price": price} for ts, price in series]
+    _cache_set(cache_key, points)
     return {"points": points}
-
-def __ts_to_iso(ts_ms: int) -> str:
-    # Keep it lightweight; no tz conversions here (ISO in UTC)
-    from datetime import datetime, timezone
-    return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).isoformat()
