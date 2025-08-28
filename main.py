@@ -1141,129 +1141,84 @@ async def delete_all_user_data(confirm: bool = False, user_id: str = Depends(get
     await conn.execute("UPDATE portfolio SET starting_balance = 0 WHERE user_id=$1", user_id)
     return {"message": "All data deleted successfully", "trades_deleted": 0}
 
-# Search players
-# main.py /api/search-players
+# Search players (supports optional position filtering via ?pos=ST)
 @app.get("/api/search-players")
-async def search_players(q: str = "", pos: str = ""):
+async def search_players(q: str = "", pos: Optional[str] = None):
     q = (q or "").strip()
-    pos = (pos or "").strip()
-    if not q and not pos:
+    # if nothing to search, keep it cheap
+    if not q:
         return {"players": []}
 
-    base_sql = """
-        SELECT card_id, name, rating, version, image_url,
-               club, nation, league, position, altposition, price
-        FROM fut_players
-        WHERE 1=1
-    """
-    params = []
-    if q:
-        base_sql += " AND (LOWER(name) LIKE LOWER($1) OR card_id::text LIKE $1)"
-        params.append(f"%{q}%")
-
-    # simple positional filter: either primary position OR altposition contains it
-    if pos:
-        idx = len(params) + 1
-        base_sql += f" AND (UPPER(position) = UPPER(${idx}) OR (altposition IS NOT NULL AND UPPER(altposition)::text LIKE UPPER(${idx+1})))"
-        params.extend([pos, f"%{pos}%"])
-
-    base_sql += " ORDER BY rating DESC NULLS LAST, name ASC LIMIT 20"
-
-    async with player_pool.acquire() as conn:
-        rows = await conn.fetch(base_sql, *params)
-
-    players = [dict(r) for r in rows]
-    return {"players": players}
-
-        # De-dupe, keep order
-        positions = []
-        if main_pos:
-            positions.append(main_pos)
-        for p in alt_positions:
-            if p and p not in positions:
-                positions.append(p)
-
-        # If a slot filter was provided, drop players that don’t have that exact code
-        if pos and pos not in positions:
-            continue
-
-        players.append({
-            "card_id": int(r["card_id"]),
-            "name": r["name"],
-            "rating": r["rating"],
-            "version": r["version"],
-            "image_url": r["image_url"],
-            "club": r["club"],
-            "league": r["league"],
-            "nation": r["nation"],
-            "positions": positions,   # <-- frontend relies on this
-            # price intentionally omitted unless you add that column
-        })
-
-    return {"players": players}
-
-# Extension ingest
-@app.post("/api/trades/ingest")
-async def ingest_sale(sale: ExtSale, auth=Depends(require_extension_jwt)):
-    ts = sale.timestamp_ms / 1000.0
-    user_id = auth.discord_id
-    player = (sale.player_name or "").strip()
-    version = (sale.card_version or "").strip()
-    buy = int(sale.buy_price or 0)
-    sell = int(sale.sell_price)
-    qty = 1
-    platform = "Console"
-    tag = "Auto"
-    profit = (sell - buy) * qty
-    ea_tax = int(round(sell * qty * 0.05))
-
     try:
-        async with pool.acquire() as conn:
-            async with conn.transaction():
-                inserted = await conn.fetchrow(
+        async with player_pool.acquire() as conn:
+            # base filter: name or card_id textual match
+            where_clauses = [
+                "(LOWER(name) LIKE LOWER($1) OR card_id::text LIKE $1)"
+            ]
+            params = [f"%{q}%"]
+
+            # optional position filter (server-side), matches primary position or any token in altposition
+            # altposition can be CSV/pipe/semicolon/etc — we split using a regex
+            if pos:
+                params.append(pos.strip().upper())
+                where_clauses.append(
                     """
-                    INSERT INTO fut_trades
-                      (discord_id, trade_id, player_name, card_version, buy_price, sell_price, ts, source)
-                    VALUES ($1,$2,$3,$4,$5,$6,to_timestamp($7),'webapp')
-                    ON CONFLICT (discord_id, trade_id) DO NOTHING
-                    RETURNING id
-                    """,
-                    user_id,
-                    sale.trade_id,
-                    player,
-                    (version or None),
-                    buy,
-                    sell,
-                    ts,
+                    (
+                      UPPER(position) = $2
+                      OR (
+                        altposition IS NOT NULL
+                        AND EXISTS (
+                          SELECT 1
+                          FROM regexp_split_to_table(altposition, '[,;/|\\s]+') AS ap
+                          WHERE UPPER(TRIM(ap)) = $2
+                        )
+                      )
+                    )
+                    """
                 )
 
-                if inserted:
-                    await conn.execute(
-                        """
-                        INSERT INTO trades
-                          (user_id, player, version, buy, sell, quantity, platform, tag, notes, ea_tax, profit, timestamp, trade_id)
-                        VALUES
-                          ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, to_timestamp($12), $13)
-                        ON CONFLICT (user_id, trade_id) DO NOTHING
-                        """,
-                        user_id,
-                        player,
-                        version,
-                        buy,
-                        sell,
-                        qty,
-                        platform,
-                        tag,
-                        "",
-                        ea_tax,
-                        profit,
-                        ts,
-                        sale.trade_id,
-                    )
-        return {"ok": True, "mirrored_to_trades": bool(inserted)}
+            sql = f"""
+                SELECT
+                  card_id,
+                  name,
+                  rating,
+                  version,
+                  image_url,
+                  club,
+                  league,
+                  nation,
+                  position,
+                  altposition,
+                  price
+                FROM fut_players
+                WHERE {" AND ".join(where_clauses)}
+                ORDER BY rating DESC NULLS LAST, name ASC
+                LIMIT 40
+            """
+
+            rows = await conn.fetch(sql, *params)
+
+        players = [
+            {
+                "card_id": int(r["card_id"]),
+                "name": r["name"],
+                "rating": r["rating"],
+                "version": r["version"],
+                "image_url": r["image_url"],
+                "club": r["club"],
+                "league": r["league"],
+                "nation": r["nation"],
+                "position": r["position"],        # primary
+                "altposition": r["altposition"],  # CSV or NULL; frontend handles both
+                "price": r["price"],
+            }
+            for r in rows
+        ]
+        return {"players": players}
     except Exception as e:
-        logging.error(f"Ingest error: {e}")
-        raise HTTPException(status_code=500, detail="Failed to ingest sale")
+        logging.error(f"Player search error: {e}")
+        return {"players": [], "error": str(e)}
+
 
 # --------- Try to include Squad Builder router LAST (optional) ---------
 try:
