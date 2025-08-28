@@ -1146,111 +1146,101 @@ async def delete_all_user_data(confirm: bool = False, user_id: str = Depends(get
 async def search_players(q: str = "", pos: str = ""):
     """
     Search by name/card_id (q) and/or filter by a target slot position (pos).
-    Supports alt positions stored as Postgres text[] OR a comma-separated string.
-    Returns 'positions' as an array.
+    Works even if 'altposition' column does NOT exist yet.
+    When 'altposition' exists, it can be either text[] or comma-separated text.
+    Always returns 'positions' as an array of canonical codes.
     """
     q = (q or "").strip()
     pos = (pos or "").strip().upper()
 
-    where_clauses = []
-    params = []
-
-    # Name / id match
-    if q:
-        where_clauses.append("(LOWER(name) LIKE LOWER($1) OR card_id::text LIKE $1)")
-        params.append(f"%{q}%")
-
-    # Position eligibility
-    #   - direct match on main 'position'
-    #   - altposition may be text[] or comma string — handle both
-    # For text[]:       $X = ANY(altposition)
-    # For comma string: altposition ILIKE '%ST%' with safe word boundaries (basic)
-    if pos:
-        # build a safe pattern for comma string column (adds commas to avoid partials like 'CM' matching 'CAM')
-        # we’ll match:  start|comma + pos + comma|end   (approximation, works well for "A,B,C" data)
-        like_pattern = f"%,{pos},%"
-        where_clauses.append(
-            "("
-            "  UPPER(position) = $X "
-            "  OR (altposition IS NOT NULL AND ("
-            "        (pg_typeof(altposition)::text = 'text[]' AND $X = ANY(altposition))"
-            "     OR (pg_typeof(altposition)::text <> 'text[]' AND ("
-            "           UPPER(',' || REPLACE(REPLACE(TRIM(altposition), ' ,', ','), ', ', ',') || ',') LIKE $Y"
-            "        ))"
-            "  ))"
-            ")"
-        )
-        # replace $X and $Y indices with actual ones
-        # (we’ll append values after we know current params length)
-        # To keep it simple in text, we’ll build the final SQL string with numbered placeholders now:
-        x_idx = len(params) + 1
-        y_idx = len(params) + 2
-
-        where_clauses[-1] = where_clauses[-1].replace("$X", f"${x_idx}").replace("$Y", f"${y_idx}")
-        params.extend([pos, like_pattern])
-
-    where_sql = " AND ".join(where_clauses) if where_clauses else "TRUE"
-
-    sql = f"""
-        SELECT
-          card_id,
-          name,
-          rating,
-          version,
-          image_url,
-          club,
-          league,
-          nation,
-          position,
-          altposition,
-          price
-        FROM fut_players
-        WHERE {where_sql}
-        ORDER BY rating DESC NULLS LAST, name ASC
-        LIMIT 40
-    """
-
+    # Find out if altposition column exists and whether it's an array
+    has_alt = False
+    alt_is_array = False
     try:
         async with player_pool.acquire() as conn:
+            meta = await conn.fetchrow("""
+                SELECT data_type, udt_name
+                FROM information_schema.columns
+                WHERE table_name = 'fut_players' AND column_name = 'altposition'
+                LIMIT 1
+            """)
+            if meta:
+                has_alt = True
+                # ARRAY types usually report udt_name like '_text'
+                alt_is_array = (meta["data_type"] == "ARRAY") or (str(meta["udt_name"] or "").startswith("_"))
+
+            # Build a SELECT that only includes 'altposition' if it exists
+            select_cols = """
+                card_id, name, rating, version, image_url,
+                club, league, nation, position
+            """
+            if has_alt:
+                select_cols += ", altposition"
+
+            # Basic WHERE (name or id). If no q, allow all so pos-only queries still work.
+            where_sql = "TRUE"
+            params = []
+            if q:
+                where_sql = "(LOWER(name) LIKE LOWER($1) OR card_id::text LIKE $1)"
+                params.append(f"%{q}%")
+
+            sql = f"""
+                SELECT {select_cols}
+                FROM fut_players
+                WHERE {where_sql}
+                ORDER BY rating DESC NULLS LAST, name ASC
+                LIMIT 200
+            """
             rows = await conn.fetch(sql, *params)
 
-        players = []
-        for r in rows:
-            # Normalize positions into an array
-            main_pos = (r["position"] or "").strip().upper() if r["position"] else None
-
-            alt_raw = r["altposition"]
-            if isinstance(alt_raw, list):
-                alt_positions = [p.strip().upper() for p in alt_raw if p]
-            elif isinstance(alt_raw, str):
-                alt_positions = [p.strip().upper() for p in alt_raw.split(",") if p.strip()]
-            else:
-                alt_positions = []
-
-            positions = []
-            if main_pos:
-                positions.append(main_pos)
-            for p in alt_positions:
-                if p and p not in positions:
-                    positions.append(p)
-
-            players.append({
-                "card_id": int(r["card_id"]),
-                "name": r["name"],
-                "rating": r["rating"],
-                "version": r["version"],
-                "image_url": r["image_url"],
-                "club": r["club"],
-                "league": r["league"],
-                "nation": r["nation"],
-                "positions": positions,
-                "price": r["price"],
-            })
-
-        return {"players": players}
     except Exception as e:
         logging.error(f"Player search error: {e}")
         return {"players": [], "error": str(e)}
+
+    # Normalize positions (main + alt if present)
+    def norm(p):
+        return (str(p).strip().upper()) if p else None
+
+    players = []
+    for r in rows:
+        main_pos = norm(r["position"])
+
+        alt_positions = []
+        if has_alt:
+            raw = r["altposition"]
+            if raw is not None:
+                if alt_is_array and isinstance(raw, (list, tuple)):
+                    alt_positions = [norm(x) for x in raw if x]
+                elif isinstance(raw, str):
+                    alt_positions = [norm(x) for x in raw.split(",") if x.strip()]
+                # else: unknown type → ignore
+
+        # De-dupe, keep order
+        positions = []
+        if main_pos:
+            positions.append(main_pos)
+        for p in alt_positions:
+            if p and p not in positions:
+                positions.append(p)
+
+        # If a slot filter was provided, drop players that don’t have that exact code
+        if pos and pos not in positions:
+            continue
+
+        players.append({
+            "card_id": int(r["card_id"]),
+            "name": r["name"],
+            "rating": r["rating"],
+            "version": r["version"],
+            "image_url": r["image_url"],
+            "club": r["club"],
+            "league": r["league"],
+            "nation": r["nation"],
+            "positions": positions,   # <-- frontend relies on this
+            # price intentionally omitted unless you add that column
+        })
+
+    return {"players": players}
 
 # Extension ingest
 @app.post("/api/trades/ingest")
