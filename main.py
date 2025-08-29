@@ -8,13 +8,14 @@ import logging
 import time
 import secrets
 import jwt
+
 from app.services.price_history import get_price_history
 
 from types import SimpleNamespace
 from urllib.parse import urlencode
 
 from fastapi import FastAPI, Request, HTTPException, Depends, UploadFile, File
-from fastapi.responses import RedirectResponse, StreamingResponse
+from fastapi.responses import RedirectResponse, StreamingResponse, JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 from dotenv import load_dotenv
@@ -22,8 +23,8 @@ from contextlib import asynccontextmanager
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 
+# ----------------- BOOTSTRAP -----------------
 logging.basicConfig(level=logging.INFO)
-
 load_dotenv()
 
 # --------- ENV ---------
@@ -44,14 +45,21 @@ SECRET_KEY = os.getenv("SECRET_KEY")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://frontend-production-ab5e.up.railway.app")
 PORT = int(os.getenv("PORT", 8000))
 
+# Environment mode toggles cookie behaviour
+ENV = os.getenv("ENV", "production").lower()
+IS_PROD = ENV in ("prod", "production")
+
 # JWT / Discord
 JWT_PRIVATE_KEY = os.getenv("JWT_PRIVATE_KEY", "dev-secret-change-me")
 JWT_ISSUER = os.getenv("JWT_ISSUER", "fut-dashboard")
-JWT_TTL_SECONDS = int(os.getenv("JWT_TTL_SECONDS", "2592000"))
+JWT_TTL_SECONDS = int(os.getenv("JWT_TTL_SECONDS", "2592000"))  # 30 days
 DISCORD_OAUTH_AUTHORIZE = "https://discord.com/api/oauth2/authorize"
+DISCORD_OAUTH_TOKEN = "https://discord.com/api/oauth2/token"
 DISCORD_USERS_ME = "https://discord.com/api/users/@me"
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 DISCORD_SERVER_ID = os.getenv("DISCORD_SERVER_ID")
+
+# ephemeral state store (extension + dashboard)
 OAUTH_STATE: Dict[str, Dict[str, Any]] = {}
 
 if not SECRET_KEY:
@@ -63,7 +71,7 @@ PRICE_CACHE_TTL = 5  # seconds
 # {(card_id|platform): {"at": ts, "price": int|None, "isExtinct": bool, "updatedAt": str|None}}
 _price_cache: Dict[str, Dict[str, Any]] = {}
 
-# --------- MODELS ---------
+# ----------------- MODELS -----------------
 class UserSettings(BaseModel):
     default_platform: Optional[str] = "Console"
     custom_tags: Optional[List[str]] = []
@@ -90,7 +98,6 @@ class ExtSale(BaseModel):
     sell_price: int
     timestamp_ms: int
 
-# Trade update payload (partial updates)
 class TradeUpdate(BaseModel):
     player: Optional[str] = None
     version: Optional[str] = None
@@ -102,7 +109,6 @@ class TradeUpdate(BaseModel):
     notes: Optional[str] = None
     timestamp: Optional[str] = None  # ISO8601 string
 
-# Watchlist payload
 class WatchlistCreate(BaseModel):
     card_id: int
     player_name: str
@@ -110,7 +116,7 @@ class WatchlistCreate(BaseModel):
     platform: str  # "ps" | "xbox"
     notes: Optional[str] = None
 
-# --------- POOLS & LIFESPAN ---------
+# ----------------- POOLS & LIFESPAN -----------------
 pool = None               # main app DB
 player_pool = None        # static players DB
 watchlist_pool = None     # watchlist DB
@@ -121,7 +127,6 @@ async def lifespan(app: FastAPI):
 
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
 
-    # Reuse pool when URLs match (prevents mis-pointing and double close)
     if PLAYER_DATABASE_URL == DATABASE_URL:
         player_pool = pool
     else:
@@ -175,12 +180,16 @@ async def lifespan(app: FastAPI):
                 completed_at TIMESTAMP
             )
         """)
+
+        # trades indexes/cols used across the app
         await conn.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS trade_id BIGINT")
         await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS trades_user_trade_uidx ON trades (user_id, trade_id)")
         await conn.execute("DROP INDEX IF EXISTS idx_trades_date")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_user_ts ON trades(user_id, timestamp)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_tag ON trades(user_id, tag)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_platform ON trades(user_id, platform)")
+
+        # extension ingestion table
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS fut_trades (
               id           BIGSERIAL PRIMARY KEY,
@@ -222,16 +231,14 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        # Close each unique pool once
         to_close = {pool, player_pool, watchlist_pool}
         for p in to_close:
             if p is not None:
                 await p.close()
 
-# --------- APP ---------
+# ----------------- APP & MIDDLEWARE -----------------
 app = FastAPI(lifespan=lifespan)
 
-# --------- MIDDLEWARE (CORS FIRST) ---------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -247,14 +254,15 @@ app.add_middleware(
     max_age=600,
 )
 
+# Env-aware cookie flags: secure in prod, lax for localhost dev
 app.add_middleware(
     SessionMiddleware,
     secret_key=SECRET_KEY,
-    same_site="none",
-    https_only=True,
+    same_site="none" if IS_PROD else "lax",
+    https_only=IS_PROD,
 )
 
-# --------- DEPENDENCIES & HELPERS ---------
+# ----------------- DEPENDENCIES & HELPERS -----------------
 async def get_db():
     async with pool.acquire() as connection:
         yield connection
@@ -346,7 +354,7 @@ async def fetch_price(card_id: int, platform: str) -> Dict[str, Any]:
     _price_cache[key] = {"at": now, "price": price, "isExtinct": is_extinct, "updatedAt": updated_at}
     return {"price": price, "isExtinct": is_extinct, "updatedAt": updated_at}
 
-# --------- ROUTES ---------
+# ----------------- ROUTES -----------------
 @app.get("/")
 async def root():
     return {"message": "FUT Dashboard API", "status": "healthy"}
@@ -363,9 +371,18 @@ async def health_check():
 # OAuth – dashboard
 @app.get("/api/login")
 async def login():
-    return RedirectResponse(
-        f"https://discord.com/oauth2/authorize?client_id={DISCORD_CLIENT_ID}&redirect_uri={DISCORD_REDIRECT_URI}&response_type=code&scope=identify"
-    )
+    state = secrets.token_urlsafe(24)
+    # store dashboard flow state (optional CSRF)
+    OAUTH_STATE[state] = {"flow": "dashboard", "ts": time.time()}
+    params = {
+        "client_id": DISCORD_CLIENT_ID,
+        "redirect_uri": DISCORD_REDIRECT_URI,
+        "response_type": "code",
+        "scope": "identify",
+        "state": state,
+        "prompt": "none",
+    }
+    return RedirectResponse(f"{DISCORD_OAUTH_AUTHORIZE}?{urlencode(params)}")
 
 @app.get("/api/price-history")
 async def price_history(playerId: int, platform: str = "ps", tf: str = "today"):
@@ -377,9 +394,7 @@ async def price_history(playerId: int, platform: str = "ps", tf: str = "today"):
     try:
         return await get_price_history(playerId, platform, tf)
     except Exception as e:
-        # If upstream site blocks or errors, surface a clean 502
         raise HTTPException(status_code=502, detail=f"Upstream error: {e}")
-
 
 @app.get("/api/callback")
 async def callback(request: Request):
@@ -388,7 +403,6 @@ async def callback(request: Request):
     if not code:
         raise HTTPException(status_code=400, detail="Missing code")
 
-    token_url = "https://discord.com/api/oauth2/token"
     data = {
         "client_id": DISCORD_CLIENT_ID,
         "client_secret": DISCORD_CLIENT_SECRET,
@@ -400,9 +414,10 @@ async def callback(request: Request):
 
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(token_url, data=data, headers=headers) as resp:
+            async with session.post(DISCORD_OAUTH_TOKEN, data=data, headers=headers) as resp:
                 if resp.status != 200:
-                    raise HTTPException(status_code=400, detail="OAuth token exchange failed")
+                    txt = await resp.text()
+                    raise HTTPException(status_code=400, detail=f"OAuth token exchange failed: {txt}")
                 token_data = await resp.json()
                 access_token = token_data.get("access_token")
                 if not access_token:
@@ -414,14 +429,18 @@ async def callback(request: Request):
 
         user_id = user_data["id"]
 
-        # Extension flow
-        if state and state in OAUTH_STATE:
+        # Extension flow (Chrome identity API)
+        if state and state in OAUTH_STATE and OAUTH_STATE.get(state, {}).get("flow") != "dashboard":
             meta = OAUTH_STATE.pop(state)
             jwt_token = issue_extension_token(user_id)
             ext_redirect = meta["ext_redirect"]
             return RedirectResponse(f"{ext_redirect}#token={jwt_token}&state={state}")
 
-        # Site login flow
+        # For dashboard CSRF, just pop (optional)
+        if state and state in OAUTH_STATE:
+            OAUTH_STATE.pop(state, None)
+
+        # Site login flow: membership check (optional gate)
         is_member = await check_server_membership(user_id)
         if not is_member:
             return RedirectResponse(f"{FRONTEND_URL}/access-denied")
@@ -434,17 +453,18 @@ async def callback(request: Request):
         )
         global_name = user_data.get('global_name') or user_data['username']
 
+        # Set server-side session (httpOnly cookie)
         request.session["user_id"] = user_id
         request.session["username"] = username
         request.session["avatar_url"] = avatar_url
         request.session["global_name"] = global_name
 
+        # Ensure profile/portfolio exists
         async with pool.acquire() as conn:
             await conn.execute(
                 "INSERT INTO portfolio (user_id, starting_balance) VALUES ($1, $2) "
                 "ON CONFLICT (user_id) DO NOTHING",
-                user_id,
-                0,
+                user_id, 0,
             )
             await conn.execute(
                 """
@@ -453,13 +473,11 @@ async def callback(request: Request):
                 ON CONFLICT (user_id)
                 DO UPDATE SET username = $2, avatar_url = $3, global_name = $4, updated_at = NOW()
                 """,
-                user_id,
-                username,
-                avatar_url,
-                global_name,
+                user_id, username, avatar_url, global_name,
             )
 
-        return RedirectResponse(f"{FRONTEND_URL}/?authenticated=true")
+        # IMPORTANT: redirect to a route where the frontend will call /api/me and then write localStorage.user_id
+        return RedirectResponse(f"{FRONTEND_URL}/auth/done")
     except HTTPException:
         raise
     except Exception as e:
@@ -467,7 +485,12 @@ async def callback(request: Request):
         raise HTTPException(status_code=500, detail="Authentication failed")
 
 @app.get("/api/logout")
-async def logout(request: Request):
+async def logout_get(request: Request):
+    request.session.clear()
+    return {"message": "Logged out successfully"}
+
+@app.post("/api/logout")
+async def logout_post(request: Request):
     request.session.clear()
     return {"message": "Logged out successfully"}
 
@@ -477,7 +500,7 @@ async def oauth_start(redirect_uri: str):
     if not redirect_uri.startswith("https://") or "chromiumapp.org" not in redirect_uri:
         raise HTTPException(400, "Invalid redirect_uri")
     state = secrets.token_urlsafe(24)
-    OAUTH_STATE[state] = {"ext_redirect": redirect_uri, "ts": time.time()}
+    OAUTH_STATE[state] = {"ext_redirect": redirect_uri, "ts": time.time(), "flow": "extension"}
     params = {
         "client_id": DISCORD_CLIENT_ID,
         "response_type": "code",
@@ -488,8 +511,7 @@ async def oauth_start(redirect_uri: str):
     }
     return RedirectResponse(f"{DISCORD_OAUTH_AUTHORIZE}?{urlencode(params)}")
 
-# --- Business routes (dashboard, trades, settings, goals, analytics, bulk, export/import, search) ---
-
+# ----------------- BUSINESS ROUTES -----------------
 # Dashboard helper
 async def fetch_dashboard_data(user_id: str, conn):
     portfolio = await conn.fetchrow("SELECT starting_balance FROM portfolio WHERE user_id=$1", user_id)
@@ -588,12 +610,10 @@ async def update_trade(
     user_id: str = Depends(get_current_user),
     conn=Depends(get_db),
 ):
-    """Update a trade using EA trade_id for the current user and return the updated row."""
     data = payload.model_dump(exclude_none=True)
     if not data:
         raise HTTPException(status_code=400, detail="No fields to update")
 
-    # Build dynamic SET clause
     fields, values = [], []
     for col, val in data.items():
         fields.append(f"{col} = ${len(values)+1}")
@@ -611,12 +631,11 @@ async def update_trade(
     if not row:
         raise HTTPException(status_code=404, detail="Trade not found")
 
-    # Recompute tax/profit on server (source of truth)
     sell = int(row["sell"] or 0)
     buy  = int(row["buy"] or 0)
     qty  = int(row["quantity"] or 1)
     ea_tax = int(round(sell * qty * 0.05))
-    profit = (sell - buy) * qty  # if you prefer after-tax profit: profit -= ea_tax
+    profit = (sell - buy) * qty
 
     row2 = await conn.fetchrow(
         """
@@ -682,7 +701,7 @@ async def get_player_price(card_id: str):
         logging.error(f"Player price fetch error: {e}")
         return {"error": str(e)}
 
-# --------- WATCHLIST ROUTES ---------
+# ----------------- WATCHLIST ROUTES -----------------
 @app.post("/api/watchlist")
 async def add_watch_item(payload: WatchlistCreate, user_id: str = Depends(get_current_user)):
     try:
@@ -732,7 +751,6 @@ async def list_watch_items(user_id: str = Depends(get_current_user)):
             if not watches:
                 return {"ok": True, "items": []}
 
-            # fut_players.card_id is TEXT → pass TEXT[] to ANY()
             card_ids = [str(w["card_id"]) for w in watches if w.get("card_id") is not None]
 
             async with player_pool.acquire() as pconn:
@@ -745,7 +763,6 @@ async def list_watch_items(user_id: str = Depends(get_current_user)):
                     card_ids,
                 )
 
-            # map with TEXT keys
             meta_map = {
                 str(m["card_id"]): {k: m[k] for k in ("name", "rating", "club", "nation")}
                 for m in meta_rows
@@ -862,7 +879,7 @@ async def refresh_watch_item(watch_id: int, user_id: str = Depends(get_current_u
         print(f"Watchlist REFRESH error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# Me
+# ----------------- ME / SETTINGS / PORTFOLIO -----------------
 @app.get("/api/me")
 async def get_current_user_info(request: Request, user_id: str = Depends(get_current_user)):
     return {
@@ -873,10 +890,8 @@ async def get_current_user_info(request: Request, user_id: str = Depends(get_cur
         "authenticated": True,
     }
 
-# Settings - Updated to use usersettings table
 @app.get("/api/settings")
 async def get_user_settings(user_id: str = Depends(get_current_user), conn=Depends(get_db)):
-    """Get user settings from usersettings table, return defaults if none exist"""
     try:
         settings_row = await conn.fetchrow("""
             SELECT 
@@ -913,7 +928,6 @@ async def get_user_settings(user_id: str = Depends(get_current_user), conn=Depen
 
 @app.post("/api/settings")
 async def update_user_settings(settings: UserSettings, user_id: str = Depends(get_current_user), conn=Depends(get_db)):
-    """Update user settings in usersettings table"""
     try:
         await conn.execute(
             """
@@ -965,7 +979,7 @@ async def update_starting_balance(request: Request, user_id: str = Depends(get_c
     )
     return {"message": "Starting balance updated successfully"}
 
-# Goals
+# ----------------- GOALS -----------------
 @app.get("/api/goals")
 async def get_trading_goals(user_id: str = Depends(get_current_user), conn=Depends(get_db)):
     goals = await conn.fetch("SELECT * FROM trading_goals WHERE user_id=$1 ORDER BY created_at DESC", user_id)
@@ -987,7 +1001,7 @@ async def create_trading_goal(goal: TradingGoal, user_id: str = Depends(get_curr
     )
     return {"message": "Goal created successfully"}
 
-# Analytics
+# ----------------- ANALYTICS -----------------
 @app.get("/api/analytics/advanced")
 async def get_advanced_analytics(user_id: str = Depends(get_current_user), conn=Depends(get_db)):
     daily_profits = await conn.fetch(
@@ -1032,11 +1046,11 @@ async def get_advanced_analytics(user_id: str = Depends(get_current_user), conn=
         "monthly_summary": [dict(r) for r in monthly_summary],
     }
 
-# Bulk update (by trade_id)
+# ----------------- BULK EDIT / EXPORT / IMPORT / NUKE -----------------
 @app.put("/api/trades/bulk")
 async def bulk_edit_trades(request: Request, user_id: str = Depends(get_current_user), conn=Depends(get_db)):
     data = await request.json()
-    trade_ids = data.get("trade_ids", [])  # EA trade_id list
+    trade_ids = data.get("trade_ids", [])
     updates = data.get("updates", {})
     if not trade_ids or not updates:
         raise HTTPException(status_code=400, detail="trade_ids and updates required")
@@ -1064,7 +1078,6 @@ async def bulk_edit_trades(request: Request, user_id: str = Depends(get_current_
     await conn.execute(query, *params)
     return {"message": f"Updated {len(trade_ids)} trades successfully"}
 
-# Export
 @app.get("/api/export/trades")
 async def export_trades(format: str = "csv", user_id: str = Depends(get_current_user), conn=Depends(get_db)):
     rows = await conn.fetch("SELECT * FROM trades WHERE user_id=$1 ORDER BY timestamp DESC", user_id)
@@ -1089,7 +1102,6 @@ async def export_trades(format: str = "csv", user_id: str = Depends(get_current_
         headers={"Content-Disposition": "attachment; filename=trades_export.csv"},
     )
 
-# Import
 @app.post("/api/import/trades")
 async def import_trades(file: UploadFile = File(...), user_id: str = Depends(get_current_user), conn=Depends(get_db)):
     contents = await file.read()
@@ -1148,7 +1160,6 @@ async def import_trades(file: UploadFile = File(...), user_id: str = Depends(get
         "errors": errors[:10],
     }
 
-# Delete all
 @app.delete("/api/data/delete-all")
 async def delete_all_user_data(confirm: bool = False, user_id: str = Depends(get_current_user), conn=Depends(get_db)):
     if not confirm:
@@ -1157,9 +1168,7 @@ async def delete_all_user_data(confirm: bool = False, user_id: str = Depends(get
     await conn.execute("UPDATE portfolio SET starting_balance = 0 WHERE user_id=$1", user_id)
     return {"message": "All data deleted successfully", "trades_deleted": 0}
 
-# --- Search players (supports q and/or pos, parses altposition) ---
-from typing import Optional
-
+# ----------------- SEARCH PLAYERS -----------------
 @app.get("/api/search-players")
 async def search_players(q: str = "", pos: Optional[str] = None):
     q = (q or "").strip()
@@ -1175,7 +1184,6 @@ async def search_players(q: str = "", pos: Optional[str] = None):
                 params.append(f"%{q}%")
 
             if p:
-                # Reuse the same bind index for UPPER(TRIM(ap)) and UPPER(position)
                 params.append(p)
                 idx = len(params)
                 where.append(f"""
@@ -1193,7 +1201,6 @@ async def search_players(q: str = "", pos: Optional[str] = None):
                 """)
 
             if not where:
-                # Avoid returning the whole table if no constraints
                 return {"players": []}
 
             sql = f"""
@@ -1236,9 +1243,7 @@ async def search_players(q: str = "", pos: Optional[str] = None):
         logging.error(f"Player search error: {e}")
         return {"players": [], "error": str(e)}
 
-
-
-# --------- Try to include Squad Builder router LAST (optional) ---------
+# ----------------- INCLUDE OPTIONAL ROUTERS -----------------
 try:
     from app.routers.squad import router as squad_router  # type: ignore
     app.include_router(squad_router, prefix="/api")
@@ -1246,7 +1251,7 @@ try:
 except Exception as e:
     logging.warning("⚠️ Squad router not loaded: %s", e)
 
-# ---- entrypoint ----
+# ----------------- ENTRYPOINT -----------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=PORT)
