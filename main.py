@@ -881,13 +881,20 @@ async def refresh_watch_item(watch_id: int, user_id: str = Depends(get_current_u
 
 # ----------------- ME / SETTINGS / PORTFOLIO -----------------
 @app.get("/api/me")
-async def get_current_user_info(request: Request, user_id: str = Depends(get_current_user)):
+async def get_current_user_info(request: Request):
+    """
+    Always 200. If not logged in, return authenticated=False (no 401),
+    to avoid frontend re-login loops.
+    """
+    uid = request.session.get("user_id")
+    if not uid:
+        return {"authenticated": False}
     return {
-        "user_id": user_id,
+        "authenticated": True,
+        "user_id": uid,
         "username": request.session.get("username"),
         "avatar_url": request.session.get("avatar_url"),
         "global_name": request.session.get("global_name"),
-        "authenticated": True,
     }
 
 @app.get("/api/settings")
@@ -1242,6 +1249,15 @@ async def search_players(q: str = "", pos: Optional[str] = None):
     except Exception as e:
         logging.error(f"Player search error: {e}")
         return {"players": [], "error": str(e)}
+
+# ----------------- DEBUG -----------------
+@app.get("/api/debug/session")
+async def debug_session(req: Request):
+    return {
+        "cookies_present": bool(req.cookies),
+        "session_user_id": req.session.get("user_id"),
+        "all_session_keys": list(req.session.keys()),
+    }
 
 # ----------------- INCLUDE OPTIONAL ROUTERS -----------------
 try:
