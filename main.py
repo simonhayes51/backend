@@ -21,7 +21,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 from pydantic import BaseModel
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Literal  # ← added Literal
 
 # ----------------- BOOTSTRAP -----------------
 logging.basicConfig(level=logging.INFO)
@@ -700,6 +700,93 @@ async def get_player_price(card_id: str):
     except Exception as e:
         logging.error(f"Player price fetch error: {e}")
         return {"error": str(e)}
+
+# ----------------- TRENDING ROUTE (risers / fallers / smart) -----------------
+"""
+This endpoint powers your Trending.jsx page.
+
+It first tries to import real implementations from app.services.trending:
+  - get_trending_risers(tf: Literal["4h","24h"])
+  - get_trending_fallers(tf: Literal["4h","24h"])
+  - get_trending_smart()
+
+If those functions aren't available, it falls back to stubs that return [].
+"""
+
+# Try to use your existing scraper/cache if present
+try:
+    from app.services.trending import (  # type: ignore
+        get_trending_risers as _get_trending_risers,
+        get_trending_fallers as _get_trending_fallers,
+        get_trending_smart as _get_trending_smart,
+    )
+    logging.info("✅ Using app.services.trending implementations")
+except Exception as _e:
+    logging.warning("⚠️ app.services.trending not found, using empty stub implementations: %s", _e)
+
+    async def _get_trending_risers(tf: Literal["4h", "24h"]) -> List[Dict[str, Any]]:
+        return []
+
+    async def _get_trending_fallers(tf: Literal["4h", "24h"]) -> List[Dict[str, Any]]:
+        return []
+
+    async def _get_trending_smart() -> List[Dict[str, Any]]:
+        return []
+
+def _normalise_player(p: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalise various keys to what the frontend expects.
+    """
+    return {
+        "name": p.get("name"),
+        "rating": p.get("rating") or p.get("ovr"),
+        "pid": p.get("pid") or p.get("id"),
+        "version": p.get("version") or p.get("card_type"),
+        "image": p.get("image") or p.get("image_url"),
+        "price_ps": p.get("price_ps") or p.get("ps"),
+        "price_xb": p.get("price_xb") or p.get("xb") or p.get("xbox"),
+        "percent": p.get("percent"),
+        "percent_4h": p.get("percent_4h"),
+        "percent_24h": p.get("percent_24h"),
+        "club": p.get("club"),
+        "league": p.get("league"),
+    }
+
+@app.get("/api/trending")
+async def api_trending(
+    type: Literal["risers", "fallers", "smart"],
+    tf: Optional[Literal["4h", "24h"]] = None,
+):
+    try:
+        if type == "smart":
+            items = await _get_trending_smart()
+            return {"type": "smart", "items": [_normalise_player(p) for p in items]}
+
+        if tf is None:
+            raise HTTPException(status_code=400, detail="tf is required for risers/fallers (use 4h or 24h)")
+
+        if type == "risers":
+            items = await _get_trending_risers(tf)
+        else:
+            items = await _get_trending_fallers(tf)
+
+        normalised: List[Dict[str, Any]] = []
+        for p in items:
+            n = _normalise_player(p)
+            # Ensure single "percent" matches timeframe if only percent_4h/percent_24h provided
+            if n.get("percent") is None:
+                if tf == "4h" and n.get("percent_4h") is not None:
+                    n["percent"] = n["percent_4h"]
+                if tf == "24h" and n.get("percent_24h") is not None:
+                    n["percent"] = n["percent_24h"]
+            normalised.append(n)
+
+        return {"type": type, "timeframe": tf, "items": normalised}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"/api/trending error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ----------------- WATCHLIST ROUTES -----------------
 @app.post("/api/watchlist")
