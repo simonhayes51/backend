@@ -8,8 +8,12 @@ import logging
 import time
 import secrets
 import jwt
+import asyncio
+import re
 
+from bs4 import BeautifulSoup
 from app.services.price_history import get_price_history
+from app.services.prices import get_player_price  # <-- added
 
 from types import SimpleNamespace
 from urllib.parse import urlencode
@@ -21,7 +25,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 from pydantic import BaseModel
-from typing import List, Optional, Dict, Any, Literal  # <-- added Literal
+from typing import List, Optional, Dict, Any, Literal
 
 # ----------------- BOOTSTRAP -----------------
 logging.basicConfig(level=logging.INFO)
@@ -70,6 +74,134 @@ FUTGG_BASE = "https://www.fut.gg/api/fut/player-prices/25"
 PRICE_CACHE_TTL = 5  # seconds
 # {(card_id|platform): {"at": ts, "price": int|None, "isExtinct": bool, "updatedAt": str|None}}
 _price_cache: Dict[str, Dict[str, Any]] = {}
+
+# ----------------- FUT.GG MOMENTUM (NEW) -----------------
+MOMENTUM_BASE = "https://www.fut.gg/players/momentum"
+MOMENTUM_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-GB,en;q=0.9",
+    "Referer": "https://www.fut.gg/",
+}
+# Hrefs look like: /players/4231-rivaldo/25-4231/
+_CARD_HREF_RE = re.compile(r"/players/(\d+)-[a-z0-9-]+/25-(\d+)/?", re.IGNORECASE)
+
+def _norm_tf(tf: Optional[str]) -> str:
+    """Accept '6'|'12'|'24' or '6h'|'12h'|'24h', default '24'."""
+    if not tf:
+        return "24"
+    tf = tf.lower().strip()
+    if tf.endswith("h"):
+        tf = tf[:-1]
+    return tf if tf in ("6", "12", "24") else "24"
+
+async def _fetch_momentum_page(tf: str, page: int) -> str:
+    url = f"{MOMENTUM_BASE}/{tf}/?page={page}"
+    timeout = aiohttp.ClientTimeout(total=12)
+    async with aiohttp.ClientSession(timeout=timeout, headers=MOMENTUM_HEADERS) as sess:
+        async with sess.get(url) as r:
+            if r.status != 200:
+                raise HTTPException(status_code=502, detail=f"MOMENTUM {r.status}")
+            return await r.text()
+
+def _parse_last_page_number(html: str) -> int:
+    soup = BeautifulSoup(html, "html.parser")
+    nums = []
+    for a in soup.find_all("a"):
+        href = a.get("href") or ""
+        if "page=" in href:
+            try:
+                n = int(href.split("page=", 1)[1].split("&", 1)[0])
+                nums.append(n)
+            except Exception:
+                continue
+        else:
+            t = a.text.strip()
+            if t.isdigit():
+                nums.append(int(t))
+    return max(nums) if nums else 1
+
+def _extract_items(html: str) -> list[dict]:
+    """
+    Return list of {card_id:int, percent:float} in page order.
+    We associate the percent text found inside/near the player tile anchor.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    tiles = []
+    for a in soup.find_all("a", href=True):
+        m = _CARD_HREF_RE.search(a["href"])
+        if not m:
+            continue
+        # climb up a few levels to find a container that includes the % text
+        node = a
+        for _ in range(4):
+            if node is None or node.name == "body":
+                break
+            txt = node.get_text(separator=" ", strip=True)
+            if "%" in txt:
+                tiles.append((m.group(2), txt))  # second group is the item/card id
+                break
+            node = node.parent
+
+    items = []
+    pct_re = re.compile(r"([+\-]?\s?\d+(?:\.\d+)?)\s*%")
+    seen = set()
+    for cid, text in tiles:
+        if cid in seen:
+            continue
+        m = pct_re.search(text)
+        if not m:
+            continue
+        try:
+            pct = float(m.group(1).replace(" ", ""))
+            items.append({"card_id": int(cid), "percent": pct})
+            seen.add(cid)
+        except Exception:
+            continue
+    return items
+
+async def _momentum_page_items(tf: str, page: int) -> tuple[list[dict], str]:
+    html = await _fetch_momentum_page(tf, page)
+    return _extract_items(html), html
+
+async def _enrich_with_meta(items: list[dict]) -> list[dict]:
+    """Join with fut_players and attach name/rating/version/image/club/league."""
+    if not items:
+        return []
+    ids = [str(it["card_id"]) for it in items]
+    async with player_pool.acquire() as pconn:
+        rows = await pconn.fetch(
+            """
+            SELECT card_id, name, rating, version, image_url, club, league
+              FROM fut_players
+             WHERE card_id = ANY($1::text[])
+            """,
+            ids,
+        )
+    meta = {str(r["card_id"]): dict(r) for r in rows}
+    out = []
+    for it in items:
+        m = meta.get(str(it["card_id"]), {})
+        out.append({
+            "pid": it["card_id"],
+            "name": m.get("name") or f"Card {it['card_id']}",
+            "rating": m.get("rating"),
+            "version": m.get("version"),
+            "image": m.get("image_url"),
+            "club": m.get("club"),
+            "league": m.get("league"),
+            "percent": it["percent"],
+            "price_ps": None,
+            "price_xb": None,
+        })
+    return out
+
+async def _attach_prices_ps(items: list[dict]) -> list[dict]:
+    tasks = [get_player_price(it["pid"], "ps") for it in items]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for it, val in zip(items, results):
+        it["price_ps"] = int(val) if isinstance(val, (int, float)) else None
+    return items
 
 # ----------------- MODELS -----------------
 class UserSettings(BaseModel):
@@ -227,17 +359,6 @@ async def lifespan(app: FastAPI):
             CREATE UNIQUE INDEX IF NOT EXISTS idx_watchlist_unique
             ON watchlist(user_id, card_id, platform)
         """)
-
-    # ----------------- TRENDING SOURCE INIT -----------------
-    # Prefer building from FUT.GG history + fut_players
-    from app.services import trending_from_history as trending_source  # <--- add module
-    try:
-        await trending_source.init_pool(player_pool)
-        app.state.trending_source = trending_source
-        logging.info("✅ Trending source ready (from FUT.GG history + fut_players)")
-    except Exception as e:
-        logging.error("❌ Failed to init trending source: %s", e)
-        app.state.trending_source = None
 
     try:
         yield
@@ -1270,69 +1391,38 @@ async def debug_session(req: Request):
         "all_session_keys": list(req.session.keys()),
     }
 
-# ----------------- TRENDING ROUTES -----------------
-
-def _normalise_player(p: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Ensure the payload keys match the frontend's expectations.
-    Converts image_url -> image, keeps pid, price_ps, price_xb, percent/_4h/_24h.
-    """
-    out = {
-        "name": p.get("name"),
-        "rating": p.get("rating"),
-        "pid": p.get("pid") or p.get("card_id"),
-        "version": p.get("version"),
-        "image": p.get("image_url") or p.get("image"),
-        "club": p.get("club"),
-        "league": p.get("league"),
-        "price_ps": p.get("price_ps"),
-        "price_xb": p.get("price_xb"),
-        "percent": p.get("percent"),
-        "percent_4h": p.get("percent_4h"),
-        "percent_24h": p.get("percent_24h"),
-    }
-    return out
+# ----------------- TRENDING ROUTES (REPLACED) -----------------
 
 @app.get("/api/trending")
 async def api_trending(
-    type: Literal["risers","fallers","smart"],
-    tf: Optional[Literal["4h","24h"]] = None,
+    type: Literal["risers","fallers"],
+    tf: Optional[str] = "24",  # accepts '6','12','24' or '6h','12h','24h'
 ):
-    src = getattr(app.state, "trending_source", None)
-    if src is None:
-        raise HTTPException(status_code=503, detail="Trending source not ready")
-    try:
-        if type == "smart":
-            items = await src.get_trending_smart()
-            return {"type": "smart", "items": [_normalise_player(p) for p in items]}
+    """
+    FUT.GG Momentum-based trending with 6h/12h/24h filters.
+    - Fallers: page 1, first 10 (lowest %)
+    - Risers : last page, top 10 (highest %)
+    """
+    kind = (type or "fallers").lower()
+    tf_norm = _norm_tf(tf)
 
-        if tf is None:
-            raise HTTPException(status_code=400, detail="tf is required for risers/fallers (use 4h or 24h)")
+    if kind == "fallers":
+        items, _ = await _momentum_page_items(tf_norm, 1)
+        items.sort(key=lambda x: x["percent"])  # most negative first
+        pick = items[:10]
+    elif kind == "risers":
+        # find last page from page 1's pagination
+        _, html = await _momentum_page_items(tf_norm, 1)
+        last = _parse_last_page_number(html)
+        items, _ = await _momentum_page_items(tf_norm, last)
+        items.sort(key=lambda x: x["percent"], reverse=True)  # most positive first
+        pick = items[:10]
+    else:
+        raise HTTPException(status_code=400, detail="type must be 'risers' or 'fallers'")
 
-        if type == "risers":
-            items = await src.get_trending_risers(tf)
-        elif type == "fallers":
-            items = await src.get_trending_fallers(tf)
-        else:
-            raise HTTPException(status_code=400, detail="Unknown type")
-
-        normalised = []
-        for p in items:
-            n = _normalise_player(p)
-            if n.get("percent") is None:
-                # fallback: if only _4h/_24h present, use the requested tf
-                if tf == "4h" and n.get("percent_4h") is not None:
-                    n["percent"] = n["percent_4h"]
-                if tf == "24h" and n.get("percent_24h") is not None:
-                    n["percent"] = n["percent_24h"]
-            normalised.append(n)
-
-        return {"type": type, "timeframe": tf, "items": normalised}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logging.error(f"/api/trending error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    enriched = await _enrich_with_meta(pick)
+    enriched = await _attach_prices_ps(enriched)
+    return {"type": kind, "timeframe": f"{tf_norm}h", "items": enriched}
 
 # ----------------- INCLUDE OPTIONAL ROUTERS -----------------
 try:
