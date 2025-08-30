@@ -1,183 +1,220 @@
-import os
-import asyncio
-import asyncpg
+import re
+import aiohttp
+from bs4 import BeautifulSoup
 from typing import Any, Dict, List, Optional, Literal
 
-# Reuse your existing price history utility
-from app.services.price_history import get_price_history
+FUTBIN_MARKET_URL = "https://www.futbin.com/market"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
-PLAYER_DATABASE_URL = os.getenv("PLAYER_DATABASE_URL") or os.getenv("DATABASE_URL")
-if not PLAYER_DATABASE_URL:
-    raise RuntimeError("PLAYER_DATABASE_URL or DATABASE_URL must be set")
+# --- helpers --------------------------------------------------------------
 
-_pool: Optional[asyncpg.Pool] = None
-_SEM = asyncio.Semaphore(8)  # limit concurrency so we don't hammer upstream
-
-async def _get_pool() -> asyncpg.Pool:
-    global _pool
-    if _pool is None:
-        _pool = await asyncpg.create_pool(PLAYER_DATABASE_URL, min_size=1, max_size=10)
-    return _pool
-
-async def _latest_price_from_history(player_id: int, platform: str, tf: Literal["4h","24h"]) -> Optional[int]:
-    """Return the most recent valid price from history for a platform/timeframe."""
+def _parse_price_text(txt: Optional[str]) -> Optional[int]:
+    """
+    Convert FUTBIN price text like '12,500', '23.5K', '1.2M' -> int coins.
+    """
+    if not txt:
+        return None
+    s = txt.strip().lower().replace(",", "")
     try:
-        data = await get_price_history(player_id, platform, tf)
-        pts = data.get("points") or []
-        for p in reversed(pts):
-            price = p.get("price")
-            if isinstance(price, (int, float)) and price > 0:
-                return int(price)
+        if s.endswith("m"):
+            return int(float(s[:-1]) * 1_000_000)
+        if s.endswith("k"):
+            return int(float(s[:-1]) * 1_000)
+        # plain number
+        return int(float(s))
     except Exception:
-        pass
+        return None
+
+async def _fetch(session: aiohttp.ClientSession, url: str) -> Optional[str]:
+    try:
+        async with session.get(url) as resp:
+            if resp.status == 200:
+                return await resp.text()
+            return None
+    except Exception:
+        return None
+
+async def _get_ps_price(session: aiohttp.ClientSession, player_url: str, expected_rating: str) -> Optional[int]:
+    """
+    Scrape a FUTBIN player page, returning PS price (coins) for the block that matches the card rating.
+    Falls back to the first "lowest-price-1" block.
+    """
+    html = await _fetch(session, player_url)
+    if not html:
+        return None
+    soup = BeautifulSoup(html, "html.parser")
+
+    # try rating-matched block first
+    blocks = soup.select("div.player-page-price-versions > div")
+    for b in blocks:
+        rating = b.select_one(".player-rating")
+        price = b.select_one("div.price.inline-with-icon.lowest-price-1")
+        if rating and price and rating.text.strip() == expected_rating:
+            return _parse_price_text(price.text)
+
+    # fallback: first lowest price block
+    fallback = soup.select_one("div.price.inline-with-icon.lowest-price-1")
+    return _parse_price_text(fallback.text if fallback else None)
+
+def _extract_pid_from_link(link: str) -> Optional[int]:
+    # FUTBIN links look like /player/12345-name or /23/player/12345...
+    m = re.search(r"/player/(\d+)", link)
+    if m:
+        try:
+            return int(m.group(1))
+        except ValueError:
+            return None
     return None
 
-def _percent_change(points: List[Dict[str, Any]]) -> Optional[float]:
-    """Compute percent change from first valid to last valid price in the series."""
-    if not points:
-        return None
-    # first valid
-    first = None
-    for p in points:
-        v = p.get("price")
-        if isinstance(v, (int, float)) and v > 0:
-            first = float(v)
-            break
-    if not first or first <= 0:
-        return None
-    # last valid
-    last = None
-    for p in reversed(points):
-        v = p.get("price")
-        if isinstance(v, (int, float)) and v > 0:
-            last = float(v)
-            break
-    if last is None:
-        return None
-    return round(((last - first) / first) * 100.0, 2)
+# --- core scraping (mirrors your Discord cog) -----------------------------
 
-async def _compute_for_player(row: asyncpg.Record, tf: Literal["4h","24h"]) -> Optional[Dict[str, Any]]:
-    """
-    Build the unified payload for one player for a single timeframe.
-    Uses PS/Xbox latest prices and computes percent (PS based).
-    """
-    card_id = int(row["card_id"])
-    name = row["name"]
-    rating = row["rating"]
-    version = row["version"]
-    image_url = row["image_url"]
-    club = row["club"]
-    league = row["league"]
-
-    async with _SEM:
-        try:
-            # Use PS series to compute percentage
-            ps_hist = await get_price_history(card_id, "ps", tf)
-            percent = _percent_change(ps_hist.get("points") or [])
-            # latest prices
-            price_ps = await _latest_price_from_history(card_id, "ps", tf)
-            price_xb = await _latest_price_from_history(card_id, "xbox", tf)
-        except Exception:
-            return None
-
-    if percent is None and price_ps is None and price_xb is None:
-        return None
-
-    return {
-        "name": name,
-        "rating": rating,
-        "pid": card_id,
-        "version": version,
-        "image_url": image_url,
-        "club": club,
-        "league": league,
-        "price_ps": price_ps,
-        "price_xb": price_xb,
-        "percent": percent,
+async def _fetch_trending_cards(session: aiohttp.ClientSession, timeframe: Literal["4h", "24h"]) -> List[Dict[str, Any]]:
+    tf_map = {
+        "24h": "div.market-players-wrapper.market-24-hours.m-row.space-between",
+        "4h": "div.market-players-wrapper.market-4-hours.m-row.space-between",
     }
+    html = await _fetch(session, FUTBIN_MARKET_URL)
+    if not html:
+        return []
 
-async def _compute_for_player_dual(row: asyncpg.Record) -> Optional[Dict[str, Any]]:
-    """
-    For Smart Movers: compute 4h and 24h in one shot.
-    """
-    card_id = int(row["card_id"])
-    name = row["name"]
-    rating = row["rating"]
-    version = row["version"]
-    image_url = row["image_url"]
+    soup = BeautifulSoup(html, "html.parser")
+    container = soup.select_one(tf_map[timeframe])
+    cards = container.select("a.market-player-card") if container else []
 
-    async with _SEM:
+    players: List[Dict[str, Any]] = []
+    for card in cards:
+        trend_tag = card.select_one(".market-player-change")
+        if not trend_tag or "%" not in (trend_tag.text or ""):
+            continue
+
+        # parse % and sign
+        txt = trend_tag.text.strip().replace("%", "").replace("+", "").replace(",", "")
         try:
-            ps4 = await get_price_history(card_id, "ps", "4h")
-            ps24 = await get_price_history(card_id, "ps", "24h")
-            price_ps = await _latest_price_from_history(card_id, "ps", "24h")  # show a stable latest
-            price_xb = await _latest_price_from_history(card_id, "xbox", "24h")
+            trend = float(txt)
+            if "day-change-negative" in (trend_tag.get("class") or []):
+                trend = -abs(trend)
         except Exception:
-            return None
+            continue
 
-    p4 = _percent_change(ps4.get("points") or [])
-    p24 = _percent_change(ps24.get("points") or [])
+        name = card.select_one(".playercard-s-25-name")
+        rating = card.select_one(".playercard-s-25-rating")
+        link = card.get("href")
+        if not (name and rating and link):
+            continue
 
-    if p4 is None and p24 is None:
-        return None
+        href = f"https://www.futbin.com{link}?platform=ps"
+        pid = _extract_pid_from_link(link)  # Optional
 
-    return {
-        "name": name,
-        "rating": rating,
-        "pid": card_id,
-        "version": version,
-        "image_url": image_url,
-        "price_ps": price_ps,
-        "price_xb": price_xb,
-        "percent_4h": p4,
-        "percent_24h": p24,
-    }
-
-async def _candidate_rows(limit: int = 120) -> List[asyncpg.Record]:
-    """
-    Pull a reasonable set of candidates from fut_players to evaluate.
-    Prefer higher-rated and those with a known current price.
-    """
-    pool = await _get_pool()
-    async with pool.acquire() as conn:
-        return await conn.fetch(
-            """
-            SELECT card_id, name, rating, version, image_url, club, league
-            FROM fut_players
-            WHERE price IS NOT NULL
-            ORDER BY rating DESC NULLS LAST, price DESC NULLS LAST
-            LIMIT $1
-            """,
-            limit,
+        players.append(
+            {
+                "name": name.text.strip(),
+                "rating": int((rating.text or "0").strip() or 0),
+                "trend": trend,
+                "url": href,
+                "pid": pid,
+            }
         )
+    return players
 
-async def get_trending_risers(tf: Literal["4h","24h"]) -> List[Dict[str, Any]]:
-    rows = await _candidate_rows()
-    results = await asyncio.gather(*[_compute_for_player(r, tf) for r in rows])
-    items = [r for r in results if r and isinstance(r.get("percent"), (int, float))]
-    items.sort(key=lambda x: x["percent"], reverse=True)
-    return items[:20]
+# --- public functions used by main.py ------------------------------------
 
-async def get_trending_fallers(tf: Literal["4h","24h"]) -> List[Dict[str, Any]]:
-    rows = await _candidate_rows()
-    results = await asyncio.gather(*[_compute_for_player(r, tf) for r in rows])
-    items = [r for r in results if r and isinstance(r.get("percent"), (int, float))]
-    items.sort(key=lambda x: x["percent"])  # ascending -> most negative first
-    return items[:20]
+async def get_trending_risers(tf: Literal["4h", "24h"]) -> List[Dict[str, Any]]:
+    """
+    Return top 10 risers with PS price. Fields match the frontend normaliser:
+      name, rating, pid, version?, image?, price_ps, price_xb(None), percent
+    """
+    timeout = aiohttp.ClientTimeout(total=20)
+    headers = {"User-Agent": USER_AGENT}
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        raw = await _fetch_trending_cards(session, tf)
+        out: List[Dict[str, Any]] = []
+        for p in raw:
+            if p["trend"] <= 0:
+                continue
+            price_ps = await _get_ps_price(session, p["url"], str(p["rating"]))
+            if price_ps is None:
+                continue
+            out.append(
+                {
+                    "name": p["name"],
+                    "rating": p["rating"],
+                    "pid": p.get("pid"),
+                    "version": None,
+                    "image_url": None,
+                    "price_ps": price_ps,
+                    "price_xb": None,  # FUTBIN scrape is PS-only here
+                    "percent": round(float(p["trend"]), 2),
+                }
+            )
+            if len(out) == 10:
+                break
+        return out
+
+async def get_trending_fallers(tf: Literal["4h", "24h"]) -> List[Dict[str, Any]]:
+    timeout = aiohttp.ClientTimeout(total=20)
+    headers = {"User-Agent": USER_AGENT}
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        raw = await _fetch_trending_cards(session, tf)
+        out: List[Dict[str, Any]] = []
+        for p in raw:
+            if p["trend"] >= 0:
+                continue
+            price_ps = await _get_ps_price(session, p["url"], str(p["rating"]))
+            if price_ps is None:
+                continue
+            out.append(
+                {
+                    "name": p["name"],
+                    "rating": p["rating"],
+                    "pid": p.get("pid"),
+                    "version": None,
+                    "image_url": None,
+                    "price_ps": price_ps,
+                    "price_xb": None,
+                    "percent": round(float(p["trend"]), 2),
+                }
+            )
+            if len(out) == 10:
+                break
+        return out
 
 async def get_trending_smart() -> List[Dict[str, Any]]:
-    rows = await _candidate_rows()
-    results = await asyncio.gather(*[_compute_for_player_dual(r) for r in rows])
-    items = []
-    for r in results:
-        if not r:
-            continue
-        p4 = r.get("percent_4h")
-        p24 = r.get("percent_24h")
-        # "Smart" = moving in opposite directions or large divergence
-        if isinstance(p4, (int, float)) and isinstance(p24, (int, float)):
-            if (p4 > 0 and p24 < 0) or (p4 < 0 and p24 > 0) or abs(p4 - p24) >= 5:
-                items.append(r)
-    # sort by magnitude of divergence
-    items.sort(key=lambda x: abs((x.get("percent_4h") or 0) - (x.get("percent_24h") or 0)), reverse=True)
-    return items[:20]
+    """
+    Smart movers = players whose trend flips between 4h and 24h.
+    Return top 10; include percent_4h and percent_24h, plus PS price.
+    """
+    timeout = aiohttp.ClientTimeout(total=30)
+    headers = {"User-Agent": USER_AGENT}
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        short = await _fetch_trending_cards(session, "4h")
+        long = await _fetch_trending_cards(session, "24h")
+        map_4h = {(p["name"], p["rating"]): p for p in short}
+
+        smart: List[Dict[str, Any]] = []
+        for p in long:
+            key = (p["name"], p["rating"])
+            if key not in map_4h:
+                continue
+            p4 = float(map_4h[key]["trend"])
+            p24 = float(p["trend"])
+            if (p4 > 0 > p24) or (p4 < 0 < p24):
+                price_ps = await _get_ps_price(session, p["url"], str(p["rating"]))
+                if price_ps is None:
+                    continue
+                smart.append(
+                    {
+                        "name": p["name"],
+                        "rating": p["rating"],
+                        "pid": p.get("pid"),
+                        "version": None,
+                        "image_url": None,
+                        "price_ps": price_ps,
+                        "price_xb": None,
+                        "percent_4h": round(p4, 2),
+                        "percent_24h": round(p24, 2),
+                    }
+                )
+                if len(smart) == 10:
+                    break
+
+        return smart
