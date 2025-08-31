@@ -19,7 +19,7 @@ from types import SimpleNamespace
 from urllib.parse import urlencode
 
 from fastapi import FastAPI, Request, HTTPException, Depends, UploadFile, File
-from fastapi.responses import RedirectResponse, StreamingResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 from dotenv import load_dotenv
@@ -46,7 +46,8 @@ DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID")
 DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
 DISCORD_REDIRECT_URI = os.getenv("DISCORD_REDIRECT_URI")
 SECRET_KEY = os.getenv("SECRET_KEY")
-FRONTEND_URL = os.getenv("FRONTEND_URL", "https://frontendnew-production.up.railway.app")
+# Normalize FRONTEND_URL to match browser Origin exactly (no trailing slash)
+FRONTEND_URL = (os.getenv("FRONTEND_URL", "https://frontendnew-production.up.railway.app/").rstrip("/"))
 PORT = int(os.getenv("PORT", 8000))
 
 # Environment mode toggles cookie behaviour
@@ -203,6 +204,43 @@ async def _attach_prices_ps(items: list[dict]) -> list[dict]:
         it["price_ps"] = int(val) if isinstance(val, (int, float)) else None
     return items
 
+# ----------------- HELPERS -----------------
+def parse_coin_amount(v) -> int:
+    """
+    Accepts strings/numbers like: 1000, "1,000", "1.000", "1 000", "1.2k", "1,2k", "1m", "1kk"
+    Returns integer coins (rounded).
+    """
+    if v is None:
+        return 0
+    if isinstance(v, (int, float)):
+        return int(round(float(v)))
+    s = str(v).strip().lower()
+
+    # remove spaces/underscores
+    s = re.sub(r"[\s_]", "", s)
+
+    # drop thousand separators followed by exactly 3 digits
+    s = re.sub(r"(?<=\d)[,\.](?=\d{3}\b)", "", s)
+
+    # normalize decimal comma to dot
+    s = s.replace(",", ".")
+
+    # suffixes
+    if s.endswith("kk"):
+        try: return int(round(float(s[:-2]) * 1_000_000))
+        except: return 0
+    if s.endswith("k"):
+        try: return int(round(float(s[:-1]) * 1_000))
+        except: return 0
+    if s.endswith("m"):
+        try: return int(round(float(s[:-1]) * 1_000_000))
+        except: return 0
+
+    try:
+        return int(round(float(s)))
+    except:
+        return 0
+
 # ----------------- MODELS -----------------
 class UserSettings(BaseModel):
     default_platform: Optional[str] = "Console"
@@ -210,7 +248,7 @@ class UserSettings(BaseModel):
     currency_format: Optional[str] = "coins"  # coins, k, m
     theme: Optional[str] = "dark"
     timezone: Optional[str] = "UTC"
-    date_format: Optional[str] = "US"  # US or EU
+    date_format: Optional[str] = "US"  # US or EU or ISO
     include_tax_in_profit: Optional[bool] = True
     default_chart_range: Optional[str] = "30d"  # 7d, 30d, 90d, all
     visible_widgets: Optional[List[str]] = ["profit", "tax", "balance", "trades"]
@@ -234,8 +272,8 @@ class TradeUpdate(BaseModel):
     player: Optional[str] = None
     version: Optional[str] = None
     quantity: Optional[int] = None
-    buy: Optional[int] = None
-    sell: Optional[int] = None
+    buy: Optional[Any] = None   # accept formatted strings too
+    sell: Optional[Any] = None
     platform: Optional[str] = None
     tag: Optional[str] = None
     notes: Optional[str] = None
@@ -374,7 +412,7 @@ app = FastAPI(lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        FRONTEND_URL,
+        FRONTEND_URL,              # exact origin, no trailing slash
         "http://localhost:5173",
         "http://localhost:3000",
     ],
@@ -697,15 +735,15 @@ async def add_trade(request: Request, user_id: str = Depends(get_current_user), 
 
     try:
         quantity = int(data["quantity"])
-        buy = int(data["buy"])
-        sell = int(data["sell"])
+        buy = parse_coin_amount(data["buy"])
+        sell = parse_coin_amount(data["sell"])
         if quantity <= 0 or buy <= 0 or sell <= 0:
             raise ValueError()
     except (ValueError, TypeError):
         raise HTTPException(status_code=400, detail="Invalid numeric values")
 
     profit = (sell - buy) * quantity
-    ea_tax = int(sell * quantity * 0.05)
+    ea_tax = int(round(sell * quantity * 0.05))
 
     await conn.execute(
         """
@@ -745,6 +783,12 @@ async def update_trade(
     data = payload.model_dump(exclude_none=True)
     if not data:
         raise HTTPException(status_code=400, detail="No fields to update")
+
+    # Ensure buy/sell parse if they came in formatted
+    if "buy" in data:
+        data["buy"] = parse_coin_amount(data["buy"])
+    if "sell" in data:
+        data["sell"] = parse_coin_amount(data["sell"])
 
     fields, values = [], []
     for col, val in data.items():
@@ -1109,7 +1153,7 @@ async def update_user_settings(settings: UserSettings, user_id: str = Depends(ge
 @app.post("/api/portfolio/balance")
 async def update_starting_balance(request: Request, user_id: str = Depends(get_current_user), conn=Depends(get_db)):
     data = await request.json()
-    starting_balance = int(data.get("starting_balance", 0))
+    starting_balance = parse_coin_amount(data.get("starting_balance", 0))
     await conn.execute(
         "INSERT INTO portfolio (user_id, starting_balance) VALUES ($1, $2) "
         "ON CONFLICT (user_id) DO UPDATE SET starting_balance = $2",
@@ -1258,20 +1302,20 @@ async def import_trades(file: UploadFile = File(...), user_id: str = Depends(get
 
     for t in trades_to_import:
         try:
-            player = t.get("player", "").strip()
-            version = t.get("version", "").strip()
-            buy = int(t.get("buy", 0))
-            sell = int(t.get("sell", 0))
+            player = (t.get("player", "") or "").strip()
+            version = (t.get("version", "") or "").strip()
+            buy = parse_coin_amount(t.get("buy", 0))
+            sell = parse_coin_amount(t.get("sell", 0))
             quantity = int(t.get("quantity", 1))
-            platform = t.get("platform", "Console").strip()
-            tag = t.get("tag", "").strip()
+            platform = (t.get("platform", "Console") or "").strip()
+            tag = (t.get("tag", "") or "").strip()
 
             if not player or not version or buy <= 0 or sell <= 0:
                 errors.append(f"Invalid trade data: {t}")
                 continue
 
             profit = (sell - buy) * quantity
-            ea_tax = int(sell * quantity * 0.05)
+            ea_tax = int(round(sell * quantity * 0.05))
 
             await conn.execute(
                 """
@@ -1303,9 +1347,10 @@ async def import_trades(file: UploadFile = File(...), user_id: str = Depends(get
 async def delete_all_user_data(confirm: bool = False, user_id: str = Depends(get_current_user), conn=Depends(get_db)):
     if not confirm:
         raise HTTPException(status_code=400, detail="Confirmation required")
-    await conn.execute("DELETE FROM trades WHERE user_id=$1", user_id)
+    res = await conn.execute("DELETE FROM trades WHERE user_id=$1", user_id)
+    deleted = int(res.split()[-1]) if res.startswith("DELETE ") else 0
     await conn.execute("UPDATE portfolio SET starting_balance = 0 WHERE user_id=$1", user_id)
-    return {"message": "All data deleted successfully", "trades_deleted": 0}
+    return {"message": "All data deleted successfully", "trades_deleted": deleted}
 
 # ----------------- SEARCH PLAYERS -----------------
 @app.get("/api/search-players")
@@ -1392,7 +1437,6 @@ async def debug_session(req: Request):
     }
 
 # ----------------- TRENDING ROUTES (REPLACED) -----------------
-
 @app.get("/api/trending")
 async def api_trending(
     type: Literal["risers","fallers"],
