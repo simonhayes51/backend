@@ -176,7 +176,7 @@ async def _enrich_with_meta(items: list[dict]) -> list[dict]:
             "name": m.get("name") or f"Card {it['card_id']}",
             "rating": m.get("rating"),
             "version": m.get("version"),
-            "image": m.get("image_url"],
+            "image": m.get("image_url"),
             "club": m.get("club"),
             "league": m.get("league"),
             "percent": it["percent"],
