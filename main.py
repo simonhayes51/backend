@@ -176,7 +176,7 @@ async def _enrich_with_meta(items: list[dict]) -> list[dict]:
             "name": m.get("name") or f"Card {it['card_id']}",
             "rating": m.get("rating"),
             "version": m.get("version"),
-            "image": m.get("image_url"),
+            "image": m.get("image_url"],
             "club": m.get("club"),
             "league": m.get("league"),
             "percent": it["percent"],
@@ -324,12 +324,28 @@ async def lifespan(app: FastAPI):
                 completed_at TIMESTAMP
             )
         """)
+
+        # Ensure column + indexes exist
         await conn.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS trade_id BIGINT")
         await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS trades_user_trade_uidx ON trades (user_id, trade_id)")
         await conn.execute("DROP INDEX IF EXISTS idx_trades_date")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_user_ts ON trades(user_id, timestamp)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_tag ON trades(user_id, tag)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_platform ON trades(user_id, platform)")
+
+        # ✅ Backfill missing trade_id uniquely per user (one-time, safe)
+        await conn.execute("""
+            WITH to_fix AS (
+              SELECT ctid, user_id,
+                     ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY timestamp, player) AS rn
+              FROM trades
+              WHERE trade_id IS NULL
+            )
+            UPDATE trades t
+               SET trade_id = ((EXTRACT(EPOCH FROM NOW())*1000)::bigint) + tf.rn
+            FROM to_fix tf
+            WHERE t.ctid = tf.ctid AND t.trade_id IS NULL
+        """)
 
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS fut_trades (
@@ -643,7 +659,7 @@ async def fetch_dashboard_data(user_id: str, conn):
         user_id,
     )
     trades = await conn.fetch(
-        "SELECT player, version, buy, sell, quantity, platform, profit, ea_tax, tag, timestamp "
+        "SELECT player, version, buy, sell, quantity, platform, profit, ea_tax, tag, timestamp, trade_id "
         "FROM trades WHERE user_id=$1 ORDER BY timestamp DESC LIMIT 10",
         user_id,
     )
@@ -695,7 +711,7 @@ async def add_trade(request: Request, user_id: str = Depends(get_current_user), 
     except (ValueError, TypeError):
         raise HTTPException(status_code=400, detail="Invalid numeric values")
 
-    # ✅ sanitize trade_id to avoid 22P02 ('' -> NULL)
+    # ✅ trade_id: sanitize or generate
     trade_id = data.get("trade_id")
     if isinstance(trade_id, str):
         tid = trade_id.strip()
@@ -703,15 +719,27 @@ async def add_trade(request: Request, user_id: str = Depends(get_current_user), 
     elif not isinstance(trade_id, (int, type(None))):
         trade_id = None
 
+    if trade_id is None:
+        # generate snowflake-ish id + ensure uniqueness for this user
+        base = int(time.time() * 1000)
+        trade_id = base + secrets.randbelow(1000)
+        exists = await conn.fetchval(
+            "SELECT 1 FROM trades WHERE user_id=$1 AND trade_id=$2",
+            user_id, trade_id
+        )
+        if exists:
+            trade_id = base + secrets.randbelow(1000000)
+
     profit = (sell - buy) * quantity
     ea_tax = int(round(sell * quantity * 0.05))
 
-    await conn.execute(
+    row = await conn.fetchrow(
         """
         INSERT INTO trades (
             user_id, player, version, buy, sell, quantity, platform, profit, ea_tax, tag, notes, timestamp, trade_id
         )
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW(),$12)
+        RETURNING player, version, buy, sell, quantity, platform, profit, ea_tax, tag, notes, timestamp, trade_id
         """,
         user_id,
         (data["player"] or "").strip(),
@@ -726,7 +754,10 @@ async def add_trade(request: Request, user_id: str = Depends(get_current_user), 
         (data.get("notes", "") or "").strip(),
         trade_id,
     )
-    return {"message": "Trade added successfully!", "profit": profit, "ea_tax": ea_tax}
+    return {
+        "message": "Trade added successfully!",
+        "trade": dict(row)  # includes trade_id, timestamp, profit, ea_tax, etc.
+    }
 
 @app.get("/api/trades")
 async def get_all_trades(user_id: str = Depends(get_current_user), conn=Depends(get_db)):
