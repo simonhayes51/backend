@@ -38,7 +38,6 @@ if missing_vars:
     raise ValueError(f"Missing required environment variables: {missing_vars}")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-# DEFAULT PLAYER DB TO MAIN DB (so fut_players is visible)
 PLAYER_DATABASE_URL = os.getenv("PLAYER_DATABASE_URL", DATABASE_URL)
 WATCHLIST_DATABASE_URL = os.getenv("WATCHLIST_DATABASE_URL", DATABASE_URL)
 
@@ -46,11 +45,9 @@ DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID")
 DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
 DISCORD_REDIRECT_URI = os.getenv("DISCORD_REDIRECT_URI")
 SECRET_KEY = os.getenv("SECRET_KEY")
-# Normalize FRONTEND_URL to match browser Origin exactly (no trailing slash)
 FRONTEND_URL = (os.getenv("FRONTEND_URL", "https://frontendnew-production.up.railway.app").rstrip("/"))
 PORT = int(os.getenv("PORT", 8000))
 
-# Environment mode toggles cookie behaviour
 ENV = os.getenv("ENV", "production").lower()
 IS_PROD = ENV in ("prod", "production")
 
@@ -64,7 +61,7 @@ DISCORD_USERS_ME = "https://discord.com/api/users/@me"
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 DISCORD_SERVER_ID = os.getenv("DISCORD_SERVER_ID")
 
-# ephemeral state store (extension + dashboard)
+# ephemeral state store
 OAUTH_STATE: Dict[str, Dict[str, Any]] = {}
 
 if not SECRET_KEY:
@@ -73,7 +70,6 @@ if not SECRET_KEY:
 # --------- FUT.GG / Watchlist config ---------
 FUTGG_BASE = "https://www.fut.gg/api/fut/player-prices/25"
 PRICE_CACHE_TTL = 5  # seconds
-# {(card_id|platform): {"at": ts, "price": int|None, "isExtinct": bool, "updatedAt": str|None}}
 _price_cache: Dict[str, Dict[str, Any]] = {}
 
 # ----------------- FUT.GG MOMENTUM (NEW) -----------------
@@ -84,11 +80,9 @@ MOMENTUM_HEADERS = {
     "Accept-Language": "en-GB,en;q=0.9",
     "Referer": "https://www.fut.gg/",
 }
-# Hrefs look like: /players/4231-rivaldo/25-4231/
 _CARD_HREF_RE = re.compile(r"/players/(\d+)-[a-z0-9-]+/25-(\d+)/?", re.IGNORECASE)
 
 def _norm_tf(tf: Optional[str]) -> str:
-    """Accept '6'|'12'|'24' or '6h'|'12h'|'24h', default '24'."""
     if not tf:
         return "24"
     tf = tf.lower().strip()
@@ -123,24 +117,19 @@ def _parse_last_page_number(html: str) -> int:
     return max(nums) if nums else 1
 
 def _extract_items(html: str) -> list[dict]:
-    """
-    Return list of {card_id:int, percent:float} in page order.
-    We associate the percent text found inside/near the player tile anchor.
-    """
     soup = BeautifulSoup(html, "html.parser")
     tiles = []
     for a in soup.find_all("a", href=True):
         m = _CARD_HREF_RE.search(a["href"])
         if not m:
             continue
-        # climb up a few levels to find a container that includes the % text
         node = a
         for _ in range(4):
             if node is None or node.name == "body":
                 break
             txt = node.get_text(separator=" ", strip=True)
             if "%" in txt:
-                tiles.append((m.group(2), txt))  # second group is the item/card id
+                tiles.append((m.group(2), txt))
                 break
             node = node.parent
 
@@ -166,7 +155,6 @@ async def _momentum_page_items(tf: str, page: int) -> tuple[list[dict], str]:
     return _extract_items(html), html
 
 async def _enrich_with_meta(items: list[dict]) -> list[dict]:
-    """Join with fut_players and attach name/rating/version/image/club/league."""
     if not items:
         return []
     ids = [str(it["card_id"]) for it in items]
@@ -206,26 +194,14 @@ async def _attach_prices_ps(items: list[dict]) -> list[dict]:
 
 # ----------------- HELPERS -----------------
 def parse_coin_amount(v) -> int:
-    """
-    Accepts strings/numbers like: 1000, "1,000", "1.000", "1 000", "1.2k", "1,2k", "1m", "1kk"
-    Returns integer coins (rounded).
-    """
     if v is None:
         return 0
     if isinstance(v, (int, float)):
         return int(round(float(v)))
     s = str(v).strip().lower()
-
-    # remove spaces/underscores
     s = re.sub(r"[\s_]", "", s)
-
-    # drop thousand separators followed by exactly 3 digits
     s = re.sub(r"(?<=\d)[,\.](?=\d{3}\b)", "", s)
-
-    # normalize decimal comma to dot
     s = s.replace(",", ".")
-
-    # suffixes
     if s.endswith("kk"):
         try: return int(round(float(s[:-2]) * 1_000_000))
         except: return 0
@@ -235,7 +211,6 @@ def parse_coin_amount(v) -> int:
     if s.endswith("m"):
         try: return int(round(float(s[:-1]) * 1_000_000))
         except: return 0
-
     try:
         return int(round(float(s)))
     except:
@@ -245,12 +220,12 @@ def parse_coin_amount(v) -> int:
 class UserSettings(BaseModel):
     default_platform: Optional[str] = "Console"
     custom_tags: Optional[List[str]] = []
-    currency_format: Optional[str] = "coins"  # coins, k, m
+    currency_format: Optional[str] = "coins"
     theme: Optional[str] = "dark"
     timezone: Optional[str] = "UTC"
-    date_format: Optional[str] = "US"  # US or EU or ISO
+    date_format: Optional[str] = "US"
     include_tax_in_profit: Optional[bool] = True
-    default_chart_range: Optional[str] = "30d"  # 7d, 30d, 90d, all
+    default_chart_range: Optional[str] = "30d"
     visible_widgets: Optional[List[str]] = ["profit", "tax", "balance", "trades"]
 
 class TradingGoal(BaseModel):
@@ -272,12 +247,12 @@ class TradeUpdate(BaseModel):
     player: Optional[str] = None
     version: Optional[str] = None
     quantity: Optional[int] = None
-    buy: Optional[Any] = None   # accept formatted strings too
+    buy: Optional[Any] = None
     sell: Optional[Any] = None
     platform: Optional[str] = None
     tag: Optional[str] = None
     notes: Optional[str] = None
-    timestamp: Optional[str] = None  # ISO8601 string
+    timestamp: Optional[str] = None
 
 class WatchlistCreate(BaseModel):
     card_id: int
@@ -287,9 +262,9 @@ class WatchlistCreate(BaseModel):
     notes: Optional[str] = None
 
 # ----------------- POOLS & LIFESPAN -----------------
-pool = None               # main app DB
-player_pool = None        # static players DB
-watchlist_pool = None     # watchlist DB
+pool = None
+player_pool = None
+watchlist_pool = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -307,7 +282,6 @@ async def lifespan(app: FastAPI):
     else:
         watchlist_pool = await asyncpg.create_pool(WATCHLIST_DATABASE_URL, min_size=1, max_size=10)
 
-    # Create tables / indexes (main app)
     async with pool.acquire() as conn:
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS usersettings (
@@ -350,8 +324,6 @@ async def lifespan(app: FastAPI):
                 completed_at TIMESTAMP
             )
         """)
-
-        # trades indexes/cols used across the app
         await conn.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS trade_id BIGINT")
         await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS trades_user_trade_uidx ON trades (user_id, trade_id)")
         await conn.execute("DROP INDEX IF EXISTS idx_trades_date")
@@ -359,7 +331,6 @@ async def lifespan(app: FastAPI):
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_tag ON trades(user_id, tag)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_platform ON trades(user_id, platform)")
 
-        # extension ingestion table
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS fut_trades (
               id           BIGSERIAL PRIMARY KEY,
@@ -375,7 +346,6 @@ async def lifespan(app: FastAPI):
         """)
         await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS fut_trades_uidx ON fut_trades (discord_id, trade_id)")
 
-    # Create tables / indexes (watchlist DB)
     async with watchlist_pool.acquire() as wconn:
         await wconn.execute("""
             CREATE TABLE IF NOT EXISTS watchlist (
@@ -384,7 +354,7 @@ async def lifespan(app: FastAPI):
               card_id BIGINT NOT NULL,
               player_name TEXT NOT NULL,
               version TEXT,
-              platform TEXT NOT NULL,         -- 'ps' | 'xbox'
+              platform TEXT NOT NULL,
               started_price INTEGER NOT NULL,
               started_at TIMESTAMP NOT NULL DEFAULT NOW(),
               last_price INTEGER,
@@ -412,7 +382,7 @@ app = FastAPI(lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        FRONTEND_URL,              # exact origin, no trailing slash
+        FRONTEND_URL,
         "http://localhost:5173",
         "http://localhost:3000",
     ],
@@ -424,7 +394,6 @@ app.add_middleware(
     max_age=600,
 )
 
-# Env-aware cookie flags: secure in prod, lax for localhost dev
 app.add_middleware(
     SessionMiddleware,
     secret_key=SECRET_KEY,
@@ -483,17 +452,12 @@ def require_extension_jwt(request: Request):
         raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
     return SimpleNamespace(discord_id=payload.get("sub"))
 
-# --------- FUT.GG price fetch (watchlist helper) ---------
+# --------- FUT.GG price fetch ---------
 async def fetch_price(card_id: int, platform: str) -> Dict[str, Any]:
-    """
-    platform: 'ps' or 'xbox'
-    Returns: {"price": int|None, "isExtinct": bool, "updatedAt": str|None}
-    """
     platform = (platform or "").lower()
     key = f"{card_id}|{platform}"
     now = time.time()
 
-    # short TTL cache
     if key in _price_cache and (now - _price_cache[key]["at"] < PRICE_CACHE_TTL):
         c = _price_cache[key]
         return {"price": c["price"], "isExtinct": c["isExtinct"], "updatedAt": c["updatedAt"]}
@@ -542,7 +506,6 @@ async def health_check():
 @app.get("/api/login")
 async def login():
     state = secrets.token_urlsafe(24)
-    # store dashboard flow state (optional CSRF)
     OAUTH_STATE[state] = {"flow": "dashboard", "ts": time.time()}
     params = {
         "client_id": DISCORD_CLIENT_ID,
@@ -556,9 +519,6 @@ async def login():
 
 @app.get("/api/price-history")
 async def price_history(playerId: int, platform: str = "ps", tf: str = "today"):
-    """
-    Returns: { "points": [ { "t": ISO_8601_UTC, "price": int }, ... ] }
-    """
     if playerId <= 0:
         raise HTTPException(status_code=400, detail="playerId must be a positive integer")
     try:
@@ -599,18 +559,15 @@ async def callback(request: Request):
 
         user_id = user_data["id"]
 
-        # Extension flow (Chrome identity API)
         if state and state in OAUTH_STATE and OAUTH_STATE.get(state, {}).get("flow") != "dashboard":
             meta = OAUTH_STATE.pop(state)
             jwt_token = issue_extension_token(user_id)
             ext_redirect = meta["ext_redirect"]
             return RedirectResponse(f"{ext_redirect}#token={jwt_token}&state={state}")
 
-        # For dashboard CSRF, just pop (optional)
         if state and state in OAUTH_STATE:
             OAUTH_STATE.pop(state, None)
 
-        # Site login flow: membership check (optional gate)
         is_member = await check_server_membership(user_id)
         if not is_member:
             return RedirectResponse(f"{FRONTEND_URL}/access-denied")
@@ -623,13 +580,11 @@ async def callback(request: Request):
         )
         global_name = user_data.get('global_name') or user_data['username']
 
-        # Set server-side session (httpOnly cookie)
         request.session["user_id"] = user_id
         request.session["username"] = username
         request.session["avatar_url"] = avatar_url
         request.session["global_name"] = global_name
 
-        # Ensure profile/portfolio exists
         async with pool.acquire() as conn:
             await conn.execute(
                 "INSERT INTO portfolio (user_id, starting_balance) VALUES ($1, $2) "
@@ -646,7 +601,6 @@ async def callback(request: Request):
                 user_id, username, avatar_url, global_name,
             )
 
-        # IMPORTANT: redirect to a route where the frontend will call /api/me and then write localStorage.user_id
         return RedirectResponse(f"{FRONTEND_URL}/auth/done")
     except HTTPException:
         raise
@@ -682,7 +636,6 @@ async def oauth_start(redirect_uri: str):
     return RedirectResponse(f"{DISCORD_OAUTH_AUTHORIZE}?{urlencode(params)}")
 
 # ----------------- BUSINESS ROUTES -----------------
-# Dashboard helper
 async def fetch_dashboard_data(user_id: str, conn):
     portfolio = await conn.fetchrow("SELECT starting_balance FROM portfolio WHERE user_id=$1", user_id)
     stats = await conn.fetchrow(
@@ -742,6 +695,14 @@ async def add_trade(request: Request, user_id: str = Depends(get_current_user), 
     except (ValueError, TypeError):
         raise HTTPException(status_code=400, detail="Invalid numeric values")
 
+    # ✅ sanitize trade_id to avoid 22P02 ('' -> NULL)
+    trade_id = data.get("trade_id")
+    if isinstance(trade_id, str):
+        tid = trade_id.strip()
+        trade_id = int(tid) if tid.isdigit() else None
+    elif not isinstance(trade_id, (int, type(None))):
+        trade_id = None
+
     profit = (sell - buy) * quantity
     ea_tax = int(round(sell * quantity * 0.05))
 
@@ -753,17 +714,17 @@ async def add_trade(request: Request, user_id: str = Depends(get_current_user), 
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW(),$12)
         """,
         user_id,
-        data["player"],
-        data["version"],
+        (data["player"] or "").strip(),
+        (data["version"] or "").strip(),
         buy,
         sell,
         quantity,
-        data["platform"],
+        (data["platform"] or "").strip(),
         profit,
         ea_tax,
-        data["tag"],
-        data.get("notes", ""),
-        data.get("trade_id"),
+        (data["tag"] or "").strip(),
+        (data.get("notes", "") or "").strip(),
+        trade_id,
     )
     return {"message": "Trade added successfully!", "profit": profit, "ea_tax": ea_tax}
 
@@ -772,11 +733,10 @@ async def get_all_trades(user_id: str = Depends(get_current_user), conn=Depends(
     rows = await conn.fetch("SELECT * FROM trades WHERE user_id=$1 ORDER BY timestamp DESC", user_id)
     return {"trades": [dict(r) for r in rows]}
 
-# --- UPDATE by trade_id (EA id) ---
 @app.put("/api/trades/{trade_id}")
 async def update_trade(
     trade_id: int,
-    payload: TradeUpdate,
+    payload: 'TradeUpdate',
     user_id: str = Depends(get_current_user),
     conn=Depends(get_db),
 ):
@@ -784,7 +744,6 @@ async def update_trade(
     if not data:
         raise HTTPException(status_code=400, detail="No fields to update")
 
-    # Ensure buy/sell parse if they came in formatted
     if "buy" in data:
         data["buy"] = parse_coin_amount(data["buy"])
     if "sell" in data:
@@ -826,7 +785,6 @@ async def update_trade(
     )
     return dict(row2)
 
-# --- DELETE by trade_id ---
 @app.delete("/api/trades/{trade_id}")
 async def delete_trade(trade_id: int, user_id: str = Depends(get_current_user), conn=Depends(get_db)):
     result = await conn.execute("DELETE FROM trades WHERE trade_id=$1 AND user_id=$2", trade_id, user_id)
@@ -834,7 +792,6 @@ async def delete_trade(trade_id: int, user_id: str = Depends(get_current_user), 
         raise HTTPException(status_code=404, detail="Trade not found")
     return {"message": "Trade deleted successfully"}
 
-# FUT.GG proxies
 @app.get("/api/fut-player-definition/{card_id}")
 async def get_player_definition(card_id: str):
     try:
@@ -1058,10 +1015,6 @@ async def refresh_watch_item(watch_id: int, user_id: str = Depends(get_current_u
 # ----------------- ME / SETTINGS / PORTFOLIO -----------------
 @app.get("/api/me")
 async def get_current_user_info(request: Request):
-    """
-    Always 200. If not logged in, return authenticated=False (no 401),
-    to avoid frontend re-login loops.
-    """
     uid = request.session.get("user_id")
     if not uid:
         return {"authenticated": False}
@@ -1229,7 +1182,7 @@ async def get_advanced_analytics(user_id: str = Depends(get_current_user), conn=
         "monthly_summary": [dict(r) for r in monthly_summary],
     }
 
-# ----------------- BULK EDIT / EXPORT / IMPORT / NUKE -----------------
+# ----------------- BULK / EXPORT / IMPORT / NUKE -----------------
 @app.put("/api/trades/bulk")
 async def bulk_edit_trades(request: Request, user_id: str = Depends(get_current_user), conn=Depends(get_db)):
     data = await request.json()
@@ -1436,30 +1389,24 @@ async def debug_session(req: Request):
         "all_session_keys": list(req.session.keys()),
     }
 
-# ----------------- TRENDING ROUTES (REPLACED) -----------------
+# ----------------- TRENDING -----------------
 @app.get("/api/trending")
 async def api_trending(
     type: Literal["risers","fallers"],
-    tf: Optional[str] = "24",  # accepts '6','12','24' or '6h','12h','24h'
+    tf: Optional[str] = "24",
 ):
-    """
-    FUT.GG Momentum-based trending with 6h/12h/24h filters.
-    - Fallers: page 1, first 10 (lowest %)
-    - Risers : last page, top 10 (highest %)
-    """
     kind = (type or "fallers").lower()
     tf_norm = _norm_tf(tf)
 
     if kind == "fallers":
         items, _ = await _momentum_page_items(tf_norm, 1)
-        items.sort(key=lambda x: x["percent"])  # most negative first
+        items.sort(key=lambda x: x["percent"])
         pick = items[:10]
     elif kind == "risers":
-        # find last page from page 1's pagination
         _, html = await _momentum_page_items(tf_norm, 1)
         last = _parse_last_page_number(html)
         items, _ = await _momentum_page_items(tf_norm, last)
-        items.sort(key=lambda x: x["percent"], reverse=True)  # most positive first
+        items.sort(key=lambda x: x["percent"], reverse=True)
         pick = items[:10]
     else:
         raise HTTPException(status_code=400, detail="type must be 'risers' or 'fallers'")
