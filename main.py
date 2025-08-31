@@ -47,7 +47,7 @@ DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
 DISCORD_REDIRECT_URI = os.getenv("DISCORD_REDIRECT_URI")
 SECRET_KEY = os.getenv("SECRET_KEY")
 # Normalize FRONTEND_URL to match browser Origin exactly (no trailing slash)
-FRONTEND_URL = (os.getenv("FRONTEND_URL", "https://frontendnew-production.up.railway.app/").rstrip("/"))
+FRONTEND_URL = (os.getenv("FRONTEND_URL", "https://frontendnew-production.up.railway.app").rstrip("/"))
 PORT = int(os.getenv("PORT", 8000))
 
 # Environment mode toggles cookie behaviour
