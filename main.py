@@ -23,9 +23,11 @@ from fastapi.responses import RedirectResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 from dotenv import load_dotenv
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pydantic import BaseModel
-from typing import List, Optional, Dict, Any, Literal
+from typing import List, Optional, Dict, Any, Literal, Tuple
+from datetime import datetime, timedelta, timezone, time as dt_time
+from zoneinfo import ZoneInfo
 
 # ----------------- BOOTSTRAP -----------------
 logging.basicConfig(level=logging.INFO)
@@ -60,6 +62,10 @@ DISCORD_OAUTH_TOKEN = "https://discord.com/api/oauth2/token"
 DISCORD_USERS_ME = "https://discord.com/api/users/@me"
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 DISCORD_SERVER_ID = os.getenv("DISCORD_SERVER_ID")
+
+# Watchlist alert env
+WATCHLIST_FALLBACK_CHANNEL_ID = os.getenv("WATCHLIST_FALLBACK_CHANNEL_ID")
+WATCHLIST_POLL_INTERVAL = int(os.getenv("WATCHLIST_POLL_INTERVAL", "60"))  # seconds
 
 # ephemeral state store
 OAUTH_STATE: Dict[str, Dict[str, Any]] = {}
@@ -216,6 +222,27 @@ def parse_coin_amount(v) -> int:
     except:
         return 0
 
+# Time helpers
+LONDON = ZoneInfo("Europe/London")
+UTC = timezone.utc
+def now_utc() -> datetime:
+    return datetime.now(UTC)
+def london_now() -> datetime:
+    return datetime.now(LONDON)
+def next_daily_london_hour(hour: int = 18) -> datetime:
+    ln = london_now()
+    tgt = ln.replace(hour=hour, minute=0, second=0, microsecond=0)
+    if tgt <= ln:
+        tgt = tgt + timedelta(days=1)
+    return tgt.astimezone(UTC)
+def is_within_quiet_hours(dt: datetime, quiet_start: Optional[dt_time], quiet_end: Optional[dt_time]) -> bool:
+    if not quiet_start or not quiet_end:
+        return False
+    t = dt.astimezone(LONDON).time()
+    if quiet_start <= quiet_end:
+        return quiet_start <= t < quiet_end
+    return t >= quiet_start or t < quiet_end
+
 # ----------------- MODELS -----------------
 class UserSettings(BaseModel):
     default_platform: Optional[str] = "Console"
@@ -261,14 +288,29 @@ class WatchlistCreate(BaseModel):
     platform: str  # "ps" | "xbox"
     notes: Optional[str] = None
 
+# Alerts config
+class WatchlistAlertCreate(BaseModel):
+    card_id: int
+    platform: str  # ps|xbox|pc
+    rise_pct: Optional[float] = 5
+    fall_pct: Optional[float] = 5
+    ref_mode: Optional[str] = "last_close"  # last_close | fixed | started_price
+    ref_price: Optional[float] = None
+    cooloff_minutes: Optional[int] = 30
+    quiet_start: Optional[str] = None  # "22:00"
+    quiet_end: Optional[str] = None    # "07:00"
+    prefer_dm: Optional[bool] = True
+    fallback_channel_id: Optional[str] = None
+
 # ----------------- POOLS & LIFESPAN -----------------
 pool = None
 player_pool = None
 watchlist_pool = None
+_watchlist_task: Optional[asyncio.Task] = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global pool, player_pool, watchlist_pool
+    global pool, player_pool, watchlist_pool, _watchlist_task
 
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
 
@@ -282,6 +324,7 @@ async def lifespan(app: FastAPI):
     else:
         watchlist_pool = await asyncpg.create_pool(WATCHLIST_DATABASE_URL, min_size=1, max_size=10)
 
+    # Core tables + indexes
     async with pool.acquire() as conn:
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS usersettings (
@@ -324,16 +367,13 @@ async def lifespan(app: FastAPI):
                 completed_at TIMESTAMP
             )
         """)
-
-        # Ensure column + indexes exist
         await conn.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS trade_id BIGINT")
         await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS trades_user_trade_uidx ON trades (user_id, trade_id)")
         await conn.execute("DROP INDEX IF EXISTS idx_trades_date")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_user_ts ON trades(user_id, timestamp)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_tag ON trades(user_id, tag)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_platform ON trades(user_id, platform)")
-
-        # ✅ Backfill missing trade_id uniquely per user (one-time, safe)
+        # Backfill trade_id
         await conn.execute("""
             WITH to_fix AS (
               SELECT ctid, user_id,
@@ -346,7 +386,6 @@ async def lifespan(app: FastAPI):
             FROM to_fix tf
             WHERE t.ctid = tf.ctid AND t.trade_id IS NULL
         """)
-
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS fut_trades (
               id           BIGSERIAL PRIMARY KEY,
@@ -362,6 +401,22 @@ async def lifespan(app: FastAPI):
         """)
         await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS fut_trades_uidx ON fut_trades (discord_id, trade_id)")
 
+        # Events table (for Next Promo)
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS events (
+          id BIGSERIAL PRIMARY KEY,
+          name TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          start_at TIMESTAMPTZ NOT NULL,
+          end_at TIMESTAMPTZ,
+          confidence TEXT NOT NULL DEFAULT 'heuristic',
+          source TEXT NOT NULL DEFAULT 'rule:18:00',
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )""")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_events_start ON events(start_at)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind)")
+
+    # Existing watchlist table on watchlist_pool
     async with watchlist_pool.acquire() as wconn:
         await wconn.execute("""
             CREATE TABLE IF NOT EXISTS watchlist (
@@ -384,9 +439,56 @@ async def lifespan(app: FastAPI):
             ON watchlist(user_id, card_id, platform)
         """)
 
+        # Alerts config + log
+        await wconn.execute("""
+        CREATE TABLE IF NOT EXISTS watchlist_alerts (
+          id BIGSERIAL PRIMARY KEY,
+          user_id TEXT NOT NULL,
+          user_discord_id TEXT,
+          card_id BIGINT NOT NULL,
+          platform TEXT NOT NULL CHECK (platform IN ('ps','xbox','pc')),
+          ref_mode TEXT NOT NULL DEFAULT 'last_close', -- last_close | fixed | started_price
+          ref_price NUMERIC,
+          rise_pct NUMERIC DEFAULT 5,
+          fall_pct NUMERIC DEFAULT 5,
+          cooloff_minutes INT NOT NULL DEFAULT 30,
+          quiet_start TIME,
+          quiet_end TIME,
+          prefer_dm BOOLEAN NOT NULL DEFAULT TRUE,
+          fallback_channel_id TEXT,
+          last_alert_at TIMESTAMPTZ,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )""")
+        await wconn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_user ON watchlist_alerts(user_id)")
+        await wconn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_pair ON watchlist_alerts(card_id, platform)")
+
+        await wconn.execute("""
+        CREATE TABLE IF NOT EXISTS alerts_log (
+          id BIGSERIAL PRIMARY KEY,
+          user_id TEXT NOT NULL,
+          user_discord_id TEXT,
+          card_id BIGINT NOT NULL,
+          platform TEXT NOT NULL,
+          direction TEXT NOT NULL,
+          pct NUMERIC NOT NULL,
+          price NUMERIC NOT NULL,
+          ref_mode TEXT NOT NULL,
+          ref_price NUMERIC,
+          sent_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )""")
+        await wconn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_user_time ON alerts_log(user_id, sent_at)")
+
+    # Start alerts loop
+    _watchlist_task = asyncio.create_task(_alerts_poll_loop())
+    logging.info("✅ Watchlist alerts loop started (%ss)", WATCHLIST_POLL_INTERVAL)
+
     try:
         yield
     finally:
+        if _watchlist_task:
+            _watchlist_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await _watchlist_task
         to_close = {pool, player_pool, watchlist_pool}
         for p in to_close:
             if p is not None:
@@ -865,7 +967,7 @@ async def get_player_price_proxy(card_id: str):
         logging.error(f"Player price fetch error: {e}")
         return {"error": str(e)}
 
-# ----------------- WATCHLIST ROUTES -----------------
+# ----------------- WATCHLIST ROUTES (simple list used by UI) -----------------
 @app.post("/api/watchlist")
 async def add_watch_item(payload: WatchlistCreate, user_id: str = Depends(get_current_user)):
     try:
@@ -1042,6 +1144,195 @@ async def refresh_watch_item(watch_id: int, user_id: str = Depends(get_current_u
     except Exception as e:
         print(f"Watchlist REFRESH error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+# ----------------- WATCHLIST ALERTS (new) -----------------
+async def _send_discord_dm(user_discord_id: str, content: str) -> bool:
+    if not DISCORD_BOT_TOKEN or not user_discord_id:
+        return False
+    try:
+        async with aiohttp.ClientSession(headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}", "Content-Type":"application/json"}) as sess:
+            # Create or get DM channel
+            async with sess.post("https://discord.com/api/v10/users/@me/channels", json={"recipient_id": user_discord_id}) as r:
+                if r.status not in (200, 201):
+                    return False
+                ch = await r.json()
+                ch_id = ch.get("id")
+            async with sess.post(f"https://discord.com/api/v10/channels/{ch_id}/messages", json={"content": content}) as r2:
+                return r2.status in (200, 201)
+    except Exception as e:
+        logging.warning("DM send failed: %s", e)
+        return False
+
+async def _send_channel_fallback(channel_id: Optional[str], content: str) -> bool:
+    if not DISCORD_BOT_TOKEN:
+        return False
+    ch_id = channel_id or WATCHLIST_FALLBACK_CHANNEL_ID
+    if not ch_id:
+        return False
+    try:
+        async with aiohttp.ClientSession(headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}", "Content-Type":"application/json"}) as sess:
+            async with sess.post(f"https://discord.com/api/v10/channels/{ch_id}/messages", json={"content": content}) as r:
+                return r.status in (200, 201)
+    except Exception as e:
+        logging.warning("Channel send failed: %s", e)
+        return False
+
+def _fmt_alert(name: str, platform: str, direction: str, pct: float, price: float, ref_mode: str, ref_price: Optional[float]) -> str:
+    arrow = "📈" if direction == "rise" else "📉"
+    rp = f"{int(ref_price):,}c" if isinstance(ref_price, (int, float)) else "—"
+    return (f"{arrow} Watchlist Alert • {name} ({platform.upper()})\n"
+            f"Current: {int(price):,}c • Change: {pct:+.2f}%\n"
+            f"Ref: {rp} ({ref_mode})")
+
+async def _ref_price_for_alert(row: asyncpg.Record) -> Optional[float]:
+    mode = row["ref_mode"]
+    if mode == "fixed" and row["ref_price"]:
+        return float(row["ref_price"])
+    # started_price: look up user's watchlist baseline
+    if mode == "started_price":
+        async with watchlist_pool.acquire() as w:
+            r = await w.fetchrow(
+                "SELECT started_price FROM watchlist WHERE user_id=$1 AND card_id=$2 AND platform=$3",
+                row["user_id"], row["card_id"], row["platform"]
+            )
+        return float(r["started_price"]) if r and r["started_price"] else None
+    # last_close: use latest history point
+    try:
+        hist = await get_price_history(int(row["card_id"]), row["platform"], "today")
+        if hist:
+            p = hist[-1]
+            v = p.get("price") or p.get("v") or p.get("y")
+            return float(v) if v else None
+    except Exception:
+        return None
+    return None
+
+async def _resolve_player_name(card_id: int) -> str:
+    try:
+        async with player_pool.acquire() as p:
+            r = await p.fetchrow("SELECT name FROM fut_players WHERE card_id=$1::text", str(card_id))
+        return r["name"] if r and r["name"] else f"Card {card_id}"
+    except Exception:
+        return f"Card {card_id}"
+
+async def _eval_alerts_for_pair(card_id: int, platform: str, price_now: float) -> int:
+    sent = 0
+    now = now_utc()
+    async with watchlist_pool.acquire() as w:
+        rows = await w.fetch("SELECT * FROM watchlist_alerts WHERE card_id=$1 AND platform=$2", card_id, platform)
+    if not rows:
+        return 0
+    name = await _resolve_player_name(card_id)
+    for row in rows:
+        try:
+            if row["quiet_start"] or row["quiet_end"]:
+                if is_within_quiet_hours(now, row["quiet_start"], row["quiet_end"]):
+                    continue
+            last = row["last_alert_at"]
+            if last and (now - last).total_seconds() < (row["cooloff_minutes"] * 60):
+                continue
+            refp = await _ref_price_for_alert(row)
+            if not refp:
+                continue
+            pct = 100.0 * (price_now - refp) / refp
+            direction = None
+            if pct >= float(row["rise_pct"] or 0):
+                direction = "rise"
+            elif pct <= -float(row["fall_pct"] or 0):
+                direction = "fall"
+            if not direction:
+                continue
+
+            content = _fmt_alert(name, platform, direction, pct, price_now, row["ref_mode"], refp)
+            ok = False
+            if row["prefer_dm"] and row["user_discord_id"]:
+                ok = await _send_discord_dm(row["user_discord_id"], content)
+            if not ok:
+                await _send_channel_fallback(row["fallback_channel_id"], content)
+
+            async with watchlist_pool.acquire() as w:
+                await w.execute(
+                    "INSERT INTO alerts_log (user_id, user_discord_id, card_id, platform, direction, pct, price, ref_mode, ref_price) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+                    row["user_id"], row["user_discord_id"], card_id, platform, direction, pct, price_now, row["ref_mode"], refp
+                )
+                await w.execute("UPDATE watchlist_alerts SET last_alert_at=$1 WHERE id=$2", now, row["id"])
+            sent += 1
+        except Exception as e:
+            logging.warning("alert eval error: %s", e)
+    return sent
+
+async def _alerts_poll_loop():
+    await asyncio.sleep(3)
+    while True:
+        try:
+            # distinct pairs
+            async with watchlist_pool.acquire() as w:
+                pairs = await w.fetch("SELECT DISTINCT card_id, platform FROM watchlist_alerts")
+            tasks = []
+            for rec in pairs:
+                cid = int(rec["card_id"]); plat = rec["platform"]
+                tasks.append(_poll_pair_once(cid, plat))
+            if tasks:
+                await asyncio.gather(*tasks)
+        except Exception as e:
+            logging.warning("poll loop error: %s", e)
+        await asyncio.sleep(WATCHLIST_POLL_INTERVAL)
+
+async def _poll_pair_once(card_id: int, platform: str):
+    try:
+        live = await fetch_price(card_id, platform)
+        price = live.get("price")
+        if not isinstance(price, (int, float)):
+            return
+        n = await _eval_alerts_for_pair(card_id, platform, float(price))
+        if n:
+            logging.info("sent %s alerts for %s/%s", n, card_id, platform)
+    except Exception as e:
+        logging.debug("poll pair error: %s", e)
+
+# CRUD for alerts
+@app.get("/api/watchlist-alerts")
+async def list_watchlist_alerts(user_id: str = Depends(get_current_user)):
+    async with watchlist_pool.acquire() as w:
+        rows = await w.fetch("SELECT * FROM watchlist_alerts WHERE user_id=$1 ORDER BY created_at DESC", user_id)
+    return {"items": [dict(r) for r in rows]}
+
+@app.post("/api/watchlist-alerts")
+async def create_watchlist_alert(payload: WatchlistAlertCreate, user_id: str = Depends(get_current_user)):
+    qs = None; qe = None
+    if payload.quiet_start:
+        try: qs = datetime.strptime(payload.quiet_start, "%H:%M").time()
+        except: qs = None
+    if payload.quiet_end:
+        try: qe = datetime.strptime(payload.quiet_end, "%H:%M").time()
+        except: qe = None
+    async with watchlist_pool.acquire() as w:
+        await w.execute("""
+            INSERT INTO watchlist_alerts (user_id, user_discord_id, card_id, platform, ref_mode, ref_price, rise_pct, fall_pct, cooloff_minutes, quiet_start, quiet_end, prefer_dm, fallback_channel_id)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+        """, user_id, user_id, int(payload.card_id), payload.platform.lower(),
+           payload.ref_mode or "last_close", payload.ref_price, payload.rise_pct or 5, payload.fall_pct or 5,
+           payload.cooloff_minutes or 30, qs, qe, bool(payload.prefer_dm), payload.fallback_channel_id)
+    return {"ok": True}
+
+@app.delete("/api/watchlist-alerts/{alert_id}")
+async def delete_watchlist_alert(alert_id: int, user_id: str = Depends(get_current_user)):
+    async with watchlist_pool.acquire() as w:
+        res = await w.execute("DELETE FROM watchlist_alerts WHERE id=$1 AND user_id=$2", alert_id, user_id)
+    if res == "DELETE 0":
+        raise HTTPException(404, "Alert not found")
+    return {"ok": True}
+
+@app.post("/api/watchlist-alerts/test")
+async def test_alert_endpoint(card_id: int, platform: str = "ps", price: Optional[int] = None, user_id: str = Depends(get_current_user)):
+    # trigger eval once with forced price or live
+    if price is None:
+        live = await fetch_price(card_id, platform)
+        price = live.get("price")
+    if not isinstance(price, (int, float)):
+        raise HTTPException(400, "No price available")
+    n = await _eval_alerts_for_pair(card_id, platform, float(price))
+    return {"sent": n}
 
 # ----------------- ME / SETTINGS / PORTFOLIO -----------------
 @app.get("/api/me")
@@ -1447,7 +1738,6 @@ async def api_trending(
     return {"type": kind, "timeframe": f"{tf_norm}h", "items": enriched}
 
 # ----------------- COMPARE: side-by-side player data -----------------
-
 def _cmp_now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -1476,7 +1766,6 @@ def _cmp_low_high(points: List[Dict[str, Any]]) -> Dict[str, Optional[int]]:
     return {"low": min(vals) if vals else None, "high": max(vals) if vals else None}
 
 def _cmp_platform(p: str) -> str:
-    # normalise to your services' expected tokens
     p = (p or "").lower()
     if p in ("ps", "playstation", "console"):
         return "ps"
@@ -1487,10 +1776,6 @@ def _cmp_platform(p: str) -> str:
     return "ps"
 
 async def _cmp_price_range_via_futgg(card_id: str) -> Dict[str, Optional[int]]:
-    """
-    Ask FUT.GG item definitions API for range min/max.
-    Falls back to None/None if not present.
-    """
     url = f"https://www.fut.gg/api/fut/player-item-definitions/25/{card_id}/"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
@@ -1509,7 +1794,6 @@ async def _cmp_price_range_via_futgg(card_id: str) -> Dict[str, Optional[int]]:
         pr = data.get("priceRange") or {}
         mn = pr.get("min")
         mx = pr.get("max")
-        # Sometimes nested; be defensive
         if (mn is None or mx is None) and "ranges" in data:
             rng = (data["ranges"] or {}).get("priceRange") or {}
             mn = mn if mn is not None else rng.get("min")
@@ -1520,10 +1804,6 @@ async def _cmp_price_range_via_futgg(card_id: str) -> Dict[str, Optional[int]]:
         return {"min": None, "max": None}
 
 async def _cmp_recent_sales_futbin(card_id: str, platform: str) -> List[Dict[str, Any]]:
-    """
-    FUTBIN 'sales' page lists latest listed/sold prices; useful as a liquidity proxy.
-    Example: https://www.futbin.com/25/sales/{card_id}?platform=ps|xbox|pc
-    """
     plat = platform if platform in ("ps", "xbox", "pc") else "ps"
     url = f"https://www.futbin.com/25/sales/{card_id}?platform={plat}"
     out: List[Dict[str, Any]] = []
@@ -1538,7 +1818,6 @@ async def _cmp_recent_sales_futbin(card_id: str, platform: str) -> List[Dict[str
                 if r.status != 200:
                     return out
                 html = await r.text()
-        # Most pages embed: var table_data = [ {price:12345, time:"2025-08-31 20:01"}, ... ];
         m = re.search(r"var\s+table_data\s*=\s*(\[\s*{.*?}\s*\]);", html, re.S)
         if not m:
             return out
@@ -1559,13 +1838,11 @@ async def player_compare(
     include_pc: bool = Query(True, description="Also return PC current price"),
     include_sales: bool = Query(True, description="Include recent sales list"),
 ):
-    # Parse and clamp
     raw_ids = [x.strip() for x in ids.split(",") if x.strip()]
     if not raw_ids or len(raw_ids) > 2:
         raise HTTPException(status_code=400, detail="Provide 1 or 2 ids")
     plat = _cmp_platform(platform)
 
-    # Metadata from fut_players (note: card_id is TEXT in your DB)
     async with player_pool.acquire() as pconn:
         meta_rows = await pconn.fetch(
             """
@@ -1580,34 +1857,27 @@ async def player_compare(
     players_out: List[Dict[str, Any]] = []
     for cid_str in raw_ids:
         m = meta.get(cid_str, {})
-        # get_price_* helpers expect numeric id; be defensive
         try:
             cid_int = int(cid_str)
         except Exception:
             cid_int = None
 
-        # current prices
         console_price = await get_player_price(cid_int, plat) if cid_int is not None else None
         pc_price = await get_player_price(cid_int, "pc") if (cid_int is not None and include_pc) else None
 
-        # histories (short=24h, long=7d if supported by your service)
         hist_short = await get_price_history(cid_int, plat, "today") if cid_int is not None else []
         try:
             hist_long = await get_price_history(cid_int, plat, "week") if cid_int is not None else []
         except Exception:
-            hist_long = hist_short  # safe fallback if 'week' pill not supported
+            hist_long = hist_short
 
-        # trends & low/high from 24h window
         w4 = _cmp_window(hist_short, 4)
         w24 = _cmp_window(hist_short, 24)
         chg4 = _cmp_chg_pct(w4)
         chg24 = _cmp_chg_pct(w24)
         lohi = _cmp_low_high(w24)
 
-        # price range (via FUT.GG item definitions)
         pr = await _cmp_price_range_via_futgg(cid_str)
-
-        # recent sales
         sales = await _cmp_recent_sales_futbin(cid_str, plat) if include_sales else []
 
         players_out.append({
@@ -1620,7 +1890,7 @@ async def player_compare(
             "club": m.get("club"),
             "image": m.get("image_url"),
             "prices": {"console": console_price, "pc": pc_price},
-            "priceRange": pr,  # {min, max}
+            "priceRange": pr,
             "trend": {
                 "chg4hPct": chg4,
                 "chg24hPct": chg24,
@@ -1628,13 +1898,150 @@ async def player_compare(
                 "high24h": lohi["high"],
             },
             "history": {
-                "short": hist_short,  # 24h
-                "long": hist_long,    # 7d (or fallback)
+                "short": hist_short,
+                "long": hist_long,
             },
             "recentSales": sales,
         })
 
     return {"players": players_out}
+
+# ----------------- Next Promo endpoint -----------------
+@app.get("/api/events/next")
+async def next_event():
+    # If no events, fallback to next 18:00 UK "Daily Content Drop"
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT name, kind, start_at, confidence FROM events WHERE start_at > $1 ORDER BY start_at ASC LIMIT 1",
+            now_utc()
+        )
+    if row:
+        return {"name": row["name"], "kind": row["kind"], "start_at": row["start_at"].isoformat(), "confidence": row["confidence"]}
+    nxt = next_daily_london_hour(18)
+    return {"name": "Daily Content Drop", "kind": "promo", "start_at": nxt.isoformat(), "confidence": "heuristic"}
+
+# ----------------- Deal Confidence endpoint -----------------
+@app.get("/api/deal-confidence/{card_id}")
+async def deal_confidence(card_id: int, platform: str = "ps"):
+    try:
+        hist = await get_price_history(card_id, platform, "today")
+    except Exception as e:
+        raise HTTPException(502, f"history error: {e}")
+    prices = [p.get("price") or p.get("v") or p.get("y") for p in hist if (p.get("price") or p.get("v") or p.get("y"))]
+    if len(prices) < 6:
+        live = await fetch_price(card_id, platform)
+        if isinstance(live.get("price"), (int, float)):
+            prices = [int(live["price"])] * 6
+        else:
+            return {"score": 0, "components": {}, "note": "no data"}
+
+    n = len(prices)
+    def _slope(xs):
+        m = len(xs)
+        if m < 2: return 0.0
+        xb = (m-1)/2.0
+        yb = sum(xs)/m
+        num = sum((i-xb)*(y-yb) for i,y in enumerate(xs))
+        den = sum((i-xb)**2 for i in range(m))
+        return num/den if den else 0.0
+    last_q = prices[max(0, n - max(6, n//4)):]
+    sl = _slope(last_q)
+    momentum4h = 1.0 if sl > 0 else 0.0
+    first = prices[:n//2] or prices
+    second = prices[n//2:] or prices
+    regime = 1.0 if (sum(second)/len(second) >= sum(first)/len(first)) else 0.0
+    diffs = [abs(prices[i]-prices[i-1]) for i in range(1, n)]
+    vol_abs = sum(diffs)/len(diffs) if diffs else 0.0
+    avgp = sum(prices)/len(prices)
+    volRisk = min(1.0, (vol_abs/avgp) if avgp else 1.0)
+    liquidity = min(1.0, max(0.0, (n-6)/90))
+    wnd = prices[-min(12, n):]
+    if wnd:
+        lo, hi = min(wnd), max(wnd)
+        spread_proxy = (hi-lo)/hi if hi else 0.1
+    else:
+        spread_proxy = 0.1
+    recent_hi = max(wnd) if wnd else max(prices)
+    cur = prices[-1]
+    srRoom = (recent_hi - cur)/recent_hi if recent_hi else 0.0
+    secs = (next_daily_london_hour(18) - now_utc()).total_seconds()
+    catalyst = max(0.0, min(1.0, 1 - abs(secs)/(6*3600)))
+
+    score = 100 * (0.22*momentum4h + 0.14*regime + 0.16*(1-volRisk) + 0.18*liquidity + 0.12*(1-spread_proxy) + 0.10*srRoom + 0.08*catalyst)
+    score = max(0.0, min(100.0, score))
+    return {"score": round(score,1), "components": {
+        "momentum4h": round(momentum4h,3), "regimeAgreement": regime, "volRisk": round(volRisk,3),
+        "liquidity": round(liquidity,3), "spreadProxy": round(spread_proxy,3), "srRoom": round(srRoom,3),
+        "catalystBoost": round(catalyst,3)
+    }}
+
+# ----------------- Backtest endpoint (simple dip->tp/sl) -----------------
+@app.post("/api/backtest")
+async def backtest(payload: Dict[str, Any]):
+    players: List[int] = payload.get("players") or []
+    platform: str = payload.get("platform", "ps")
+    window_days: int = int(payload.get("window_days", 7))
+    entry = payload.get("entry", {"type":"dip_from_high","x_pct":5})
+    exit_ = payload.get("exit", {"tp_pct":7,"sl_pct":4,"max_hold_h":24})
+    size = payload.get("size", {"coins":200000})
+    concurrency = int(payload.get("concurrency", 3))
+
+    if not players:
+        raise HTTPException(400, "players required")
+
+    def norm_series(hist: List[dict]) -> List[Tuple[int, float]]:
+        out = []
+        for p in hist:
+            t = p.get("t") or p.get("ts") or p.get("time")
+            v = p.get("price") or p.get("v") or p.get("y")
+            if t is not None and v is not None:
+                out.append((int(t), float(v)))
+        return out
+
+    equity = []; all_trades = []; cash = 0.0; open_trades = []
+    for pid in players:
+        hist = await get_price_history(pid, platform, "today")
+        pts = norm_series(hist)[-(window_days*96):]
+        if len(pts) < 16: 
+            continue
+        recent_high = max(v for _,v in pts[:8])
+        for i in range(8, len(pts)):
+            t, px = pts[i]
+            if px > recent_high: recent_high = px
+            # exits
+            keep = []
+            for tr in open_trades:
+                tp = tr["entry_price"]*(1+exit_.get("tp_pct",7)/100.0)
+                sl = tr["entry_price"]*(1-exit_.get("sl_pct",4)/100.0)
+                hold_h = (t - tr["t_in"]) / 3600000.0
+                reason = None
+                if px >= tp: reason="tp"
+                elif px <= sl: reason="sl"
+                elif hold_h >= exit_.get("max_hold_h",24): reason="time"
+                if reason:
+                    pnl = (px - tr["entry_price"]) * tr["qty"]
+                    pnl_after_tax = pnl * 0.95
+                    all_trades.append({**tr, "t_out": t, "px_out": px, "exit": reason, "pnl_after_tax": pnl_after_tax})
+                    cash += pnl_after_tax
+                else:
+                    keep.append(tr)
+            open_trades = keep
+            # entries
+            if len(open_trades) < concurrency and entry.get("type") == "dip_from_high":
+                x = entry.get("x_pct", 5)
+                if recent_high > 0 and ((recent_high - px)/recent_high)*100 >= x:
+                    qty = max(1, int(size.get("coins",200000) // px))
+                    open_trades.append({"player_id": pid, "t_in": t, "px_in": px, "entry_price": px, "qty": qty})
+            equity.append({"t": t, "value": cash + sum((px - tr["entry_price"]) * tr["qty"] * 0.95 for tr in open_trades)})
+
+    wins = [tr for tr in all_trades if tr["pnl_after_tax"] > 0]
+    summary = {
+        "trades": len(all_trades),
+        "net_profit": round(sum(tr["pnl_after_tax"] for tr in all_trades), 2),
+        "win_rate": round(100*len(wins)/len(all_trades), 1) if all_trades else 0.0,
+        "avg_hold_h": round(sum(((tr["t_out"]-tr["t_in"])/3600000.0) for tr in all_trades)/len(all_trades), 2) if all_trades else 0.0,
+    }
+    return {"equity": equity, "summary": summary, "trades": all_trades}
 
 # ----------------- INCLUDE OPTIONAL ROUTERS -----------------
 try:
