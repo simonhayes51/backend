@@ -18,7 +18,7 @@ from app.services.prices import get_player_price  # <-- added
 from types import SimpleNamespace
 from urllib.parse import urlencode
 
-from fastapi import FastAPI, Request, HTTPException, Depends, UploadFile, File
+from fastapi import FastAPI, Request, HTTPException, Depends, UploadFile, File, Query
 from fastapi.responses import RedirectResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
@@ -1445,6 +1445,196 @@ async def api_trending(
     enriched = await _enrich_with_meta(pick)
     enriched = await _attach_prices_ps(enriched)
     return {"type": kind, "timeframe": f"{tf_norm}h", "items": enriched}
+
+# ----------------- COMPARE: side-by-side player data -----------------
+
+def _cmp_now_ms() -> int:
+    return int(time.time() * 1000)
+
+def _cmp_window(points: List[Dict[str, Any]], hours: int) -> List[Dict[str, Any]]:
+    if not points:
+        return []
+    cutoff = _cmp_now_ms() - hours * 60 * 60 * 1000
+    return [p for p in points if int(p.get("t", 0)) >= cutoff]
+
+def _cmp_chg_pct(points: List[Dict[str, Any]]) -> Optional[float]:
+    if len(points) < 2:
+        return None
+    first = points[0].get("price")
+    last = points[-1].get("price")
+    if not first:
+        return None
+    try:
+        return round(((last - first) / first) * 100.0, 2)
+    except Exception:
+        return None
+
+def _cmp_low_high(points: List[Dict[str, Any]]) -> Dict[str, Optional[int]]:
+    if not points:
+        return {"low": None, "high": None}
+    vals = [p.get("price") for p in points if isinstance(p.get("price"), (int, float))]
+    return {"low": min(vals) if vals else None, "high": max(vals) if vals else None}
+
+def _cmp_platform(p: str) -> str:
+    # normalise to your services' expected tokens
+    p = (p or "").lower()
+    if p in ("ps", "playstation", "console"):
+        return "ps"
+    if p in ("xbox", "xb"):
+        return "xbox"
+    if p in ("pc", "origin"):
+        return "pc"
+    return "ps"
+
+async def _cmp_price_range_via_futgg(card_id: str) -> Dict[str, Optional[int]]:
+    """
+    Ask FUT.GG item definitions API for range min/max.
+    Falls back to None/None if not present.
+    """
+    url = f"https://www.fut.gg/api/fut/player-item-definitions/25/{card_id}/"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-GB,en;q=0.9",
+        "Referer": "https://www.fut.gg/",
+        "Origin": "https://www.fut.gg",
+    }
+    try:
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get(url, headers=headers, timeout=15) as r:
+                if r.status != 200:
+                    return {"min": None, "max": None}
+                js = await r.json()
+        data = js.get("data") or {}
+        pr = data.get("priceRange") or {}
+        mn = pr.get("min")
+        mx = pr.get("max")
+        # Sometimes nested; be defensive
+        if (mn is None or mx is None) and "ranges" in data:
+            rng = (data["ranges"] or {}).get("priceRange") or {}
+            mn = mn if mn is not None else rng.get("min")
+            mx = mx if mx is not None else rng.get("max")
+        return {"min": int(mn) if isinstance(mn, (int, float)) else None,
+                "max": int(mx) if isinstance(mx, (int, float)) else None}
+    except Exception:
+        return {"min": None, "max": None}
+
+async def _cmp_recent_sales_futbin(card_id: str, platform: str) -> List[Dict[str, Any]]:
+    """
+    FUTBIN 'sales' page lists latest listed/sold prices; useful as a liquidity proxy.
+    Example: https://www.futbin.com/25/sales/{card_id}?platform=ps|xbox|pc
+    """
+    plat = platform if platform in ("ps", "xbox", "pc") else "ps"
+    url = f"https://www.futbin.com/25/sales/{card_id}?platform={plat}"
+    out: List[Dict[str, Any]] = []
+    try:
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get(url, timeout=20, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-GB,en;q=0.9",
+                "Referer": "https://www.futbin.com/",
+            }) as r:
+                if r.status != 200:
+                    return out
+                html = await r.text()
+        # Most pages embed: var table_data = [ {price:12345, time:"2025-08-31 20:01"}, ... ];
+        m = re.search(r"var\s+table_data\s*=\s*(\[\s*{.*?}\s*\]);", html, re.S)
+        if not m:
+            return out
+        raw = m.group(1)
+        for price_str, when in re.findall(r"\{[^}]*price[^}\d]*(\d+)[^}]*time[^\"]*\"([^\"]+)\"[^}]*\}", raw):
+            try:
+                out.append({"price": int(price_str), "time": when})
+            except Exception:
+                continue
+        return out[:20]
+    except Exception:
+        return []
+
+@app.get("/api/player-compare")
+async def player_compare(
+    ids: str = Query(..., description="CSV of 1 or 2 card_ids (as stored in fut_players)"),
+    platform: str = Query("ps", description="ps|xbox|pc|console"),
+    include_pc: bool = Query(True, description="Also return PC current price"),
+    include_sales: bool = Query(True, description="Include recent sales list"),
+):
+    # Parse and clamp
+    raw_ids = [x.strip() for x in ids.split(",") if x.strip()]
+    if not raw_ids or len(raw_ids) > 2:
+        raise HTTPException(status_code=400, detail="Provide 1 or 2 ids")
+    plat = _cmp_platform(platform)
+
+    # Metadata from fut_players (note: card_id is TEXT in your DB)
+    async with player_pool.acquire() as pconn:
+        meta_rows = await pconn.fetch(
+            """
+            SELECT card_id, name, rating, position, league, nation, club, image_url
+            FROM fut_players
+            WHERE card_id = ANY($1::text[])
+            """,
+            raw_ids,
+        )
+    meta = {str(r["card_id"]): dict(r) for r in meta_rows}
+
+    players_out: List[Dict[str, Any]] = []
+    for cid_str in raw_ids:
+        m = meta.get(cid_str, {})
+        # get_price_* helpers expect numeric id; be defensive
+        try:
+            cid_int = int(cid_str)
+        except Exception:
+            cid_int = None
+
+        # current prices
+        console_price = await get_player_price(cid_int, plat) if cid_int is not None else None
+        pc_price = await get_player_price(cid_int, "pc") if (cid_int is not None and include_pc) else None
+
+        # histories (short=24h, long=7d if supported by your service)
+        hist_short = await get_price_history(cid_int, plat, "today") if cid_int is not None else []
+        try:
+            hist_long = await get_price_history(cid_int, plat, "week") if cid_int is not None else []
+        except Exception:
+            hist_long = hist_short  # safe fallback if 'week' pill not supported
+
+        # trends & low/high from 24h window
+        w4 = _cmp_window(hist_short, 4)
+        w24 = _cmp_window(hist_short, 24)
+        chg4 = _cmp_chg_pct(w4)
+        chg24 = _cmp_chg_pct(w24)
+        lohi = _cmp_low_high(w24)
+
+        # price range (via FUT.GG item definitions)
+        pr = await _cmp_price_range_via_futgg(cid_str)
+
+        # recent sales
+        sales = await _cmp_recent_sales_futbin(cid_str, plat) if include_sales else []
+
+        players_out.append({
+            "id": cid_str,
+            "name": m.get("name") or f"Card {cid_str}",
+            "rating": m.get("rating"),
+            "position": m.get("position"),
+            "league": m.get("league"),
+            "nation": m.get("nation"),
+            "club": m.get("club"),
+            "image": m.get("image_url"),
+            "prices": {"console": console_price, "pc": pc_price},
+            "priceRange": pr,  # {min, max}
+            "trend": {
+                "chg4hPct": chg4,
+                "chg24hPct": chg24,
+                "low24h": lohi["low"],
+                "high24h": lohi["high"],
+            },
+            "history": {
+                "short": hist_short,  # 24h
+                "long": hist_long,    # 7d (or fallback)
+            },
+            "recentSales": sales,
+        })
+
+    return {"players": players_out}
 
 # ----------------- INCLUDE OPTIONAL ROUTERS -----------------
 try:
