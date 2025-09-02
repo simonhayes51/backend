@@ -52,7 +52,7 @@ DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID")
 DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
 DISCORD_REDIRECT_URI = os.getenv("DISCORD_REDIRECT_URI")
 SECRET_KEY = os.getenv("SECRET_KEY")
-FRONTEND_URL = (os.getenv("FRONTEND_URL", "https://frontendnew-production.up.railway.app").rstrip("/"))
+FRONTEND_URL = (os.getenv("FRONTEND_URL", "https://app.futhub.co.uk").rstrip("/"))
 PORT = int(os.getenv("PORT", 8000))
 
 ENV = os.getenv("ENV", "production").lower()
