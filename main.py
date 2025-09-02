@@ -468,10 +468,15 @@ async def lifespan(app: FastAPI):
 # ----------------- APP & MIDDLEWARE -----------------
 app = FastAPI(lifespan=lifespan)
 
+FRONTEND_URL = os.getenv("FRONTEND_ORIGIN", "https://app.futhub.co.uk")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         FRONTEND_URL,
+        "https://app.futhub.co.uk",
+        "https://www.futhub.co.uk",
+        "https://futhub.co.uk",       # if you ever serve the apex directly
         "http://localhost:5173",
         "http://localhost:3000",
     ],
@@ -488,6 +493,8 @@ app.add_middleware(
     secret_key=SECRET_KEY,
     same_site="none" if IS_PROD else "lax",
     https_only=IS_PROD,
+    domain=".futhub.co.uk",     # share cookie across subdomains
+
 )
 
 
