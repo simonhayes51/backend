@@ -503,8 +503,8 @@ app.add_middleware(
     https_only=IS_PROD,
 )
 
-# ✅ mount Trade Finder API
-app.include_router(trade_finder_router)
+# ✅ mount Trade Finder API with /api prefix
+app.include_router(trade_finder_router, prefix="/api")
 
 
 # ----------------- DEPENDENCIES & HELPERS -----------------
