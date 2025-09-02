@@ -28,6 +28,71 @@ from pydantic import BaseModel
 from typing import List, Optional, Dict, Any, Literal, Tuple
 from datetime import datetime, timedelta, timezone, time as dt_time
 from zoneinfo import ZoneInfo
+from datetime import datetime, timezone
+
+@app.get("/ext/ping")
+async def ext_ping(auth = Depends(require_extension_jwt)):
+    """Sanity check for the extension – proves the JWT is valid."""
+    return {"ok": True, "sub": auth.discord_id}
+
+@app.post("/ext/trades")
+async def ext_add_trade(
+    sale: ExtSale,
+    auth = Depends(require_extension_jwt),   # <-- extension JWT, not web session
+    conn = Depends(get_db),
+):
+    """
+    Ingest a sold item from the Chrome extension.
+    The extension must send Authorization: Bearer <token> (issued during OAuth).
+    """
+    discord_id = auth.discord_id or "unknown"
+    ts = datetime.fromtimestamp(int(sale.timestamp_ms) / 1000, tz=timezone.utc)
+
+    # 1) Raw log into fut_trades (idempotent per discord_id + trade_id)
+    await conn.execute("""
+        INSERT INTO fut_trades (discord_id, trade_id, player_name, card_version, buy_price, sell_price, ts, source)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,'webapp')
+        ON CONFLICT (discord_id, trade_id)
+        DO UPDATE SET
+            player_name  = EXCLUDED.player_name,
+            card_version = COALESCE(EXCLUDED.card_version, fut_trades.card_version),
+            buy_price    = COALESCE(EXCLUDED.buy_price, fut_trades.buy_price),
+            sell_price   = EXCLUDED.sell_price,
+            ts           = EXCLUDED.ts
+    """, discord_id, int(sale.trade_id), sale.player_name, sale.card_version, sale.buy_price, sale.sell_price, ts)
+
+    # 2) Mirror into main trades so the dashboard shows it immediately
+    player   = sale.player_name
+    version  = str(sale.card_version or "Standard")
+    qty      = 1
+    buy      = int(sale.buy_price or 0)
+    sell     = int(sale.sell_price or 0)
+    platform = "ps"     # pick a default; user can edit in UI
+    tag      = "fut-webapp"
+    ea_tax   = int(round(sell * qty * 0.05))
+    profit   = (sell - buy) * qty
+
+    await conn.execute("""
+        INSERT INTO trades (
+            user_id, player, version, buy, sell, quantity, platform,
+            profit, ea_tax, tag, notes, timestamp, trade_id
+        )
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+        ON CONFLICT (user_id, trade_id)
+        DO UPDATE SET
+            sell      = EXCLUDED.sell,
+            buy       = EXCLUDED.buy,
+            profit    = EXCLUDED.profit,
+            ea_tax    = EXCLUDED.ea_tax,
+            version   = EXCLUDED.version,
+            platform  = EXCLUDED.platform,
+            tag       = EXCLUDED.tag,
+            timestamp = EXCLUDED.timestamp
+    """, discord_id, player, version, buy, sell, qty, platform,
+         profit, ea_tax, tag, "", ts, int(sale.trade_id))
+
+    return {"ok": True}
+
 
 # ----------------- BOOTSTRAP -----------------
 logging.basicConfig(level=logging.INFO)
@@ -504,7 +569,7 @@ app.add_middleware(
         "http://localhost:5173",
         "http://localhost:3000",
     ],
-    allow_origin_regex=r"^https://.*\.railway\.app$",
+    allow_origin_regex=r"^(https://.*\.railway\.app|chrome-extension://.*)$",
     allow_credentials=True,
     allow_methods=["GET","POST","PUT","PATCH","DELETE","OPTIONS"],
     allow_headers=["Authorization","Content-Type","X-Requested-With","Accept"],
