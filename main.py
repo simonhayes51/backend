@@ -493,8 +493,6 @@ app.add_middleware(
     secret_key=SECRET_KEY,
     same_site="none" if IS_PROD else "lax",
     https_only=IS_PROD,
-    domain=".futhub.co.uk",     # share cookie across subdomains
-
 )
 
 
