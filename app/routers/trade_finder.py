@@ -4,186 +4,241 @@ from typing import Optional, List, Literal, Dict, Any
 import asyncio
 import logging
 
-from app.services.prices import get_player_price  # live price per platform
+from app.services.price_history import get_price_history
+from app.services.prices import get_player_price
 
-router = APIRouter(prefix="/api")
+router = APIRouter()
 
-# --- helpers --------------------------------------------------------------
-
-def _collapse_platform(p: str) -> Literal["console", "pc"]:
-    s = (p or "").lower()
-    return "pc" if s in ("pc", "origin") else "console"
-
-def _price_platform(platform_collapse: Literal["console", "pc"]) -> Literal["ps", "pc"]:
-    # For console we default to PS pricing (most liquid); you can switch to 'xbox' if desired.
-    return "pc" if platform_collapse == "pc" else "ps"
+EA_TAX = 0.05
 
 def _num(v, default=None, cast=float):
     try:
-        if v is None or v == "": 
-            return default
+        if v is None or v == "": return default
         return cast(v)
     except Exception:
         return default
 
-# --- API ------------------------------------------------------------------
+def _collapse_platform(p: str) -> Literal["console","pc","ps","xbox","pc"]:
+    s = (p or "").lower()
+    if s in ("pc", "origin"): return "pc"
+    if s in ("ps","playstation","console"): return "ps"  # treat “console” as PS by default
+    if s in ("xbox","xb"): return "xbox"
+    return "ps"
+
+def _csv_to_list(s: Optional[str]) -> List[str]:
+    if not s: return []
+    return [x.strip() for x in s.split(",") if x.strip()]
+
+async def _chg_pct_for_hours(card_id: int, platform: str, hours: int) -> Optional[float]:
+    """Compute % change over last `hours` using short history endpoint."""
+    try:
+        # Reuse "today" (15min buckets) and slice window here
+        hist = await get_price_history(card_id, platform, "today")
+        if not hist: return None
+        # hist elements have keys like {"t": ms, "price": v} or {"t":..,"v":..}
+        now_ms = max(int(p.get("t") or p.get("ts") or 0) for p in hist)
+        cutoff = now_ms - hours * 60 * 60 * 1000
+        window = [p for p in hist if int(p.get("t") or p.get("ts") or 0) >= cutoff]
+        if len(window) < 2: return None
+        v = lambda p: p.get("price") or p.get("v") or p.get("y")
+        first = v(window[0]); last = v(window[-1])
+        if not (isinstance(first, (int, float)) and isinstance(last, (int, float)) and first):
+            return None
+        return round(((last - first) / first) * 100.0, 2)
+    except Exception:
+        return None
+
+async def _vol_score(card_id: int, platform: str, hours: int) -> Optional[float]:
+    """Very crude liquidity proxy: normalized count of ticks in window (0..1)."""
+    try:
+        hist = await get_price_history(card_id, platform, "today")
+        if not hist: return None
+        now_ms = max(int(p.get("t") or p.get("ts") or 0) for p in hist)
+        cutoff = now_ms - hours * 60 * 60 * 1000
+        window = [p for p in hist if int(p.get("t") or p.get("ts") or 0) >= cutoff]
+        # assume ~4 ticks/hour typical; cap at 1.0
+        return round(min(1.0, (len(window) / max(1, hours * 4))), 3)
+    except Exception:
+        return None
 
 @router.get("/trade-finder")
 async def trade_finder(
     request: Request,
-    platform: str = Query("console", pattern="^(console|pc)$"),
-    timeframe: int = Query(24, ge=6, le=24),            # currently unused, kept for UI
+    platform: str = Query("console", pattern="^(console|pc|ps|xbox)$"),
+    timeframe: int = Query(24, ge=4, le=24),  # 4h or 24h
     topn: int = Query(20, ge=1, le=50),
 
     budget_min: Optional[float] = Query(None),
     budget_max: Optional[float] = Query(None),
-
-    # kept for UI; we surface them back in the response but don’t hard-filter on them yet
     min_profit: Optional[float] = Query(None),
     min_margin_pct: Optional[float] = Query(None),
 
     rating_min: Optional[int] = Query(None),
     rating_max: Optional[int] = Query(None),
 
-    exclude_extinct: int = Query(1),        # currently not enforced (FUT.GG API doesn’t expose via our live call)
-    exclude_low_liquidity: int = Query(1),  # placeholder
-    exclude_anomalies: int = Query(1),      # placeholder
+    leagues: Optional[str] = Query(None, description="Comma separated"),
+    nations: Optional[str] = Query(None, description="Comma separated"),
+    positions: Optional[str] = Query(None, description="Comma separated"),
+
+    exclude_extinct: int = Query(1),
+    exclude_low_liquidity: int = Query(0),
+    exclude_anomalies: int = Query(1),
 
     debug: int = Query(0),
 ):
-    """
-    Returns a list of candidate deals:
-      - Catalog pulled from `fut_players` (PLAYER_DATABASE_URL)
-      - Live price pulled per card (PS for console, PC for pc)
-      - Budget + rating filters applied on the *live* price + static rating
-    """
     player_pool = getattr(request.app.state, "player_pool", None)
     if player_pool is None:
-        raise HTTPException(500, "player DB pool not initialised")
+        raise HTTPException(500, "Player DB pool not initialised")
 
-    plat_collapsed = _collapse_platform(platform)
-    price_plat = _price_platform(plat_collapsed)
+    plat = _collapse_platform(platform)
+    hours = 4 if int(timeframe) <= 6 else 24
 
-    # Build a *catalog* query from fut_players (no dependency on a `price` column)
-    where: List[str] = []
-    params: List[Any] = []
+    # sanitize numeric filters
+    budget_min = _num(budget_min, None, float)
+    budget_max = _num(budget_max, None, float)
+    min_profit = _num(min_profit, None, float)
+    min_margin_pct = _num(min_margin_pct, None, float)
+    rating_min = _num(rating_min, None, int)
+    rating_max = _num(rating_max, None, int)
 
-    if rating_min is not None:
-        params.append(int(rating_min)); where.append(f"rating >= ${len(params)}")
-    if rating_max is not None:
-        params.append(int(rating_max)); where.append(f"rating <= ${len(params)}")
-
-    # Avoid loans / placeholders if you have such flags; otherwise this is harmless.
-    where.append("(version IS NULL OR version NOT ILIKE '%loan%')")
-
-    sql = f"""
-      SELECT
-        card_id::text     AS cid,
-        name,
-        version,
-        rating,
-        image_url,
-        club,
-        league
-      FROM fut_players
-      {"WHERE " + " AND ".join(where) if where else ""}
-      ORDER BY rating DESC NULLS LAST, name ASC
-      LIMIT 400
-    """
+    # text filters
+    leagues_list = _csv_to_list(leagues)
+    nations_list = _csv_to_list(nations)
+    positions_list = _csv_to_list(positions)
 
     try:
+        # Build catalog WHERE on metadata only (prices come live)
+        where: List[str] = []
+        params: List[Any] = []
+
+        if rating_min is not None:
+            params.append(rating_min); where.append(f"rating >= ${len(params)}")
+        if rating_max is not None:
+            params.append(rating_max); where.append(f"rating <= ${len(params)}")
+
+        if leagues_list:
+            params.append(leagues_list)
+            where.append(f"LOWER(league) = ANY(SELECT LOWER(x) FROM unnest(${len(params)}::text[] ) AS t(x))")
+        if nations_list:
+            params.append(nations_list)
+            where.append(f"LOWER(nation) = ANY(SELECT LOWER(x) FROM unnest(${len(params)}::text[] ) AS t(x))")
+        if positions_list:
+            # match position or any altposition token
+            params.append([p.upper() for p in positions_list])
+            idx = len(params)
+            where.append(
+                f"""(
+                    UPPER(position) = ANY(${idx}::text[])
+                    OR (
+                        COALESCE(altposition, '') <> ''
+                        AND EXISTS (
+                          SELECT 1
+                          FROM regexp_split_to_table(altposition, '[,;/|\\s]+') ap
+                          WHERE UPPER(TRIM(ap)) = ANY(${idx}::text[])
+                        )
+                    )
+                )"""
+            )
+
+        # Reasonable candidate cap to keep price lookups snappy
+        sql = f"""
+          SELECT card_id::text AS cid, name, version, rating, image_url, club, league, position
+          FROM fut_players
+          {"WHERE " + " AND ".join(where) if where else ""}
+          ORDER BY rating DESC NULLS LAST, name ASC
+          LIMIT 250
+        """
+
         async with player_pool.acquire() as conn:
             rows = await conn.fetch(sql, *params)
-    except Exception as e:
-        logging.exception("trade_finder: catalog query failed")
-        raise HTTPException(500, f"player catalog error: {e}")
 
-    # Pull live prices concurrently
-    async def _live_price(cid_int: int):
-        try:
-            px = await get_player_price(cid_int, price_plat)
-            return int(px) if isinstance(px, (int, float)) else None
-        except Exception:
-            return None
+        # Pull live prices concurrently
+        async def enrich(r):
+            cid = int(r["cid"])
+            price_now = await get_player_price(cid, plat)
+            if not isinstance(price_now, (int, float)) or price_now <= 0:
+                return None
 
-    # Assemble tasks
-    tasks = []
-    cards: List[Dict[str, Any]] = []
-    for r in rows:
-        try:
-            cid_int = int(r["cid"])
-        except Exception:
-            continue
-        cards.append({
-            "pid": cid_int,
-            "name": r["name"],
-            "version": r["version"],
-            "rating": r["rating"],
-            "image": r["image_url"],
-            "club": r["club"],
-            "league": r["league"],
-        })
-        tasks.append(_live_price(cid_int))
+            # Budget filters apply to current price
+            if budget_min is not None and price_now < budget_min:
+                return None
+            if budget_max is not None and price_now > budget_max:
+                return None
 
-    prices = await asyncio.gather(*tasks, return_exceptions=False)
+            # Use requested min_margin_pct (default 8%)
+            target_margin = (min_margin_pct if min_margin_pct is not None else 8.0) / 100.0
+            expected_sell = int(round(price_now * (1 + target_margin)))
 
-    # Apply budget filtering on the *live* price
-    items: List[Dict[str, Any]] = []
-    for card, px in zip(cards, prices):
-        if px is None or px <= 0:
-            continue
-        if budget_min is not None and px < float(budget_min):
-            continue
-        if budget_max is not None and px > float(budget_max):
-            continue
+            net_profit = int(round(expected_sell * (1 - EA_TAX) - price_now))
+            margin_pct = round(((expected_sell - price_now) / price_now) * 100.0, 2)
 
-        items.append({
-            **card,
-            "platform": plat_collapsed,
-            "prices": {"now": px},
-            "edge": {
-                "minProfit": _num(min_profit, None, float),
-                "minMarginPct": _num(min_margin_pct, None, float),
-                # flags just echoed back for now
-                "excludeExtinct": int(exclude_extinct or 0),
-                "excludeLowLiquidity": int(exclude_low_liquidity or 0),
-                "excludeAnomalies": int(exclude_anomalies or 0),
-            },
-        })
+            # Enforce min_profit / min_margin filters
+            if min_profit is not None and net_profit < min_profit:
+                return None
+            if min_margin_pct is not None and margin_pct < min_margin_pct:
+                return None
 
-    # Sort: simple heuristic — higher rating first, then cheaper to surface accessible cards
-    items.sort(key=lambda x: (-int(x.get("rating") or 0), int(x["prices"]["now"])))
-    items = items[:topn]
+            # Optional extras
+            chg = await _chg_pct_for_hours(cid, plat, hours)
+            vol = await _vol_score(cid, plat, hours)
 
-    if debug:
+            # Extinct or anomalies – you can wire proper signals later
+            if exclude_extinct and price_now <= 0:
+                return None
+            if exclude_low_liquidity and (vol is None or vol < 0.05):
+                return None
+            # exclude_anomalies placeholder: no-op for now
+
+            return {
+                "player_id": cid,
+                "card_id": cid,
+                "name": r["name"],
+                "version": r.get("version"),
+                "rating": r.get("rating"),
+                "position": r.get("position"),
+                "league": r.get("league"),
+                "image_url": r.get("image_url"),
+
+                "platform": "console" if plat in ("ps","xbox") else "pc",
+                "timeframe_hours": hours,
+
+                "current_price": int(price_now),
+                "expected_sell": expected_sell,
+                "est_profit_after_tax": net_profit,
+                "margin_pct": margin_pct,
+
+                "change_pct_window": chg,
+                "vol_score": vol,
+
+                # keep these so your UI chips are stable
+                "tags": [],
+                "seasonal_shift": None,
+            }
+
+        results = await asyncio.gather(*(enrich(r) for r in rows), return_exceptions=True)
+        items = []
+        for it in results:
+            if it is None: 
+                continue
+            if isinstance(it, Exception):
+                logging.debug("deal enrich error: %s", it)
+                continue
+            items.append(it)
+
+        # crude ranking: higher net profit, then margin, then rating
+        items.sort(key=lambda d: (d["est_profit_after_tax"], d["margin_pct"], d.get("rating") or 0), reverse=True)
+        items = items[:topn]
+
         return {
             "items": items,
             "meta": {
-                "catalog_count": len(rows),
-                "after_live_price_count": sum(1 for p in prices if isinstance(p, int) and p > 0),
                 "returned": len(items),
-                "platform_price_source": price_plat,
+                "platform_price_source": plat,
             },
         }
 
-    return {"items": items}
-
-
-@router.post("/trade-insight")
-async def trade_insight(payload: Dict[str, Any]):
-    """
-    Return a lightweight, rules-based explanation (if you don't wire up LLMs).
-    """
-    deal = payload.get("deal") or {}
-    name = deal.get("name", f"Card {deal.get('pid')}")
-    px = (deal.get("prices") or {}).get("now")
-    margin = (deal.get("edge") or {}).get("minMarginPct")
-    profit = (deal.get("edge") or {}).get("minProfit")
-
-    bits = []
-    if isinstance(px, int): bits.append(f"live ≈ {px:,}c")
-    if margin is not None: bits.append(f"target margin ≥ {margin}%")
-    if profit is not None: bits.append(f"target profit ≥ {int(profit):,}c")
-
-    text = f"{name}: matches your filters" + (f" ({', '.join(bits)})" if bits else ".")
-    return {"insight": text}
+    except Exception as e:
+        logging.exception("trade_finder error")
+        if debug:
+            raise HTTPException(500, detail=str(e))
+        raise HTTPException(500, "Internal error")
