@@ -33,6 +33,9 @@ from pydantic import BaseModel
 from app.services.price_history import get_price_history
 from app.services.prices import get_player_price
 
+# ✅ Trade Finder router
+from app.routers.trade_finder import router as trade_finder_router
+
 
 # ----------------- BOOTSTRAP -----------------
 logging.basicConfig(level=logging.INFO)
@@ -294,6 +297,11 @@ async def lifespan(app: FastAPI):
     else:
         watchlist_pool = await asyncpg.create_pool(WATCHLIST_DATABASE_URL, min_size=1, max_size=10)
 
+    # ✅ expose pools to routers/services that access request.app.state.*
+    app.state.pool = pool
+    app.state.player_pool = player_pool
+    app.state.watchlist_pool = watchlist_pool
+
     # Core tables + indexes
     async with pool.acquire() as conn:
         await conn.execute("""
@@ -494,6 +502,9 @@ app.add_middleware(
     same_site="none" if IS_PROD else "lax",
     https_only=IS_PROD,
 )
+
+# ✅ mount Trade Finder API
+app.include_router(trade_finder_router)
 
 
 # ----------------- DEPENDENCIES & HELPERS -----------------
@@ -2003,7 +2014,7 @@ async def next_event():
             now_utc()
         )
     if row:
-        return {"name": row["name"], "kind": row["kind"], "start_at": row["start_at"].isoformat(), "confidence": row["confidence"]}
+        return {"name": row["name"], "kind": row["kind"], "start_at": row["start_at"].isoformat(), "confidence": "confidence" in row and row["confidence"] or "heuristic"}
     nxt = next_daily_london_hour(18)
     return {"name": "Daily Content Drop", "kind": "promo", "start_at": nxt.isoformat(), "confidence": "heuristic"}
 
