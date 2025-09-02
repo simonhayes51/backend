@@ -1,97 +1,37 @@
 import os
-import json
-import asyncpg
-import aiohttp
-import csv
-import io
-import logging
-import time
-import secrets
-import jwt
-import asyncio
 import re
+import io
+import csv
+import jwt
+import time
+import json
+import asyncio
+import logging
+import secrets
+import aiohttp
+import asyncpg
 
 from bs4 import BeautifulSoup
-from app.services.price_history import get_price_history
-from app.services.prices import get_player_price  # <-- added
-
 from types import SimpleNamespace
 from urllib.parse import urlencode
+from contextlib import asynccontextmanager, suppress
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
-from fastapi import FastAPI, Request, HTTPException, Depends, UploadFile, File, Query
+from dotenv import load_dotenv
+from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, timezone, time as dt_time
+
+from fastapi import (
+    FastAPI, APIRouter, Request, HTTPException, Depends,
+    UploadFile, File, Query
+)
 from fastapi.responses import RedirectResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
-from dotenv import load_dotenv
-from contextlib import asynccontextmanager, suppress
 from pydantic import BaseModel
-from typing import List, Optional, Dict, Any, Literal, Tuple
-from datetime import datetime, timedelta, timezone, time as dt_time
-from zoneinfo import ZoneInfo
-from datetime import datetime, timezone
 
-@app.get("/ext/ping")
-async def ext_ping(auth = Depends(require_extension_jwt)):
-    """Sanity check for the extension – proves the JWT is valid."""
-    return {"ok": True, "sub": auth.discord_id}
-
-@app.post("/ext/trades")
-async def ext_add_trade(
-    sale: ExtSale,
-    auth = Depends(require_extension_jwt),   # <-- extension JWT, not web session
-    conn = Depends(get_db),
-):
-    """
-    Ingest a sold item from the Chrome extension.
-    The extension must send Authorization: Bearer <token> (issued during OAuth).
-    """
-    discord_id = auth.discord_id or "unknown"
-    ts = datetime.fromtimestamp(int(sale.timestamp_ms) / 1000, tz=timezone.utc)
-
-    # 1) Raw log into fut_trades (idempotent per discord_id + trade_id)
-    await conn.execute("""
-        INSERT INTO fut_trades (discord_id, trade_id, player_name, card_version, buy_price, sell_price, ts, source)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,'webapp')
-        ON CONFLICT (discord_id, trade_id)
-        DO UPDATE SET
-            player_name  = EXCLUDED.player_name,
-            card_version = COALESCE(EXCLUDED.card_version, fut_trades.card_version),
-            buy_price    = COALESCE(EXCLUDED.buy_price, fut_trades.buy_price),
-            sell_price   = EXCLUDED.sell_price,
-            ts           = EXCLUDED.ts
-    """, discord_id, int(sale.trade_id), sale.player_name, sale.card_version, sale.buy_price, sale.sell_price, ts)
-
-    # 2) Mirror into main trades so the dashboard shows it immediately
-    player   = sale.player_name
-    version  = str(sale.card_version or "Standard")
-    qty      = 1
-    buy      = int(sale.buy_price or 0)
-    sell     = int(sale.sell_price or 0)
-    platform = "ps"     # pick a default; user can edit in UI
-    tag      = "fut-webapp"
-    ea_tax   = int(round(sell * qty * 0.05))
-    profit   = (sell - buy) * qty
-
-    await conn.execute("""
-        INSERT INTO trades (
-            user_id, player, version, buy, sell, quantity, platform,
-            profit, ea_tax, tag, notes, timestamp, trade_id
-        )
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
-        ON CONFLICT (user_id, trade_id)
-        DO UPDATE SET
-            sell      = EXCLUDED.sell,
-            buy       = EXCLUDED.buy,
-            profit    = EXCLUDED.profit,
-            ea_tax    = EXCLUDED.ea_tax,
-            version   = EXCLUDED.version,
-            platform  = EXCLUDED.platform,
-            tag       = EXCLUDED.tag,
-            timestamp = EXCLUDED.timestamp
-    """, discord_id, player, version, buy, sell, qty, platform,
-         profit, ea_tax, tag, "", ts, int(sale.trade_id))
-
-    return {"ok": True}
+from app.services.price_history import get_price_history
+from app.services.prices import get_player_price
 
 
 # ----------------- BOOTSTRAP -----------------
@@ -225,43 +165,6 @@ async def _momentum_page_items(tf: str, page: int) -> tuple[list[dict], str]:
     html = await _fetch_momentum_page(tf, page)
     return _extract_items(html), html
 
-async def _enrich_with_meta(items: list[dict]) -> list[dict]:
-    if not items:
-        return []
-    ids = [str(it["card_id"]) for it in items]
-    async with player_pool.acquire() as pconn:
-        rows = await pconn.fetch(
-            """
-            SELECT card_id, name, rating, version, image_url, club, league
-              FROM fut_players
-             WHERE card_id = ANY($1::text[])
-            """,
-            ids,
-        )
-    meta = {str(r["card_id"]): dict(r) for r in rows}
-    out = []
-    for it in items:
-        m = meta.get(str(it["card_id"]), {})
-        out.append({
-            "pid": it["card_id"],
-            "name": m.get("name") or f"Card {it['card_id']}",
-            "rating": m.get("rating"),
-            "version": m.get("version"),
-            "image": m.get("image_url"),
-            "club": m.get("club"),
-            "league": m.get("league"),
-            "percent": it["percent"],
-            "price_ps": None,
-            "price_xb": None,
-        })
-    return out
-
-async def _attach_prices_ps(items: list[dict]) -> list[dict]:
-    tasks = [get_player_price(it["pid"], "ps") for it in items]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    for it, val in zip(items, results):
-        it["price_ps"] = int(val) if isinstance(val, (int, float)) else None
-    return items
 
 # ----------------- HELPERS -----------------
 def parse_coin_amount(v) -> int:
@@ -307,6 +210,7 @@ def is_within_quiet_hours(dt: datetime, quiet_start: Optional[dt_time], quiet_en
     if quiet_start <= quiet_end:
         return quiet_start <= t < quiet_end
     return t >= quiet_start or t < quiet_end
+
 
 # ----------------- MODELS -----------------
 class UserSettings(BaseModel):
@@ -366,6 +270,7 @@ class WatchlistAlertCreate(BaseModel):
     quiet_end: Optional[str] = None    # "07:00"
     prefer_dm: Optional[bool] = True
     fallback_channel_id: Optional[str] = None
+
 
 # ----------------- POOLS & LIFESPAN -----------------
 pool = None
@@ -559,6 +464,7 @@ async def lifespan(app: FastAPI):
             if p is not None:
                 await p.close()
 
+
 # ----------------- APP & MIDDLEWARE -----------------
 app = FastAPI(lifespan=lifespan)
 
@@ -583,6 +489,7 @@ app.add_middleware(
     same_site="none" if IS_PROD else "lax",
     https_only=IS_PROD,
 )
+
 
 # ----------------- DEPENDENCIES & HELPERS -----------------
 async def get_db():
@@ -671,6 +578,77 @@ async def fetch_price(card_id: int, platform: str) -> Dict[str, Any]:
     _price_cache[key] = {"at": now, "price": price, "isExtinct": is_extinct, "updatedAt": updated_at}
     return {"price": price, "isExtinct": is_extinct, "updatedAt": updated_at}
 
+
+# ----------------- EXTENSION ROUTER (no NameError) -----------------
+ext_router = APIRouter()
+
+@ext_router.get("/ext/ping")
+async def ext_ping(auth = Depends(require_extension_jwt)):
+    """Sanity check for the extension – proves the JWT is valid."""
+    return {"ok": True, "sub": auth.discord_id}
+
+@ext_router.post("/ext/trades")
+async def ext_add_trade(
+    sale: ExtSale,
+    auth = Depends(require_extension_jwt),   # extension JWT, not web session
+    conn = Depends(get_db),
+):
+    """
+    Ingest a sold item from the Chrome extension.
+    The extension must send Authorization: Bearer <token> (issued during OAuth).
+    """
+    discord_id = auth.discord_id or "unknown"
+    ts = datetime.fromtimestamp(int(sale.timestamp_ms) / 1000, tz=timezone.utc)
+
+    # 1) Raw log into fut_trades (idempotent per discord_id + trade_id)
+    await conn.execute("""
+        INSERT INTO fut_trades (discord_id, trade_id, player_name, card_version, buy_price, sell_price, ts, source)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,'webapp')
+        ON CONFLICT (discord_id, trade_id)
+        DO UPDATE SET
+            player_name  = EXCLUDED.player_name,
+            card_version = COALESCE(EXCLUDED.card_version, fut_trades.card_version),
+            buy_price    = COALESCE(EXCLUDED.buy_price, fut_trades.buy_price),
+            sell_price   = EXCLUDED.sell_price,
+            ts           = EXCLUDED.ts
+    """, discord_id, int(sale.trade_id), sale.player_name, sale.card_version, sale.buy_price, sale.sell_price, ts)
+
+    # 2) Mirror into main trades so the dashboard shows it immediately
+    player   = sale.player_name
+    version  = str(sale.card_version or "Standard")
+    qty      = 1
+    buy      = int(sale.buy_price or 0)
+    sell     = int(sale.sell_price or 0)
+    platform = "ps"     # pick a default; user can edit in UI
+    tag      = "fut-webapp"
+    ea_tax   = int(round(sell * qty * 0.05))
+    profit   = (sell - buy) * qty
+
+    await conn.execute("""
+        INSERT INTO trades (
+            user_id, player, version, buy, sell, quantity, platform,
+            profit, ea_tax, tag, notes, timestamp, trade_id
+        )
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+        ON CONFLICT (user_id, trade_id)
+        DO UPDATE SET
+            sell      = EXCLUDED.sell,
+            buy       = EXCLUDED.buy,
+            profit    = EXCLUDED.profit,
+            ea_tax    = EXCLUDED.ea_tax,
+            version   = EXCLUDED.version,
+            platform  = EXCLUDED.platform,
+            tag       = EXCLUDED.tag,
+            timestamp = EXCLUDED.timestamp
+    """, discord_id, player, version, buy, sell, qty, platform,
+         profit, ea_tax, tag, "", ts, int(sale.trade_id))
+
+    return {"ok": True}
+
+# mount it
+app.include_router(ext_router)
+
+
 # ----------------- ROUTES -----------------
 @app.get("/")
 async def root():
@@ -718,7 +696,7 @@ async def callback(request: Request):
 
     data = {
         "client_id": DISCORD_CLIENT_ID,
-        "client_secret": DISCORD_CLIENT_SECRET,
+        "client_secret": DISCORD_CLIENT_SECRET",
         "grant_type": "authorization_code",
         "code": code,
         "redirect_uri": DISCORD_REDIRECT_URI,
@@ -817,6 +795,7 @@ async def oauth_start(redirect_uri: str):
         "prompt": "consent",
     }
     return RedirectResponse(f"{DISCORD_OAUTH_AUTHORIZE}?{urlencode(params)}")
+
 
 # ----------------- BUSINESS ROUTES -----------------
 async def fetch_dashboard_data(user_id: str, conn):
@@ -1777,6 +1756,44 @@ async def debug_session(req: Request):
     }
 
 # ----------------- TRENDING -----------------
+async def _enrich_with_meta(items: list[dict]) -> list[dict]:
+    if not items:
+        return []
+    ids = [str(it["card_id"]) for it in items]
+    async with player_pool.acquire() as pconn:
+        rows = await pconn.fetch(
+            """
+            SELECT card_id, name, rating, version, image_url, club, league
+              FROM fut_players
+             WHERE card_id = ANY($1::text[])
+            """,
+            ids,
+        )
+    meta = {str(r["card_id"]): dict(r) for r in rows}
+    out = []
+    for it in items:
+        m = meta.get(str(it["card_id"]), {})
+        out.append({
+            "pid": it["card_id"],
+            "name": m.get("name") or f"Card {it['card_id']}",
+            "rating": m.get("rating"),
+            "version": m.get("version"),
+            "image": m.get("image_url"),
+            "club": m.get("club"),
+            "league": m.get("league"),
+            "percent": it["percent"],
+            "price_ps": None,
+            "price_xb": None,
+        })
+    return out
+
+async def _attach_prices_ps(items: list[dict]) -> list[dict]:
+    tasks = [get_player_price(it["pid"], "ps") for it in items]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for it, val in zip(items, results):
+        it["price_ps"] = int(val) if isinstance(val, (int, float)) else None
+    return items
+
 @app.get("/api/trending")
 async def api_trending(
     type: Literal["risers","fallers"],
