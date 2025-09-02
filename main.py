@@ -857,7 +857,7 @@ async def add_trade(request: Request, user_id: str = Depends(get_current_user), 
         quantity = int(data["quantity"])
         buy = parse_coin_amount(data["buy"])
         sell = parse_coin_amount(data["sell"])
-        if quantity <= 0 or buy <= 0 or sell <= 0:
+        if quantity <= 0 or buy < 0 or sell <= 0:
             raise ValueError()
     except (ValueError, TypeError):
         raise HTTPException(status_code=400, detail="Invalid numeric values")
