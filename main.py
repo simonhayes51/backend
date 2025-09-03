@@ -504,8 +504,7 @@ app.add_middleware(
 )
 
 # ✅ mount Trade Finder API
-app.include_router(trade_finder_router)
-
+app.include_router(trade_finder_router, prefix="/api")
 
 # ----------------- DEPENDENCIES & HELPERS -----------------
 async def get_db():
