@@ -8,12 +8,15 @@ from pydantic import BaseModel
 
 router = APIRouter(prefix="/smart-buy", tags=["Smart Buy"])
 
+# ----------------- Helpers -----------------
 def _require_user(request: Request) -> str:
     uid = request.session.get("user_id")
     if not uid:
         raise HTTPException(status_code=401, detail="Not authenticated")
     return uid
 
+
+# ----------------- Models -----------------
 class PreferencesUpdate(BaseModel):
     default_budget: Optional[int] = None
     risk_tolerance: Optional[Literal["conservative", "moderate", "aggressive"]] = None
@@ -27,6 +30,7 @@ class PreferencesUpdate(BaseModel):
     min_profit: Optional[int] = None
     notifications_enabled: Optional[bool] = None
 
+
 class FeedbackCreate(BaseModel):
     card_id: str
     action: Literal["bought", "ignored", "watchlisted"]
@@ -36,6 +40,8 @@ class FeedbackCreate(BaseModel):
     actual_profit: Optional[int] = None
     suggestion_id: Optional[int] = None
 
+
+# ----------------- Health -----------------
 @router.get("/health")
 async def health(request: Request):
     pool: asyncpg.Pool = request.app.state.pool
@@ -46,6 +52,8 @@ async def health(request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB error: {e}")
 
+
+# ----------------- Preferences -----------------
 @router.get("/preferences/me")
 async def get_my_preferences(request: Request):
     uid = _require_user(request)
@@ -82,6 +90,7 @@ async def get_my_preferences(request: Request):
     for key in ("preferred_categories", "excluded_positions", "preferred_leagues", "preferred_nations"):
         d[key] = d.get(key) or []
     return d
+
 
 @router.put("/preferences/me")
 async def update_my_preferences(payload: PreferencesUpdate, request: Request):
@@ -154,6 +163,8 @@ async def update_my_preferences(payload: PreferencesUpdate, request: Request):
         )
     return {"ok": True, "preferences": base}
 
+
+# ----------------- Suggestions -----------------
 @router.get("/suggestions")
 async def list_suggestions(
     request: Request,
@@ -165,6 +176,7 @@ async def list_suggestions(
     limit: int = Query(50, ge=1, le=200),
     mine: bool = Query(False),
 ):
+    """Return cached Smart Buy suggestions filtered by query."""
     uid = request.session.get("user_id") if mine else None
     pool: asyncpg.Pool = request.app.state.pool
 
@@ -195,10 +207,22 @@ async def list_suggestions(
     """
     params.append(limit)
 
+    pool: asyncpg.Pool = request.app.state.pool
     async with pool.acquire() as conn:
         rows = await conn.fetch(sql, *params)
     return {"items": [dict(r) for r in rows]}
 
+
+@router.post("/suggestions/refresh")
+async def refresh_suggestions_stub():
+    """
+    UI compatibility stub. In the future you can trigger a background refresh here.
+    For now, always returns ok=true so the frontend doesn't show an error.
+    """
+    return {"ok": True}
+
+
+# ----------------- Feedback -----------------
 @router.post("/feedback")
 async def create_feedback(payload: FeedbackCreate, request: Request):
     uid = _require_user(request)
@@ -222,8 +246,13 @@ async def create_feedback(payload: FeedbackCreate, request: Request):
         )
     return {"ok": True}
 
+
+# ----------------- Market state & events -----------------
 @router.get("/market/state")
-async def latest_market_state(request: Request, platform: Optional[Literal["ps", "xbox", "pc"]] = Query(None)):
+async def latest_market_state(
+    request: Request,
+    platform: Optional[Literal["ps", "xbox", "pc"]] = Query(None)
+):
     pool: asyncpg.Pool = request.app.state.pool
     async with pool.acquire() as conn:
         if platform:
@@ -250,6 +279,7 @@ async def latest_market_state(request: Request, platform: Optional[Literal["ps",
         return {"state": None}
     return dict(row)
 
+
 @router.get("/events/upcoming")
 async def upcoming_events(request: Request, limit: int = Query(10, ge=1, le=100)):
     pool: asyncpg.Pool = request.app.state.pool
@@ -270,6 +300,66 @@ async def upcoming_events(request: Request, limit: int = Query(10, ge=1, le=100)
             rows = []
     return {"items": [dict(r) for r in rows]}
 
+
+# ----------------- Combined intelligence (UI expects this) -----------------
+@router.get("/market-intelligence")
+async def market_intelligence(
+    request: Request,
+    platform: Optional[Literal["ps", "xbox", "pc"]] = Query(None),
+    limit: int = Query(5, ge=1, le=20),
+):
+    """
+    Compatibility endpoint expected by the UI.
+    Bundles latest market state + upcoming events.
+    """
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        # latest market state
+        if platform:
+            state_row = await conn.fetchrow(
+                """
+                SELECT id, platform, state, confidence_score, detected_at, indicators
+                FROM market_states
+                WHERE platform = $1
+                ORDER BY detected_at DESC
+                LIMIT 1
+                """,
+                platform,
+            )
+        else:
+            state_row = await conn.fetchrow(
+                """
+                SELECT id, platform, state, confidence_score, detected_at, indicators
+                FROM market_states
+                ORDER BY detected_at DESC
+                LIMIT 1
+                """
+            )
+
+        # upcoming events (best effort)
+        try:
+            events = await conn.fetch(
+                """
+                SELECT id, name, event_type, expected_date, actual_date, impact_level,
+                       affected_categories, description, created_at
+                FROM market_events
+                WHERE expected_date IS NULL OR expected_date >= NOW()
+                ORDER BY COALESCE(expected_date, NOW()) ASC
+                LIMIT $1
+                """,
+                limit,
+            )
+        except Exception:
+            events = []
+
+    return {
+        "state": dict(state_row) if state_row else None,
+        "events": [dict(e) for e in events],
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# ----------------- Maintenance -----------------
 @router.post("/maintenance/cleanup-expired")
 async def cleanup_expired(request: Request):
     pool: asyncpg.Pool = request.app.state.pool
@@ -277,6 +367,7 @@ async def cleanup_expired(request: Request):
         try:
             await conn.execute("SELECT cleanup_expired_suggestions()")
         except Exception:
+            # Fallback if the function doesn't exist
             await conn.execute(
                 "DELETE FROM smart_buy_suggestions WHERE expires_at IS NOT NULL AND expires_at < NOW() - INTERVAL '1 day'"
             )
