@@ -31,7 +31,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from pydantic import BaseModel
 
 from app.services.price_history import get_price_history
-from app.services.prices import get_player_price
+# from app.services.prices import get_player_price  # (optional; not used directly here)
 
 # ✅ Trade Finder router
 from app.routers.trade_finder import router as trade_finder_router
@@ -161,8 +161,8 @@ def parse_coin_amount(v) -> int:
     if isinstance(v, (int, float)):
         return int(round(float(v)))
     s = str(v).strip().lower()
-    s = re.sub(r"[\s_]", "", s)
-    s = re.sub(r"(?<=\d)[,\.](?=\d{3}\b)", "", s)
+    s = re.sub(r"[\\s_]", "", s)
+    s = re.sub(r"(?<=\\d)[,\\.](?=\\d{3}\\b)", "", s)
     s = s.replace(",", ".")
     if s.endswith("kk"):
         try: return int(round(float(s[:-2]) * 1_000_000))
@@ -191,7 +191,7 @@ def next_daily_london_hour(hour: int = 18) -> datetime:
     if tgt <= ln:
         tgt = tgt + timedelta(days=1)
     return tgt.astimezone(UTC)
-def is_within_quiet_hours(dt: datetime, quiet_start: Optional[datetime.time], quiet_end: Optional[datetime.time]) -> bool:
+def is_within_quiet_hours(dt: datetime, quiet_start: Optional[dt_time], quiet_end: Optional[dt_time]) -> bool:
     if not quiet_start or not quiet_end:
         return False
     t = dt.astimezone(LONDON).time()
@@ -200,10 +200,6 @@ def is_within_quiet_hours(dt: datetime, quiet_start: Optional[datetime.time], qu
     return t >= quiet_start or t < quiet_end
 
 # ================== FUT.GG PRICE FETCH ==================
-FUTGG_BASE = "https://www.fut.gg/api/fut/player-prices/25"
-PRICE_CACHE_TTL = 5  # seconds
-_price_cache: Dict[str, Dict[str, Any]] = {}
-
 async def fetch_price(card_id: int, platform: str) -> Dict[str, Any]:
     platform = (platform or "").lower()
     key = f"{card_id}|{platform}"
@@ -259,7 +255,7 @@ async def lifespan(app: FastAPI):
 
     # ------- Core schema -------
     async with pool.acquire() as conn:
-        await conn.execute("""
+        await conn.execute(\"\"\"
             CREATE TABLE IF NOT EXISTS usersettings (
                 id SERIAL PRIMARY KEY,
                 user_id VARCHAR(255) UNIQUE NOT NULL,
@@ -271,12 +267,12 @@ async def lifespan(app: FastAPI):
                 date_format VARCHAR(10) DEFAULT 'US',
                 include_tax_in_profit BOOLEAN DEFAULT true,
                 default_chart_range VARCHAR(10) DEFAULT '30d',
-                visible_widgets JSONB DEFAULT '["profit", "tax", "balance", "trades"]',
+                visible_widgets JSONB DEFAULT '[\"profit\", \"tax\", \"balance\", \"trades\"]',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-        """)
-        await conn.execute("""
+        \"\"\")
+        await conn.execute(\"\"\"
             CREATE TABLE IF NOT EXISTS user_profiles (
                 id SERIAL PRIMARY KEY,
                 user_id VARCHAR(255) UNIQUE NOT NULL,
@@ -286,8 +282,8 @@ async def lifespan(app: FastAPI):
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-        """)
-        await conn.execute("""
+        \"\"\")
+        await conn.execute(\"\"\"
             CREATE TABLE IF NOT EXISTS trading_goals (
                 id SERIAL PRIMARY KEY,
                 user_id VARCHAR(255) NOT NULL,
@@ -299,15 +295,15 @@ async def lifespan(app: FastAPI):
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 completed_at TIMESTAMP
             )
-        """)
-        await conn.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS trade_id BIGINT")
-        await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS trades_user_trade_uidx ON trades (user_id, trade_id)")
-        await conn.execute("DROP INDEX IF EXISTS idx_trades_date")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_user_ts ON trades(user_id, timestamp)")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_tag ON trades(user_id, tag)")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_platform ON trades(user_id, platform)")
+        \"\"\")
+        await conn.execute(\"\"\"ALTER TABLE trades ADD COLUMN IF NOT EXISTS trade_id BIGINT\"\"\")
+        await conn.execute(\"\"\"CREATE UNIQUE INDEX IF NOT EXISTS trades_user_trade_uidx ON trades (user_id, trade_id)\"\"\")
+        await conn.execute(\"\"\"DROP INDEX IF EXISTS idx_trades_date\"\"\")
+        await conn.execute(\"\"\"CREATE INDEX IF NOT EXISTS idx_trades_user_ts ON trades(user_id, timestamp)\"\"\")
+        await conn.execute(\"\"\"CREATE INDEX IF NOT EXISTS idx_trades_tag ON trades(user_id, tag)\"\"\")
+        await conn.execute(\"\"\"CREATE INDEX IF NOT EXISTS idx_trades_platform ON trades(user_id, platform)\"\"\")
         # Backfill trade_id
-        await conn.execute("""
+        await conn.execute(\"\"\"
             WITH to_fix AS (
               SELECT ctid, user_id,
                      ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY timestamp, player) AS rn
@@ -318,8 +314,8 @@ async def lifespan(app: FastAPI):
                SET trade_id = ((EXTRACT(EPOCH FROM NOW())*1000)::bigint) + tf.rn
             FROM to_fix tf
             WHERE t.ctid = tf.ctid AND t.trade_id IS NULL
-        """)
-        await conn.execute("""
+        \"\"\")
+        await conn.execute(\"\"\"
             CREATE TABLE IF NOT EXISTS fut_trades (
               id           BIGSERIAL PRIMARY KEY,
               discord_id   TEXT NOT NULL,
@@ -331,10 +327,10 @@ async def lifespan(app: FastAPI):
               ts           TIMESTAMP WITH TIME ZONE NOT NULL,
               source       TEXT DEFAULT 'webapp'
             )
-        """)
-        await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS fut_trades_uidx ON fut_trades (discord_id, trade_id)")
+        \"\"\")
+        await conn.execute(\"\"\"CREATE UNIQUE INDEX IF NOT EXISTS fut_trades_uidx ON fut_trades (discord_id, trade_id)\"\"\")
 
-        await conn.execute("""
+        await conn.execute(\"\"\"
         CREATE TABLE IF NOT EXISTS events (
           id BIGSERIAL PRIMARY KEY,
           name TEXT NOT NULL,
@@ -344,13 +340,13 @@ async def lifespan(app: FastAPI):
           confidence TEXT NOT NULL DEFAULT 'heuristic',
           source TEXT NOT NULL DEFAULT 'rule:18:00',
           created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        )""")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_events_start ON events(start_at)")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind)")
+        )\"\"\")
+        await conn.execute(\"\"\"CREATE INDEX IF NOT EXISTS idx_events_start ON events(start_at)\"\"\")
+        await conn.execute(\"\"\"CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind)\"\"\")
 
     # ------- Watchlist + Alerts schema (watchlist_pool) -------
     async with watchlist_pool.acquire() as wconn:
-        await wconn.execute("""
+        await wconn.execute(\"\"\"
             CREATE TABLE IF NOT EXISTS watchlist (
               id SERIAL PRIMARY KEY,
               user_id TEXT NOT NULL,
@@ -364,14 +360,14 @@ async def lifespan(app: FastAPI):
               last_checked TIMESTAMP,
               notes TEXT
             )
-        """)
-        await wconn.execute("CREATE INDEX IF NOT EXISTS idx_watchlist_user ON watchlist(user_id)")
-        await wconn.execute("""
+        \"\"\")
+        await wconn.execute(\"\"\"CREATE INDEX IF NOT EXISTS idx_watchlist_user ON watchlist(user_id)\"\"\")
+        await wconn.execute(\"\"\"
             CREATE UNIQUE INDEX IF NOT EXISTS idx_watchlist_unique
             ON watchlist(user_id, card_id, platform)
-        """)
+        \"\"\")
 
-        await wconn.execute("""
+        await wconn.execute(\"\"\"
         CREATE TABLE IF NOT EXISTS watchlist_alerts (
           id BIGSERIAL PRIMARY KEY,
           user_id TEXT NOT NULL,
@@ -389,11 +385,11 @@ async def lifespan(app: FastAPI):
           fallback_channel_id TEXT,
           last_alert_at TIMESTAMPTZ,
           created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        )""")
-        await wconn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_user ON watchlist_alerts(user_id)")
-        await wconn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_pair ON watchlist_alerts(card_id, platform)")
+        )\"\"\")
+        await wconn.execute(\"\"\"CREATE INDEX IF NOT EXISTS idx_alerts_user ON watchlist_alerts(user_id)\"\"\")
+        await wconn.execute(\"\"\"CREATE INDEX IF NOT EXISTS idx_alerts_pair ON watchlist_alerts(card_id, platform)\"\"\")
 
-        await wconn.execute("""
+        await wconn.execute(\"\"\"
         CREATE TABLE IF NOT EXISTS alerts_log (
           id BIGSERIAL PRIMARY KEY,
           user_id TEXT NOT NULL,
@@ -406,8 +402,8 @@ async def lifespan(app: FastAPI):
           ref_mode TEXT NOT NULL,
           ref_price NUMERIC,
           sent_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        )""")
-        await wconn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_user_time ON alerts_log(user_id, sent_at)")
+        )\"\"\")
+        await wconn.execute(\"\"\"CREATE INDEX IF NOT EXISTS idx_alerts_user_time ON alerts_log(user_id, sent_at)\"\"\")
 
     # Start alerts loop
     _watchlist_task = asyncio.create_task(_alerts_poll_loop())
@@ -439,7 +435,7 @@ app.add_middleware(
         "http://localhost:5173",
         "http://localhost:3000",
     ],
-    allow_origin_regex=r"^(https://.*\.railway\.app|chrome-extension://.*)$",
+    allow_origin_regex=r"^(https://.*\\.railway\\.app|chrome-extension://.*)$",
     allow_credentials=True,
     allow_methods=["GET","POST","PUT","PATCH","DELETE","OPTIONS"],
     allow_headers=["Authorization","Content-Type","X-Requested-With","Accept"],
@@ -495,10 +491,6 @@ async def check_server_membership(user_id: str) -> bool:
     except Exception:
         return False
 
-JWT_PRIVATE_KEY = os.getenv("JWT_PRIVATE_KEY", "dev-secret-change-me")
-JWT_ISSUER = os.getenv("JWT_ISSUER", "fut-dashboard")
-JWT_TTL_SECONDS = int(os.getenv("JWT_TTL_SECONDS", "2592000"))
-
 def issue_extension_token(discord_id: str) -> str:
     now = int(time.time())
     payload = {"sub": discord_id, "scope": "trade:ingest", "iat": now, "exp": now + JWT_TTL_SECONDS, "iss": JWT_ISSUER}
@@ -514,13 +506,13 @@ def require_extension_jwt(request: Request):
     except Exception as e:
         raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
     return SimpleNamespace(discord_id=payload.get("sub"))
-    
-    # --------- EXTENSION ROUTER ---------
+
+# --------- EXTENSION ROUTER ---------
 ext_router = APIRouter()
 
 @ext_router.get("/ext/ping")
 async def ext_ping(auth = Depends(require_extension_jwt)):
-    """Sanity check for the extension – proves the JWT is valid."""
+    \"\"\"Sanity check for the extension – proves the JWT is valid.\"\"\"
     return {"ok": True, "sub": auth.discord_id}
 
 @ext_router.post("/ext/trades")
@@ -529,15 +521,15 @@ async def ext_add_trade(
     auth = Depends(require_extension_jwt),
     conn = Depends(get_db),
 ):
-    """
+    \"\"\"
     Ingest a sold item from the Chrome extension.
     The extension must send Authorization: Bearer <token> (issued during OAuth).
-    """
+    \"\"\"
     discord_id = auth.discord_id or "unknown"
     ts = datetime.fromtimestamp(int(sale.timestamp_ms) / 1000, tz=timezone.utc)
 
     # 1) Raw log into fut_trades (idempotent per discord_id + trade_id)
-    await conn.execute("""
+    await conn.execute(\"\"\"
         INSERT INTO fut_trades (discord_id, trade_id, player_name, card_version, buy_price, sell_price, ts, source)
         VALUES ($1,$2,$3,$4,$5,$6,$7,'webapp')
         ON CONFLICT (discord_id, trade_id)
@@ -547,7 +539,7 @@ async def ext_add_trade(
             buy_price    = COALESCE(EXCLUDED.buy_price, fut_trades.buy_price),
             sell_price   = EXCLUDED.sell_price,
             ts           = EXCLUDED.ts
-    """, discord_id, int(sale.trade_id), sale.player_name, sale.card_version, sale.buy_price, sale.sell_price, ts)
+    \"\"\", discord_id, int(sale.trade_id), sale.player_name, sale.card_version, sale.buy_price, sale.sell_price, ts)
 
     # 2) Mirror into main trades so the dashboard shows it immediately
     player   = sale.player_name
@@ -560,7 +552,7 @@ async def ext_add_trade(
     ea_tax   = int(round(sell * qty * 0.05))
     profit   = (sell - buy) * qty
 
-    await conn.execute("""
+    await conn.execute(\"\"\"
         INSERT INTO trades (
             user_id, player, version, buy, sell, quantity, platform, profit, ea_tax, tag, notes, timestamp, trade_id
         )
@@ -575,18 +567,13 @@ async def ext_add_trade(
             platform  = EXCLUDED.platform,
             tag       = EXCLUDED.tag,
             timestamp = EXCLUDED.timestamp
-    """, discord_id, player, version, buy, sell, qty, platform,
+    \"\"\", discord_id, player, version, buy, sell, qty, platform,
          profit, ea_tax, tag, "", ts, int(sale.trade_id))
 
     return {"ok": True}
 
-# mount it
-app = FastAPI(lifespan=lifespan)
-if trade_finder_router:
-    app.include_router(trade_finder_router, prefix="/api")
-if smart_buy_router:
-    app.include_router(smart_buy_router, prefix="/api")
-app.include_router(ext_router)
+# Mount extension routes once
+app.include_router(ext_router, prefix="/api")
 
 # ================== ALERTS & POLLING ==================
 async def _send_discord_dm(user_discord_id: str, content: str) -> bool:
@@ -622,8 +609,8 @@ async def _send_channel_fallback(channel_id: Optional[str], content: str) -> boo
 def _fmt_alert(name: str, platform: str, direction: str, pct: float, price: float, ref_mode: str, ref_price: Optional[float]) -> str:
     arrow = "📈" if direction == "rise" else "📉"
     rp = f"{int(ref_price):,}c" if isinstance(ref_price, (int, float)) else "—"
-    return (f"{arrow} Watchlist Alert • {name} ({platform.upper()})\n"
-            f"Current: {int(price):,}c • Change: {pct:+.2f}%\n"
+    return (f"{arrow} Watchlist Alert • {name} ({platform.upper()})\\n"
+            f"Current: {int(price):,}c • Change: {pct:+.2f}%\\n"
             f"Ref: {rp} ({ref_mode})")
 
 async def _ref_price_for_alert(row: asyncpg.Record) -> Optional[float]:
@@ -728,8 +715,8 @@ async def _poll_pair_once(card_id: int, platform: str):
             logging.info("sent %s alerts for %s/%s", n, card_id, platform)
     except Exception as e:
         logging.debug("poll pair error: %s", e)
-        
-        # ================== BASIC ROUTES ==================
+
+# ================== BASIC ROUTES ==================
 @app.get("/")
 async def root():
     return {"message": "FUT Dashboard API", "status": "healthy"}
@@ -883,7 +870,7 @@ async def get_current_user_info(request: Request):
 @app.get("/api/settings")
 async def get_user_settings(user_id: str = Depends(get_current_user), conn=Depends(get_db)):
     try:
-        settings_row = await conn.fetchrow("""
+        settings_row = await conn.fetchrow(\"\"\"
             SELECT 
                 default_platform, 
                 custom_tags, 
@@ -896,7 +883,7 @@ async def get_user_settings(user_id: str = Depends(get_current_user), conn=Depen
                 visible_widgets
             FROM usersettings 
             WHERE user_id = $1
-        """, user_id)
+        \"\"\", user_id)
         
         if settings_row:
             return {
@@ -920,7 +907,7 @@ async def get_user_settings(user_id: str = Depends(get_current_user), conn=Depen
 async def update_user_settings(settings: UserSettings, user_id: str = Depends(get_current_user), conn=Depends(get_db)):
     try:
         await conn.execute(
-            """
+            \"\"\"
             INSERT INTO usersettings (
                 user_id, default_platform, custom_tags, currency_format, theme, 
                 timezone, date_format, include_tax_in_profit, default_chart_range, 
@@ -939,7 +926,7 @@ async def update_user_settings(settings: UserSettings, user_id: str = Depends(ge
                 default_chart_range = EXCLUDED.default_chart_range,
                 visible_widgets = EXCLUDED.visible_widgets,
                 updated_at = NOW()
-            """,
+            \"\"\",
             user_id,
             settings.default_platform,
             json.dumps(settings.custom_tags),
@@ -966,7 +953,7 @@ async def add_watch_item(payload: WatchlistCreate, user_id: str = Depends(get_cu
             start_price = live["price"] if isinstance(live["price"], int) else 0
 
             row = await conn.fetchrow(
-                """
+                \"\"\"
                 INSERT INTO watchlist (
                     user_id, card_id, player_name, version, platform, started_price, last_price, last_checked, notes
                 )
@@ -978,7 +965,7 @@ async def add_watch_item(payload: WatchlistCreate, user_id: str = Depends(get_cu
                       last_price=EXCLUDED.last_price,
                       last_checked=NOW()
                 RETURNING id
-                """,
+                \"\"\",
                 user_id,
                 payload.card_id,
                 payload.player_name,
@@ -1011,11 +998,11 @@ async def list_watch_items(user_id: str = Depends(get_current_user)):
 
             async with player_pool.acquire() as pconn:
                 meta_rows = await pconn.fetch(
-                    """
+                    \"\"\"
                     SELECT card_id, name, rating, club, nation
                     FROM fut_players
                     WHERE card_id = ANY($1::text[])
-                    """,
+                    \"\"\",
                     card_ids,
                 )
 
@@ -1098,11 +1085,11 @@ async def refresh_watch_item(watch_id: int, user_id: str = Depends(get_current_u
 
             async with player_pool.acquire() as pconn:
                 meta = await pconn.fetchrow(
-                    """
+                    \"\"\"
                     SELECT card_id, name, rating, club, nation
                     FROM fut_players
                     WHERE card_id = $1::text
-                    """,
+                    \"\"\",
                     str(w["card_id"]),
                 )
             meta_dict = dict(meta) if meta else {}
@@ -1152,10 +1139,10 @@ async def create_watchlist_alert(payload: WatchlistAlertCreate, user_id: str = D
         try: qe = datetime.strptime(payload.quiet_end, "%H:%M").time()
         except: qe = None
     async with watchlist_pool.acquire() as w:
-        await w.execute("""
+        await w.execute(\"\"\"
             INSERT INTO watchlist_alerts (user_id, user_discord_id, card_id, platform, ref_mode, ref_price, rise_pct, fall_pct, cooloff_minutes, quiet_start, quiet_end, prefer_dm, fallback_channel_id)
             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
-        """, user_id, user_id, int(payload.card_id), payload.platform.lower(),
+        \"\"\", user_id, user_id, int(payload.card_id), payload.platform.lower(),
            payload.ref_mode or "last_close", payload.ref_price, payload.rise_pct or 5, payload.fall_pct or 5,
            payload.cooloff_minutes or 30, qs, qe, bool(payload.prefer_dm), payload.fallback_channel_id)
     return {"ok": True}
@@ -1257,13 +1244,13 @@ async def add_trade(request: Request, user_id: str = Depends(get_current_user), 
     ea_tax = int(round(sell * quantity * 0.05))
 
     row = await conn.fetchrow(
-        """
+        \"\"\"
         INSERT INTO trades (
             user_id, player, version, buy, sell, quantity, platform, profit, ea_tax, tag, notes, timestamp, trade_id
         )
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW(),$12)
         RETURNING player, version, buy, sell, quantity, platform, profit, ea_tax, tag, notes, timestamp, trade_id
-        """,
+        \"\"\",
         user_id,
         (data["player"] or "").strip(),
         (data["version"] or "").strip(),
@@ -1300,13 +1287,13 @@ async def update_trade(trade_id: int, payload: TradeUpdate, user_id: str = Depen
         fields.append(f"{col} = ${len(values)+1}")
         values.append(val)
 
-    q = f"""
+    q = f\"\"\"
         UPDATE trades
            SET {', '.join(fields)}
          WHERE trade_id = ${len(values)+1}
            AND user_id  = ${len(values)+2}
      RETURNING player, version, quantity, buy, sell, platform, tag, notes, ea_tax, profit, timestamp, trade_id
-    """
+    \"\"\"
     values.extend([trade_id, user_id])
     row = await conn.fetchrow(q, *values)
     if not row:
@@ -1319,14 +1306,14 @@ async def update_trade(trade_id: int, payload: TradeUpdate, user_id: str = Depen
     profit = (sell - buy) * qty
 
     row2 = await conn.fetchrow(
-        """
+        \"\"\"
         UPDATE trades
            SET ea_tax = $1,
                profit = $2
          WHERE trade_id = $3
            AND user_id  = $4
      RETURNING player, version, quantity, buy, sell, platform, tag, notes, ea_tax, profit, timestamp, trade_id
-        """,
+        \"\"\",
         ea_tax, profit, trade_id, user_id
     )
     return dict(row2)
@@ -1420,10 +1407,10 @@ async def import_trades(file: UploadFile = File(...), user_id: str = Depends(get
             ea_tax = int(round(sell * quantity * 0.05))
 
             await conn.execute(
-                """
+                \"\"\"
                 INSERT INTO trades (user_id, player, version, buy, sell, quantity, platform, profit, ea_tax, tag, timestamp)
                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
-                """,
+                \"\"\",
                 user_id, player, version, buy, sell, quantity, platform, profit, ea_tax, tag,
             )
             imported_count += 1
@@ -1459,30 +1446,30 @@ async def search_players(q: str = "", pos: Optional[str] = None):
             if p:
                 params.append(p)
                 idx = len(params)
-                where.append(f"""
+                where.append(f\"\"\"
                 (
                   UPPER(position) = ${idx}
                   OR (
                     COALESCE(altposition, '') <> ''
                     AND EXISTS (
                       SELECT 1
-                      FROM regexp_split_to_table(altposition, '[,;/|\\s]+') ap
+                      FROM regexp_split_to_table(altposition, '[,;/|\\\\s]+') ap
                       WHERE UPPER(TRIM(ap)) = ${idx}
                     )
                   )
                 )
-                """)
+                \"\"\")
 
             if not where:
                 return {"players": []}
 
-            sql = f"""
+            sql = f\"\"\"
                 SELECT card_id, name, rating, version, image_url, club, league, nation, position, altposition, price
                 FROM fut_players
                 WHERE {' AND '.join(where)}
                 ORDER BY rating DESC NULLS LAST, name ASC
                 LIMIT 50
-            """
+            \"\"\"
 
             rows = await conn.fetch(sql, *params)
 
@@ -1514,15 +1501,6 @@ async def debug_session(req: Request):
     }
 
 # ================== TRENDING / COMPARE ==================
-MOMENTUM_BASE = "https://www.fut.gg/players/momentum"
-MOMENTUM_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-GB,en;q=0.9",
-    "Referer": "https://www.fut.gg/",
-}
-_CARD_HREF_RE = re.compile(r"/players/(\d+)-[a-z0-9-]+/25-(\d+)/?", re.IGNORECASE)
-
 def _norm_tf(tf: Optional[str]) -> str:
     if not tf:
         return "24"
@@ -1557,7 +1535,7 @@ def _parse_last_page_number(html: str) -> int:
                 nums.append(int(t))
     return max(nums) if nums else 1
 
-def _extract_items(html: str) -> list[dict]:
+def _extract_items(html: str) -> List[Dict[str, Any]]:
     soup = BeautifulSoup(html, "html.parser")
     tiles = []
     for a in soup.find_all("a", href=True):
@@ -1574,8 +1552,8 @@ def _extract_items(html: str) -> list[dict]:
                 break
             node = node.parent
 
-    items = []
-    pct_re = re.compile(r"([+\-]?\s?\d+(?:\.\d+)?)\s*%")
+    items: List[Dict[str, Any]] = []
+    pct_re = re.compile(r"([+\\-]?\\s?\\d+(?:\\.\\d+)?)\\s*%")
     seen = set()
     for cid, text in tiles:
         if cid in seen:
@@ -1591,7 +1569,7 @@ def _extract_items(html: str) -> list[dict]:
             continue
     return items
 
-async def _momentum_page_items(tf: str, page: int) -> tuple[list[dict], str]:
+async def _momentum_page_items(tf: str, page: int) -> Tuple[List[Dict[str, Any]], str]:
     html = await _fetch_momentum_page(tf, page)
     return _extract_items(html), html
 
@@ -1604,7 +1582,7 @@ def _cmp_window(points: List[Dict[str, Any]], hours: int) -> List[Dict[str, Any]
     cutoff = _cmp_now_ms() - hours * 60 * 60 * 1000
     return [p for p in points if int(p.get("t", 0)) >= cutoff]
 
-def _cmp_chg_pct(points: List[Dict[str, Any]]) -> Optional[float]]:
+def _cmp_chg_pct(points: List[Dict[str, Any]]) -> Optional[float]:
     if len(points) < 2:
         return None
     first = points[0].get("price")
@@ -1631,6 +1609,13 @@ def _cmp_platform(p: str) -> str:
     if p in ("pc", "origin"):
         return "pc"
     return "ps"
+
+# Safe stubs; replace with real implementations later if needed
+async def _cmp_price_range_via_futgg(card_id: str) -> Dict[str, Optional[int]]:
+    return {"min": None, "max": None}
+
+async def _cmp_recent_sales_futbin(card_id: str, platform: str) -> List[Dict[str, Any]]:
+    return []
 
 @app.get("/api/trending")
 async def api_trending(type: Literal["risers","fallers"], tf: Optional[str] = "24"):
@@ -1701,16 +1686,15 @@ async def player_compare(
 
     async with player_pool.acquire() as pconn:
         meta_rows = await pconn.fetch(
-            """
+            \"\"\"
             SELECT card_id, name, rating, position, league, nation, club, image_url
             FROM fut_players
             WHERE card_id = ANY($1::text[])
-            """,
+            \"\"\",
             raw_ids,
         )
     meta = {str(r["card_id"]): dict(r) for r in meta_rows}
 
-    # util funcs reused from trending section: _cmp_window/_cmp_chg_pct/_cmp_low_high, _cmp_price_range_via_futgg, _cmp_recent_sales_futbin
     players_out: List[Dict[str, Any]] = []
     for cid_str in raw_ids:
         m = meta.get(cid_str, {})
@@ -1775,139 +1759,6 @@ async def player_compare(
 
     return {"players": players_out}
 
-# ================== EVENTS / ANALYTICS / PRICE HISTORY / BACKTEST ==================
-@app.get("/api/events/next")
-async def next_event():
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT name, kind, start_at, confidence FROM events WHERE start_at > $1 ORDER BY start_at ASC LIMIT 1",
-            now_utc()
-        )
-    if row:
-        return {"name": row["name"], "kind": row["kind"], "start_at": row["start_at"].isoformat(), "confidence": row.get("confidence", "heuristic")}
-    nxt = next_daily_london_hour(18)
-    return {"name": "Daily Content Drop", "kind": "promo", "start_at": nxt.isoformat(), "confidence": "heuristic"}
-
-@app.get("/api/analytics/advanced")
-async def get_advanced_analytics(user_id: str = Depends(get_current_user), conn=Depends(get_db)):
-    daily_profits = await conn.fetch(
-        """
-        SELECT DATE(timestamp) as date, COALESCE(SUM(profit), 0) as daily_profit, COUNT(*) as trades_count
-        FROM trades WHERE user_id=$1 AND timestamp >= NOW() - INTERVAL '30 days'
-        GROUP BY DATE(timestamp) ORDER BY date
-        """,
-        user_id,
-    )
-    tag_performance = await conn.fetch(
-        """
-        SELECT tag, COUNT(*) as trade_count, COALESCE(SUM(profit), 0) as total_profit,
-               COALESCE(AVG(profit), 0) as avg_profit,
-               COUNT(CASE WHEN profit > 0 THEN 1 END) * 100.0 / COUNT(*) as win_rate
-        FROM trades WHERE user_id=$1 AND tag IS NOT NULL AND tag != ''
-        GROUP BY tag ORDER BY total_profit DESC
-        """,
-        user_id,
-    )
-    platform_stats = await conn.fetch(
-        """
-        SELECT platform, COUNT(*) as trade_count, COALESCE(SUM(profit), 0) as total_profit,
-               COALESCE(AVG(profit), 0) as avg_profit
-        FROM trades WHERE user_id=$1 GROUP BY platform
-        """,
-        user_id,
-    )
-    monthly_summary = await conn.fetch(
-        """
-        SELECT DATE_TRUNC('month', timestamp) as month, COUNT(*) as trades_count,
-               COALESCE(SUM(profit), 0) as total_profit, COALESCE(SUM(ea_tax), 0) as total_tax
-        FROM trades WHERE user_id=$1
-        GROUP BY DATE_TRUNC('month', timestamp) ORDER BY month DESC LIMIT 12
-        """,
-        user_id,
-    )
-    return {
-        "daily_profits": [dict(r) for r in daily_profits],
-        "tag_performance": [dict(r) for r in tag_performance],
-        "platform_stats": [dict(r) for r in platform_stats],
-        "monthly_summary": [dict(r) for r in monthly_summary],
-    }
-
-@app.get("/api/price-history")
-async def price_history(playerId: int, platform: str = "ps", tf: str = "today"):
-    if playerId <= 0:
-        raise HTTPException(status_code=400, detail="playerId must be a positive integer")
-    try:
-        return await get_price_history(playerId, platform, tf)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Upstream error: {e}")
-
-@app.post("/api/backtest")
-async def backtest(payload: Dict[str, Any]):
-    players: List[int] = payload.get("players") or []
-    platform: str = payload.get("platform", "ps")
-    window_days: int = int(payload.get("window_days", 7))
-    entry = payload.get("entry", {"type":"dip_from_high","x_pct":5})
-    exit_ = payload.get("exit", {"tp_pct":7,"sl_pct":4,"max_hold_h":24})
-    size = payload.get("size", {"coins":200000})
-    concurrency = int(payload.get("concurrency", 3))
-
-    if not players:
-        raise HTTPException(400, "players required")
-
-    def norm_series(hist: List[dict]) -> List[Tuple[int, float]]:
-        out = []
-        for p in hist:
-            t = p.get("t") or p.get("ts") or p.get("time")
-            v = p.get("price") or p.get("v") or p.get("y")
-            if t is not None and v is not None:
-                out.append((int(t), float(v)))
-        return out
-
-    equity = []; all_trades = []; cash = 0.0; open_trades = []
-    for pid in players:
-        hist = await get_price_history(pid, platform, "today")
-        pts = norm_series(hist)[-(window_days*96):]
-        if len(pts) < 16: 
-            continue
-        recent_high = max(v for _,v in pts[:8])
-        for i in range(8, len(pts)):
-            t, px = pts[i]
-            if px > recent_high: recent_high = px
-            # exits
-            keep = []
-            for tr in open_trades:
-                tp = tr["entry_price"]*(1+exit_.get("tp_pct",7)/100.0)
-                sl = tr["entry_price"]*(1-exit_.get("sl_pct",4)/100.0)
-                hold_h = (t - tr["t_in"]) / 3600000.0
-                reason = None
-                if px >= tp: reason="tp"
-                elif px <= sl: reason="sl"
-                elif hold_h >= exit_.get("max_hold_h",24): reason="time"
-                if reason:
-                    pnl = (px - tr["entry_price"]) * tr["qty"]
-                    pnl_after_tax = pnl * 0.95
-                    all_trades.append({**tr, "t_out": t, "px_out": px, "exit": reason, "pnl_after_tax": pnl_after_tax})
-                    cash += pnl_after_tax
-                else:
-                    keep.append(tr)
-            open_trades = keep
-            # entries
-            if len(open_trades) < concurrency and entry.get("type") == "dip_from_high":
-                x = entry.get("x_pct", 5)
-                if recent_high > 0 and ((recent_high - px)/recent_high)*100 >= x:
-                    qty = max(1, int(size.get("coins",200000) // px))
-                    open_trades.append({"player_id": pid, "t_in": t, "px_in": px, "entry_price": px, "qty": qty})
-            equity.append({"t": t, "value": cash + sum((px - tr["entry_price"]) * tr["qty"] * 0.95 for tr in open_trades)})
-
-    wins = [tr for tr in all_trades if tr["pnl_after_tax"] > 0]
-    summary = {
-        "trades": len(all_trades),
-        "net_profit": round(sum(tr["pnl_after_tax"] for tr in all_trades), 2),
-        "win_rate": round(100*len(wins)/len(all_trades), 1) if all_trades else 0.0,
-        "avg_hold_h": round(sum(((tr["t_out"]-tr["t_in"])/3600000.0) for tr in all_trades)/len(all_trades), 2) if all_trades else 0.0,
-    }
-    return {"equity": equity, "summary": summary, "trades": all_trades}
-
 # ================== FUT.GG PROXIES ==================
 @app.get("/api/fut-player-definition/{card_id}")
 async def get_player_definition(card_id: str):
@@ -1950,9 +1801,6 @@ async def get_player_price_proxy(card_id: str):
     except Exception as e:
         logging.error(f"Player price fetch error: {e}")
         return {"error": str(e)}
-
-# Make sure extension routes are mounted under /api
-app.include_router(ext_router, prefix="/api")
 
 # ================== ENTRYPOINT ==================
 if __name__ == "__main__":
