@@ -8,21 +8,12 @@ from pydantic import BaseModel
 
 router = APIRouter(prefix="/smart-buy", tags=["Smart Buy"])
 
-# ----------------------------
-# Utils
-# ----------------------------
 def _require_user(request: Request) -> str:
     uid = request.session.get("user_id")
     if not uid:
         raise HTTPException(status_code=401, detail="Not authenticated")
     return uid
 
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-# ----------------------------
-# Models
-# ----------------------------
 class PreferencesUpdate(BaseModel):
     default_budget: Optional[int] = None
     risk_tolerance: Optional[Literal["conservative", "moderate", "aggressive"]] = None
@@ -45,17 +36,6 @@ class FeedbackCreate(BaseModel):
     actual_profit: Optional[int] = None
     suggestion_id: Optional[int] = None
 
-class SuggestionsQuery(BaseModel):
-    platform: Optional[Literal["ps", "xbox", "pc"]] = None
-    suggestion_type: Optional[str] = None
-    risk_level: Optional[Literal["low", "medium", "high"]] = None
-    min_confidence: Optional[int] = None
-    only_active: bool = True
-    limit: int = 50
-
-# ----------------------------
-# Health
-# ----------------------------
 @router.get("/health")
 async def health(request: Request):
     pool: asyncpg.Pool = request.app.state.pool
@@ -66,9 +46,6 @@ async def health(request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB error: {e}")
 
-# ----------------------------
-# Preferences
-# ----------------------------
 @router.get("/preferences/me")
 async def get_my_preferences(request: Request):
     uid = _require_user(request)
@@ -85,7 +62,6 @@ async def get_my_preferences(request: Request):
             uid,
         )
     if not row:
-        # Return sensible defaults (must match your table defaults)
         return {
             "user_id": uid,
             "default_budget": 100000,
@@ -103,7 +79,6 @@ async def get_my_preferences(request: Request):
             "updated_at": None,
         }
     d = dict(row)
-    # Ensure JSONB columns come back as lists
     for key in ("preferred_categories", "excluded_positions", "preferred_leagues", "preferred_nations"):
         d[key] = d.get(key) or []
     return d
@@ -112,8 +87,6 @@ async def get_my_preferences(request: Request):
 async def update_my_preferences(payload: PreferencesUpdate, request: Request):
     uid = _require_user(request)
     pool: asyncpg.Pool = request.app.state.pool
-
-    # Fetch current to merge with partial updates
     async with pool.acquire() as conn:
         cur = await conn.fetchrow(
             """
@@ -140,7 +113,6 @@ async def update_my_preferences(payload: PreferencesUpdate, request: Request):
         }
         if cur:
             base.update({k: cur[k] for k in base.keys()})
-
         changes = {k: v for k, v in payload.model_dump(exclude_none=True).items()}
         base.update(changes)
 
@@ -182,9 +154,6 @@ async def update_my_preferences(payload: PreferencesUpdate, request: Request):
         )
     return {"ok": True, "preferences": base}
 
-# ----------------------------
-# Suggestions
-# ----------------------------
 @router.get("/suggestions")
 async def list_suggestions(
     request: Request,
@@ -194,32 +163,25 @@ async def list_suggestions(
     min_confidence: Optional[int] = Query(None, ge=0, le=100),
     only_active: bool = Query(True),
     limit: int = Query(50, ge=1, le=200),
-    mine: bool = Query(False, description="If true, filter to current user_id"),
+    mine: bool = Query(False),
 ):
-    # Optional: allow user to filter to their own suggestions
     uid = request.session.get("user_id") if mine else None
-
     pool: asyncpg.Pool = request.app.state.pool
+
     where = []
     params: List[Any] = []
-
     if platform:
-        where.append(f"platform = ${len(params)+1}")
-        params.append(platform)
+        where.append(f"platform = ${len(params)+1}"); params.append(platform)
     if suggestion_type:
-        where.append(f"suggestion_type = ${len(params)+1}")
-        params.append(suggestion_type)
+        where.append(f"suggestion_type = ${len(params)+1}"); params.append(suggestion_type)
     if risk_level:
-        where.append(f"risk_level = ${len(params)+1}")
-        params.append(risk_level)
+        where.append(f"risk_level = ${len(params)+1}"); params.append(risk_level)
     if min_confidence is not None:
-        where.append(f"confidence_score >= ${len(params)+1}")
-        params.append(int(min_confidence))
+        where.append(f"confidence_score >= ${len(params)+1}"); params.append(int(min_confidence))
     if only_active:
         where.append("(expires_at IS NULL OR expires_at > NOW())")
     if uid:
-        where.append(f"user_id = ${len(params)+1}")
-        params.append(uid)
+        where.append(f"user_id = ${len(params)+1}"); params.append(uid)
 
     clause = f"WHERE {' AND '.join(where)}" if where else ""
     sql = f"""
@@ -235,12 +197,8 @@ async def list_suggestions(
 
     async with pool.acquire() as conn:
         rows = await conn.fetch(sql, *params)
-
     return {"items": [dict(r) for r in rows]}
 
-# ----------------------------
-# Feedback
-# ----------------------------
 @router.post("/feedback")
 async def create_feedback(payload: FeedbackCreate, request: Request):
     uid = _require_user(request)
@@ -264,14 +222,8 @@ async def create_feedback(payload: FeedbackCreate, request: Request):
         )
     return {"ok": True}
 
-# ----------------------------
-# Market snapshot helpers
-# ----------------------------
 @router.get("/market/state")
-async def latest_market_state(
-    request: Request,
-    platform: Optional[Literal["ps", "xbox", "pc"]] = Query(None),
-):
+async def latest_market_state(request: Request, platform: Optional[Literal["ps", "xbox", "pc"]] = Query(None)):
     pool: asyncpg.Pool = request.app.state.pool
     async with pool.acquire() as conn:
         if platform:
@@ -300,7 +252,6 @@ async def latest_market_state(
 
 @router.get("/events/upcoming")
 async def upcoming_events(request: Request, limit: int = Query(10, ge=1, le=100)):
-    # This reads from market_events if you created it via a migration; safe to return empty if not present
     pool: asyncpg.Pool = request.app.state.pool
     async with pool.acquire() as conn:
         try:
@@ -316,18 +267,13 @@ async def upcoming_events(request: Request, limit: int = Query(10, ge=1, le=100)
                 limit,
             )
         except Exception:
-            # Table may not exist if you didn't run the migration; return empty
             rows = []
     return {"items": [dict(r) for r in rows]}
 
-# ----------------------------
-# Maintenance (safe to call)
-# ----------------------------
 @router.post("/maintenance/cleanup-expired")
 async def cleanup_expired(request: Request):
     pool: asyncpg.Pool = request.app.state.pool
     async with pool.acquire() as conn:
-        # Try function first (if you installed it); otherwise inline delete
         try:
             await conn.execute("SELECT cleanup_expired_suggestions()")
         except Exception:
