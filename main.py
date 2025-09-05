@@ -32,6 +32,7 @@ from pydantic import BaseModel
 
 from app.services.price_history import get_price_history
 from app.services.prices import get_player_price
+from app.routers.smart_buy import router as smart_buy_router
 
 # ✅ Trade Finder router
 from app.routers.trade_finder import router as trade_finder_router
@@ -456,6 +457,79 @@ async def lifespan(app: FastAPI):
         )""")
         await wconn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_user_time ON alerts_log(user_id, sent_at)")
 
+# Smart Buy tables
+await conn.execute("""
+    CREATE TABLE IF NOT EXISTS smart_buy_suggestions (
+        id BIGSERIAL PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        card_id TEXT NOT NULL,
+        suggestion_type VARCHAR(50) NOT NULL,
+        current_price INTEGER NOT NULL,
+        target_price INTEGER NOT NULL,
+        expected_profit INTEGER NOT NULL,
+        risk_level VARCHAR(20) NOT NULL,
+        confidence_score INTEGER NOT NULL,
+        priority_score INTEGER NOT NULL,
+        reasoning TEXT NOT NULL,
+        time_to_profit VARCHAR(50),
+        platform VARCHAR(10) NOT NULL,
+        market_state VARCHAR(30) NOT NULL,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        expires_at TIMESTAMP WITH TIME ZONE
+    )
+""")
+await conn.execute("CREATE INDEX IF NOT EXISTS idx_smart_buy_suggestions_user_created ON smart_buy_suggestions(user_id, created_at DESC)")
+await conn.execute("CREATE INDEX IF NOT EXISTS idx_smart_buy_suggestions_card_platform ON smart_buy_suggestions(card_id, platform)")
+
+await conn.execute("""
+    CREATE TABLE IF NOT EXISTS smart_buy_feedback (
+        id BIGSERIAL PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        card_id TEXT NOT NULL,
+        action VARCHAR(20) NOT NULL,
+        notes TEXT,
+        actual_buy_price INTEGER,
+        actual_sell_price INTEGER,
+        actual_profit INTEGER,
+        timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    )
+""")
+await conn.execute("CREATE INDEX IF NOT EXISTS idx_smart_buy_feedback_user_action ON smart_buy_feedback(user_id, action)")
+await conn.execute("CREATE INDEX IF NOT EXISTS idx_smart_buy_feedback_card ON smart_buy_feedback(card_id, action)")
+
+await conn.execute("""
+    CREATE TABLE IF NOT EXISTS market_states (
+        id BIGSERIAL PRIMARY KEY,
+        platform VARCHAR(10) NOT NULL,
+        state VARCHAR(30) NOT NULL,
+        confidence_score INTEGER NOT NULL,
+        detected_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        indicators JSONB
+    )
+""")
+await conn.execute("CREATE INDEX IF NOT EXISTS idx_market_states_platform_detected ON market_states(platform, detected_at DESC)")
+
+await conn.execute("""
+    CREATE TABLE IF NOT EXISTS smart_buy_preferences (
+        id BIGSERIAL PRIMARY KEY,
+        user_id TEXT UNIQUE NOT NULL,
+        default_budget INTEGER DEFAULT 100000,
+        risk_tolerance VARCHAR(20) DEFAULT 'moderate',
+        preferred_time_horizon VARCHAR(20) DEFAULT 'short',
+        preferred_categories JSONB DEFAULT '[]'::jsonb,
+        excluded_positions JSONB DEFAULT '[]'::jsonb,
+        preferred_leagues JSONB DEFAULT '[]'::jsonb,
+        preferred_nations JSONB DEFAULT '[]'::jsonb,
+        min_rating INTEGER DEFAULT 75,
+        max_rating INTEGER DEFAULT 95,
+        min_profit INTEGER DEFAULT 1000,
+        notifications_enabled BOOLEAN DEFAULT TRUE,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    )
+""")
+await conn.execute("CREATE INDEX IF NOT EXISTS idx_smart_buy_preferences_user ON smart_buy_preferences(user_id)")
+
     # Start alerts loop
     _watchlist_task = asyncio.create_task(_alerts_poll_loop())
     logging.info("✅ Watchlist alerts loop started (%ss)", WATCHLIST_POLL_INTERVAL)
@@ -505,6 +579,8 @@ app.add_middleware(
 
 # ✅ mount Trade Finder API
 app.include_router(trade_finder_router)
+
+app.include_router(smart_buy_router, prefix="/api")
 
 
 # ----------------- DEPENDENCIES & HELPERS -----------------
