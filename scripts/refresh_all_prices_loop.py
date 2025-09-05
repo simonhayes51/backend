@@ -1,149 +1,176 @@
 # scripts/refresh_all_prices_loop.py
 import os
 import asyncio
-import asyncpg
 import logging
-import random
-import signal
-import time
-from typing import Optional, List, Tuple
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Tuple
 
-# Uses your existing scraper
-from app.services.prices import get_player_price  # (card_id: int, platform: str) -> Optional[int]
+import asyncpg
 
-# -------------- Config --------------
+# Import your existing price fetcher
+# Requires PYTHONPATH=. in the worker service env
+from app.services.prices import get_player_price  # type: ignore
+
+# ---------------- Env & Defaults ----------------
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL env var is required")
+    raise RuntimeError("DATABASE_URL is required")
 
-PLATFORM = os.getenv("REFRESH_PLATFORM", "ps")          # ps | xbox | pc
-CONCURRENCY = int(os.getenv("REFRESH_CONCURRENCY", "20"))
-RETRIES = int(os.getenv("REFRESH_RETRIES", "2"))
-BATCH_SIZE = int(os.getenv("REFRESH_BATCH_SIZE", "1000"))
-INTERVAL_SECONDS = int(os.getenv("REFRESH_INTERVAL_SECONDS", str(30 * 60)))  # 30 minutes default
+REFRESH_PLATFORM = os.getenv("REFRESH_PLATFORM", "ps").lower()  # ps | xbox | pc
+REFRESH_CONCURRENCY = int(os.getenv("REFRESH_CONCURRENCY", "20"))
+REFRESH_RETRIES = int(os.getenv("REFRESH_RETRIES", "2"))
+REFRESH_BATCH_SIZE = int(os.getenv("REFRESH_BATCH_SIZE", "1000"))
+REFRESH_INTERVAL_SECONDS = int(os.getenv("REFRESH_INTERVAL_SECONDS", "1800"))  # 30 min
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
-# -------------- Logging --------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("refresh_all_prices")
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)s %(message)s",
+)
 
-# -------------- Graceful shutdown --------------
-_stop = asyncio.Event()
-def _handle_stop(*_):
-    log.info("Shutdown signal received.")
-    _stop.set()
+# ---------------- Helpers ----------------
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
-signal.signal(signal.SIGINT, _handle_stop)
-signal.signal(signal.SIGTERM, _handle_stop)
+def _chunks(seq: List[str], n: int) -> List[List[str]]:
+    return [seq[i : i + n] for i in range(0, len(seq), n)]
 
+async def _ensure_schema(conn: asyncpg.Connection) -> None:
+    # Add price_updated_at if you haven't already
+    await conn.execute(
+        """
+        ALTER TABLE fut_players
+        ADD COLUMN IF NOT EXISTS price_updated_at TIMESTAMPTZ
+        """
+    )
 
-async def _get_price_with_retries(card_id_int: int, platform: str) -> Optional[int]:
+async def _fetch_all_card_ids(conn: asyncpg.Connection) -> List[str]:
+    # card_id is TEXT in your schema elsewhere; fetch as TEXT always.
+    rows = await conn.fetch("SELECT card_id FROM fut_players")
+    ids: List[str] = []
+    for r in rows:
+        cid = r["card_id"]
+        if cid is None:
+            continue
+        # Normalize to str
+        ids.append(str(cid))
+    return ids
+
+async def _fetch_one_price(card_id_text: str, platform: str, retries: int) -> Optional[int]:
     """
-    Try the upstream price function a few times with light jittered backoff.
+    Get price for a single card_id (string in DB). Your get_player_price expects int.
+    If card_id isn't numeric, skip it gracefully.
     """
-    last_err = None
-    for attempt in range(1, RETRIES + 2):
+    try:
+        card_id_int = int(card_id_text)
+    except Exception:
+        return None
+
+    delay = 0.5
+    for attempt in range(retries + 1):
         try:
             price = await get_player_price(card_id_int, platform)
             if isinstance(price, (int, float)):
                 return int(price)
             return None
         except Exception as e:
-            last_err = e
-            await asyncio.sleep(0.35 * attempt + random.random() * 0.25)
-    log.debug("card %s failed after retries: %s", card_id_int, last_err)
-    return None
+            if attempt >= retries:
+                logging.debug("price fetch failed for %s (%s): %s", card_id_text, platform, e)
+                return None
+            await asyncio.sleep(delay)
+            delay *= 2  # simple backoff
 
-
-async def _fetch_all_card_ids(conn: asyncpg.Connection) -> List[str]:
-    rows = await conn.fetch("SELECT card_id FROM fut_players")
-    return [str(r["card_id"]) for r in rows if r["card_id"]]
-
-
-async def _refresh_once(pool: asyncpg.Pool) -> Tuple[int, int, int]:
+async def _gather_prices(
+    ids: List[str],
+    platform: str,
+    concurrency: int,
+    retries: int,
+) -> Dict[str, Optional[int]]:
     """
-    One full pass: pull all card_ids, fetch prices concurrently (bounded),
-    update fut_players.price. Returns (total, updated, missing).
+    Returns { card_id_text: price_or_None }
     """
-    async with pool.acquire() as conn:
-        # Ensure price column exists (safe no-op if already there)
-        await conn.execute("ALTER TABLE fut_players ADD COLUMN IF NOT EXISTS price INTEGER")
-        card_ids = await _fetch_all_card_ids(conn)
+    sem = asyncio.Semaphore(concurrency)
+    out: Dict[str, Optional[int]] = {}
 
-    total = len(card_ids)
-    if not total:
-        log.info("No card_ids found in fut_players.")
-        return (0, 0, 0)
-
-    # Shuffle so we don't hammer the same range in the same order every run
-    random.shuffle(card_ids)
-    log.info("Refreshing prices for %s cards (platform=%s, concurrency=%s)...", total, PLATFORM, CONCURRENCY)
-
-    sem = asyncio.Semaphore(CONCURRENCY)
-
-    async def work(cid_str: str) -> Tuple[str, Optional[int]]:
-        try:
-            cid = int(cid_str)
-        except Exception:
-            return (cid_str, None)
+    async def worker(cid: str):
         async with sem:
-            price = await _get_price_with_retries(cid, PLATFORM)
-            # tiny courtesy jitter between requests
-            await asyncio.sleep(0.01)
-            return (cid_str, price)
+            out[cid] = await _fetch_one_price(cid, platform, retries)
 
-    results: List[Tuple[str, Optional[int]]] = []
+    await asyncio.gather(*(worker(cid) for cid in ids))
+    return out
 
-    for i in range(0, total, BATCH_SIZE):
-        if _stop.is_set():
-            break
-        chunk = card_ids[i:i + BATCH_SIZE]
-        chunk_results = await asyncio.gather(*(work(cid) for cid in chunk))
-        results.extend(chunk_results)
-        log.info("Fetched prices for %s/%s cards...", min(i + BATCH_SIZE, total), total)
+async def _update_prices(
+    conn: asyncpg.Connection,
+    price_map: Dict[str, Optional[int]],
+) -> Tuple[int, int]:
+    """
+    Batch update fut_players:
+    SQL expects ($1 card_id TEXT, $2 price INT, $3 timestamp)
+    """
+    now = _now_utc()
+    rows: List[Tuple[str, int, datetime]] = []
+    for cid, price in price_map.items():
+        if isinstance(price, int):
+            rows.append((cid, price, now))
 
-    # Prepare updates
-    update_rows = [(r[1], r[0]) for r in results if isinstance(r[1], int)]
-    missing = len([1 for _, p in results if p is None])
+    if not rows:
+        return 0, 0
 
-    updated = 0
-    if update_rows:
-        async with pool.acquire() as conn:
-            # executemany is efficient for many simple updates
-            await conn.executemany(
-                "UPDATE fut_players SET price = $1 WHERE card_id = $2::text",
-                update_rows
-            )
-            updated = len(update_rows)
+    # Use executemany with correct param order/types
+    await conn.executemany(
+        """
+        UPDATE fut_players
+        SET price = $2, price_updated_at = $3
+        WHERE card_id = $1::text
+        """,
+        rows,
+    )
+    return len(price_map), len(rows)
 
-    log.info("Pass finished. Updated: %s | Missing/failed: %s | Total: %s", updated, missing, total)
-    return (total, updated, missing)
+async def _refresh_once(pool: asyncpg.Pool) -> None:
+    async with pool.acquire() as conn:
+        await _ensure_schema(conn)
 
+        ids = await _fetch_all_card_ids(conn)
+        total_ids = len(ids)
+        if total_ids == 0:
+            logging.info("No fut_players found. Nothing to refresh.")
+            return
 
-async def main_loop():
+        logging.info("Starting refresh for %s cards on platform=%s ...", total_ids, REFRESH_PLATFORM)
+
+        updated = 0
+        processed = 0
+
+        # Process in batches so logs stay readable and memory stays flat
+        for batch in _chunks(ids, REFRESH_BATCH_SIZE):
+            prices = await _gather_prices(batch, REFRESH_PLATFORM, REFRESH_CONCURRENCY, REFRESH_RETRIES)
+            # Persist batch
+            async with pool.acquire() as wconn:
+                _, updated_cnt = await _update_prices(wconn, prices)
+            updated += updated_cnt
+            processed += len(batch)
+            logging.info("Progress: %s/%s processed, %s updated", processed, total_ids, updated)
+
+        logging.info("Refresh pass complete: processed=%s, updated=%s", processed, updated)
+
+async def main_loop() -> None:
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
     try:
-        while not _stop.is_set():
-            start = time.monotonic()
+        while True:
             try:
                 await _refresh_once(pool)
             except Exception as e:
-                log.exception("Unexpected error during refresh pass: %s", e)
+                logging.error("Unexpected error during refresh pass: %s", e, exc_info=True)
 
-            # Sleep until next interval (account for time spent)
-            elapsed = time.monotonic() - start
-            remaining = max(0, INTERVAL_SECONDS - int(elapsed))
-            if remaining:
-                log.info("Sleeping %ss until next run...", remaining)
-
-            try:
-                await asyncio.wait_for(_stop.wait(), timeout=remaining if remaining else 0.0)
-            except asyncio.TimeoutError:
-                # timeout means do another loop
-                pass
+            # Sleep until next pass
+            logging.info("Sleeping %ss until next run...", REFRESH_INTERVAL_SECONDS)
+            await asyncio.sleep(REFRESH_INTERVAL_SECONDS)
     finally:
         await pool.close()
-        log.info("Pool closed. Bye.")
-
 
 if __name__ == "__main__":
-    asyncio.run(main_loop())
+    try:
+        asyncio.run(main_loop())
+    except KeyboardInterrupt:
+        logging.info("Shutting down refresher loop...")
