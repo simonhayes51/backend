@@ -68,7 +68,18 @@ async def market_intelligence() -> Dict[str, Any]:
     async with p.acquire() as c:
         row = await c.fetchrow("SELECT payload FROM smart_buy_market_cache WHERE id=1")
     if row:
-        return row["payload"]
+        payload = row["payload"]
+        # ✅ Coerce to dict if DB driver returned a JSON string
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                payload = {"raw": payload}
+        elif payload is None:
+            payload = {}
+        return payload
+
+    # Seed a safe default and cache it
     payload = {
         "current_state": "normal",
         "upcoming_events": [],
