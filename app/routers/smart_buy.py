@@ -1,130 +1,121 @@
 # app/routers/smart_buy.py
-from typing import Optional, List, Dict, Any, Literal
-from datetime import datetime, timezone
+import math
+from typing import Any, Dict, List, Optional, Tuple, Literal
 
-import asyncpg
-from fastapi import APIRouter, Request, HTTPException, Query
+from datetime import datetime, timedelta, timezone
+
+from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from pydantic import BaseModel
 
-router = APIRouter(prefix="/smart-buy", tags=["Smart Buy"])
+router = APIRouter(prefix="/smart-buy", tags=["smart-buy"])
 
-# ----------------- Helpers -----------------
-def _require_user(request: Request) -> str:
+# ----------------------------
+# Tunables (safe defaults)
+# ----------------------------
+SUGGESTION_TTL_MINUTES = 90         # suggestions expire quick; UI can refresh
+MIN_HISTORY_POINTS_24H = 6          # require at least this many points in 24h window
+FALLER_DROP_PCT_MIN    = 5.0        # consider cards that dropped ≥5% in last 24h
+RECOVERY_TARGET_PCT    = 0.60       # target 60% mean-reversion back towards 24h avg
+MAX_SUGGESTIONS        = 30         # cap per refresh to keep UI snappy
+
+# Risk buckets by 24h volatility (%)
+VOL_LOW_MAX   = 3.0
+VOL_MOD_MAX   = 8.0
+# >8% becomes "high"
+
+# ----------------------------
+# Models
+# ----------------------------
+class SBPreferences(BaseModel):
+    default_budget: int = 100_000
+    risk_tolerance: Literal["conservative", "moderate", "aggressive"] = "moderate"
+    preferred_time_horizon: Literal["quick_flip", "short", "long_term"] = "short"  # UI maps to 6–48h
+    preferred_categories: List[str] = []
+    excluded_positions: List[str] = []
+    preferred_leagues: List[str] = []
+    preferred_nations: List[str] = []
+    min_rating: int = 75
+    max_rating: int = 95
+    min_profit: int = 1_000
+    notifications_enabled: bool = True
+
+class RefreshPayload(BaseModel):
+    budget: Optional[int] = None
+    risk: Optional[Literal["conservative","moderate","aggressive"]] = None
+    horizon: Optional[Literal["quick_flip","short","long_term"]] = None
+    platform: Optional[Literal["ps","xbox","pc"]] = "ps"
+
+class SuggestionFilters(BaseModel):
+    budget: Optional[int] = None
+    risk: Optional[Literal["low","medium","high"]] = None
+    horizon: Optional[Literal["quick_flip","short","long_term"]] = None
+    platform: Optional[Literal["ps","xbox","pc"]] = "ps"
+
+# ----------------------------
+# Helpers
+# ----------------------------
+def _risk_from_vol(vol_pct: float) -> str:
+    if vol_pct <= VOL_LOW_MAX:
+        return "low"
+    if vol_pct <= VOL_MOD_MAX:
+        return "medium"
+    return "high"
+
+def _confidence(drop_pct: float, vol_pct: float) -> int:
+    """
+    0-100: more confidence for sizable drop with low volatility.
+    """
+    base = max(0.0, min(1.0, (drop_pct - FALLER_DROP_PCT_MIN) / 10.0))  # 0 to ~1 as drop grows 5->15%
+    calm = max(0.0, 1.0 - (vol_pct / 12.0))  # penalize very volatile stuff
+    return int(round(100 * (0.55 * base + 0.45 * calm)))
+
+def _priority(expected_profit: int, confidence: int, price: int) -> int:
+    """
+    1-10: cheap + decent profit + confidence => higher priority
+    """
+    if price <= 0:
+        return 1
+    score = (expected_profit / max(10_000, price)) * 5 + (confidence / 100) * 5
+    return max(1, min(10, int(round(score))))
+
+async def _get_user_id(request: Request) -> str:
     uid = request.session.get("user_id")
     if not uid:
-        raise HTTPException(status_code=401, detail="Not authenticated")
+        raise HTTPException(401, "Not authenticated")
     return uid
 
+# ----------------------------
+# Preferences
+# ----------------------------
+@router.get("/preferences")
+async def get_preferences(request: Request):
+    user_id = await _get_user_id(request)
+    pool = request.app.state.pool
 
-# ----------------- Models -----------------
-class PreferencesUpdate(BaseModel):
-    default_budget: Optional[int] = None
-    risk_tolerance: Optional[Literal["conservative", "moderate", "aggressive"]] = None
-    preferred_time_horizon: Optional[Literal["quick_flip", "short", "long_term"]] = None
-    preferred_categories: Optional[List[str]] = None
-    excluded_positions: Optional[List[str]] = None
-    preferred_leagues: Optional[List[str]] = None
-    preferred_nations: Optional[List[str]] = None
-    min_rating: Optional[int] = None
-    max_rating: Optional[int] = None
-    min_profit: Optional[int] = None
-    notifications_enabled: Optional[bool] = None
-
-
-class FeedbackCreate(BaseModel):
-    card_id: str
-    action: Literal["bought", "ignored", "watchlisted"]
-    notes: Optional[str] = None
-    actual_buy_price: Optional[int] = None
-    actual_sell_price: Optional[int] = None
-    actual_profit: Optional[int] = None
-    suggestion_id: Optional[int] = None
-
-
-# ----------------- Health -----------------
-@router.get("/health")
-async def health(request: Request):
-    pool: asyncpg.Pool = request.app.state.pool
-    try:
-        async with pool.acquire() as conn:
-            await conn.fetchval("SELECT 1")
-        return {"ok": True}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"DB error: {e}")
-
-
-# ----------------- Preferences -----------------
-@router.get("/preferences/me")
-async def get_my_preferences(request: Request):
-    uid = _require_user(request)
-    pool: asyncpg.Pool = request.app.state.pool
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT user_id, default_budget, risk_tolerance, preferred_time_horizon,
-                   preferred_categories, excluded_positions, preferred_leagues, preferred_nations,
-                   min_rating, max_rating, min_profit, notifications_enabled, created_at, updated_at
-            FROM smart_buy_preferences
-            WHERE user_id = $1
-            """,
-            uid,
-        )
-    if not row:
-        return {
-            "user_id": uid,
-            "default_budget": 100000,
-            "risk_tolerance": "moderate",
-            "preferred_time_horizon": "short",
-            "preferred_categories": [],
-            "excluded_positions": [],
-            "preferred_leagues": [],
-            "preferred_nations": [],
-            "min_rating": 75,
-            "max_rating": 95,
-            "min_profit": 1000,
-            "notifications_enabled": True,
-            "created_at": None,
-            "updated_at": None,
-        }
-    d = dict(row)
-    for key in ("preferred_categories", "excluded_positions", "preferred_leagues", "preferred_nations"):
-        d[key] = d.get(key) or []
-    return d
-
-
-@router.put("/preferences/me")
-async def update_my_preferences(payload: PreferencesUpdate, request: Request):
-    uid = _require_user(request)
-    pool: asyncpg.Pool = request.app.state.pool
-    async with pool.acquire() as conn:
-        cur = await conn.fetchrow(
-            """
             SELECT default_budget, risk_tolerance, preferred_time_horizon,
-                   preferred_categories, excluded_positions, preferred_leagues, preferred_nations,
+                   preferred_categories, excluded_positions,
+                   preferred_leagues, preferred_nations,
                    min_rating, max_rating, min_profit, notifications_enabled
             FROM smart_buy_preferences
             WHERE user_id = $1
             """,
-            uid,
+            user_id,
         )
-        base: Dict[str, Any] = {
-            "default_budget": 100000,
-            "risk_tolerance": "moderate",
-            "preferred_time_horizon": "short",
-            "preferred_categories": [],
-            "excluded_positions": [],
-            "preferred_leagues": [],
-            "preferred_nations": [],
-            "min_rating": 75,
-            "max_rating": 95,
-            "min_profit": 1000,
-            "notifications_enabled": True,
-        }
-        if cur:
-            base.update({k: cur[k] for k in base.keys()})
-        changes = {k: v for k, v in payload.model_dump(exclude_none=True).items()}
-        base.update(changes)
+    if row:
+        # jsonb fields already in PG json; return as-is
+        return dict(row)
+    # default
+    return SBPreferences().model_dump()
 
+@router.post("/preferences")
+async def upsert_preferences(request: Request, prefs: SBPreferences):
+    user_id = await _get_user_id(request)
+    pool = request.app.state.pool
+
+    async with pool.acquire() as conn:
         await conn.execute(
             """
             INSERT INTO smart_buy_preferences (
@@ -132,7 +123,7 @@ async def update_my_preferences(payload: PreferencesUpdate, request: Request):
                 preferred_categories, excluded_positions, preferred_leagues, preferred_nations,
                 min_rating, max_rating, min_profit, notifications_enabled, created_at, updated_at
             ) VALUES (
-                $1,$2,$3,$4,$5::jsonb,$6::jsonb,$7::jsonb,$8::jsonb,$9,$10,$11,$12,NOW(),NOW()
+                $1,$2,$3,$4,$5::jsonb,$6::jsonb,$7::jsonb,$8::jsonb,$9,$10,$11,$12, NOW(), NOW()
             )
             ON CONFLICT (user_id) DO UPDATE SET
                 default_budget = EXCLUDED.default_budget,
@@ -148,227 +139,291 @@ async def update_my_preferences(payload: PreferencesUpdate, request: Request):
                 notifications_enabled = EXCLUDED.notifications_enabled,
                 updated_at = NOW()
             """,
-            uid,
-            base["default_budget"],
-            base["risk_tolerance"],
-            base["preferred_time_horizon"],
-            base["preferred_categories"],
-            base["excluded_positions"],
-            base["preferred_leagues"],
-            base["preferred_nations"],
-            base["min_rating"],
-            base["max_rating"],
-            base["min_profit"],
-            base["notifications_enabled"],
+            user_id,
+            prefs.default_budget,
+            prefs.risk_tolerance,
+            prefs.preferred_time_horizon,
+            prefs.preferred_categories,
+            prefs.excluded_positions,
+            prefs.preferred_leagues,
+            prefs.preferred_nations,
+            prefs.min_rating,
+            prefs.max_rating,
+            prefs.min_profit,
+            prefs.notifications_enabled,
         )
-    return {"ok": True, "preferences": base}
 
-
-# ----------------- Suggestions -----------------
-@router.get("/suggestions")
-async def list_suggestions(
-    request: Request,
-    platform: Optional[Literal["ps", "xbox", "pc"]] = Query(None),
-    suggestion_type: Optional[str] = Query(None),
-    risk_level: Optional[Literal["low", "medium", "high"]] = Query(None),
-    min_confidence: Optional[int] = Query(None, ge=0, le=100),
-    only_active: bool = Query(True),
-    limit: int = Query(50, ge=1, le=200),
-    mine: bool = Query(False),
-):
-    """Return cached Smart Buy suggestions filtered by query."""
-    uid = request.session.get("user_id") if mine else None
-    pool: asyncpg.Pool = request.app.state.pool
-
-    where = []
-    params: List[Any] = []
-    if platform:
-        where.append(f"platform = ${len(params)+1}"); params.append(platform)
-    if suggestion_type:
-        where.append(f"suggestion_type = ${len(params)+1}"); params.append(suggestion_type)
-    if risk_level:
-        where.append(f"risk_level = ${len(params)+1}"); params.append(risk_level)
-    if min_confidence is not None:
-        where.append(f"confidence_score >= ${len(params)+1}"); params.append(int(min_confidence))
-    if only_active:
-        where.append("(expires_at IS NULL OR expires_at > NOW())")
-    if uid:
-        where.append(f"user_id = ${len(params)+1}"); params.append(uid)
-
-    clause = f"WHERE {' AND '.join(where)}" if where else ""
-    sql = f"""
-        SELECT id, user_id, card_id, suggestion_type, current_price, target_price, expected_profit,
-               risk_level, confidence_score, priority_score, reasoning, time_to_profit, platform,
-               market_state, created_at, expires_at
-        FROM smart_buy_suggestions
-        {clause}
-        ORDER BY priority_score DESC, confidence_score DESC, created_at DESC
-        LIMIT ${len(params)+1}
-    """
-    params.append(limit)
-
-    pool: asyncpg.Pool = request.app.state.pool
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(sql, *params)
-    return {"items": [dict(r) for r in rows]}
-
-
-@router.post("/suggestions/refresh")
-async def refresh_suggestions_stub():
-    """
-    UI compatibility stub. In the future you can trigger a background refresh here.
-    For now, always returns ok=true so the frontend doesn't show an error.
-    """
     return {"ok": True}
 
-
-# ----------------- Feedback -----------------
-@router.post("/feedback")
-async def create_feedback(payload: FeedbackCreate, request: Request):
-    uid = _require_user(request)
-    pool: asyncpg.Pool = request.app.state.pool
-    async with pool.acquire() as conn:
-        await conn.execute(
+# ----------------------------
+# Core logic – build suggestions
+# ----------------------------
+async def _fetch_candidates(request: Request, budget: int, platform: str,
+                            min_rating: int, max_rating: int) -> List[Dict[str, Any]]:
+    """
+    Return cards with live price <= budget and with some 24h history.
+    """
+    player_pool = request.app.state.player_pool
+    async with player_pool.acquire() as pconn:
+        rows = await pconn.fetch(
             """
-            INSERT INTO smart_buy_feedback (
-                user_id, card_id, action, notes, actual_buy_price, actual_sell_price,
-                actual_profit, timestamp, suggestion_id
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,NOW(),$8)
+            SELECT card_id::text AS card_id, name, rating, version, image_url, league, nation, club, price
+            FROM fut_players
+            WHERE price IS NOT NULL
+              AND price > 0
+              AND price <= $1
+              AND rating BETWEEN $2 AND $3
+            ORDER BY price DESC
+            LIMIT 400
             """,
-            uid,
-            payload.card_id,
-            payload.action,
-            payload.notes,
-            payload.actual_buy_price,
-            payload.actual_sell_price,
-            payload.actual_profit,
-            payload.suggestion_id,
+            budget, min_rating, max_rating
         )
-    return {"ok": True}
+    return [dict(r) for r in rows]
 
+async def _load_history_24h(conn, card_id: str, platform: str) -> List[Tuple[datetime, int]]:
+    rows = await conn.fetch(
+        """
+        SELECT captured_at, price
+        FROM fut_prices_history
+        WHERE card_id = $1
+          AND platform = $2
+          AND captured_at >= now() - interval '24 hours'
+        ORDER BY captured_at ASC
+        """,
+        card_id, platform,
+    )
+    return [(r["captured_at"], int(r["price"])) for r in rows]
 
-# ----------------- Market state & events -----------------
-@router.get("/market/state")
-async def latest_market_state(
-    request: Request,
-    platform: Optional[Literal["ps", "xbox", "pc"]] = Query(None)
-):
-    pool: asyncpg.Pool = request.app.state.pool
-    async with pool.acquire() as conn:
-        if platform:
-            row = await conn.fetchrow(
-                """
-                SELECT id, platform, state, confidence_score, detected_at, indicators
-                FROM market_states
-                WHERE platform = $1
-                ORDER BY detected_at DESC
-                LIMIT 1
-                """,
-                platform,
-            )
-        else:
-            row = await conn.fetchrow(
-                """
-                SELECT id, platform, state, confidence_score, detected_at, indicators
-                FROM market_states
-                ORDER BY detected_at DESC
-                LIMIT 1
-                """
-            )
-    if not row:
-        return {"state": None}
-    return dict(row)
-
-
-@router.get("/events/upcoming")
-async def upcoming_events(request: Request, limit: int = Query(10, ge=1, le=100)):
-    pool: asyncpg.Pool = request.app.state.pool
-    async with pool.acquire() as conn:
-        try:
-            rows = await conn.fetch(
-                """
-                SELECT id, name, event_type, expected_date, actual_date, impact_level,
-                       affected_categories, description, created_at
-                FROM market_events
-                WHERE expected_date IS NULL OR expected_date >= NOW()
-                ORDER BY COALESCE(expected_date, NOW()) ASC
-                LIMIT $1
-                """,
-                limit,
-            )
-        except Exception:
-            rows = []
-    return {"items": [dict(r) for r in rows]}
-
-
-# ----------------- Combined intelligence (UI expects this) -----------------
-@router.get("/market-intelligence")
-async def market_intelligence(
-    request: Request,
-    platform: Optional[Literal["ps", "xbox", "pc"]] = Query(None),
-    limit: int = Query(5, ge=1, le=20),
-):
-    """
-    Compatibility endpoint expected by the UI.
-    Bundles latest market state + upcoming events.
-    """
-    pool: asyncpg.Pool = request.app.state.pool
-    async with pool.acquire() as conn:
-        # latest market state
-        if platform:
-            state_row = await conn.fetchrow(
-                """
-                SELECT id, platform, state, confidence_score, detected_at, indicators
-                FROM market_states
-                WHERE platform = $1
-                ORDER BY detected_at DESC
-                LIMIT 1
-                """,
-                platform,
-            )
-        else:
-            state_row = await conn.fetchrow(
-                """
-                SELECT id, platform, state, confidence_score, detected_at, indicators
-                FROM market_states
-                ORDER BY detected_at DESC
-                LIMIT 1
-                """
-            )
-
-        # upcoming events (best effort)
-        try:
-            events = await conn.fetch(
-                """
-                SELECT id, name, event_type, expected_date, actual_date, impact_level,
-                       affected_categories, description, created_at
-                FROM market_events
-                WHERE expected_date IS NULL OR expected_date >= NOW()
-                ORDER BY COALESCE(expected_date, NOW()) ASC
-                LIMIT $1
-                """,
-                limit,
-            )
-        except Exception:
-            events = []
-
+def _stats_from_series(series: List[Tuple[datetime,int]]) -> Dict[str, Any]:
+    if not series:
+        return {}
+    prices = [p for _, p in series]
+    if len(prices) < 2:
+        return {}
+    cur = prices[-1]
+    avg24 = sum(prices) / len(prices)
+    low24 = min(prices)
+    high24 = max(prices)
+    # simple vol: average absolute step / mean
+    diffs = [abs(prices[i]-prices[i-1]) for i in range(1, len(prices))]
+    vol_abs = (sum(diffs) / len(diffs)) if diffs else 0.0
+    vol_pct = (vol_abs / avg24 * 100.0) if avg24 else 0.0
+    drop_pct = ((avg24 - cur) / avg24 * 100.0) if avg24 else 0.0
     return {
-        "state": dict(state_row) if state_row else None,
-        "events": [dict(e) for e in events],
-        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "cur": cur,
+        "avg24": int(round(avg24)),
+        "low24": low24,
+        "high24": high24,
+        "vol_pct": round(vol_pct, 2),
+        "drop_pct": round(drop_pct, 2),
+        "n": len(prices),
     }
 
+async def _build_suggestions_for_user(request: Request, user_id: str,
+                                      budget: int, risk_pref: str,
+                                      horizon: str, platform: str) -> int:
+    """
+    Rebuild suggestions: delete previous for user, insert fresh ones.
+    """
+    pool = request.app.state.pool
 
-# ----------------- Maintenance -----------------
-@router.post("/maintenance/cleanup-expired")
-async def cleanup_expired(request: Request):
-    pool: asyncpg.Pool = request.app.state.pool
+    # load user pref constraints for rating/profit floors
     async with pool.acquire() as conn:
-        try:
-            await conn.execute("SELECT cleanup_expired_suggestions()")
-        except Exception:
-            # Fallback if the function doesn't exist
+        pref_row = await conn.fetchrow(
+            """
+            SELECT min_rating, max_rating, min_profit
+            FROM smart_buy_preferences
+            WHERE user_id = $1
+            """,
+            user_id,
+        )
+    if pref_row:
+        min_rating = pref_row["min_rating"]
+        max_rating = pref_row["max_rating"]
+        min_profit = pref_row["min_profit"]
+    else:
+        min_rating = 75
+        max_rating = 95
+        min_profit = 1000
+
+    # fetch candidate cards (live price within budget)
+    candidates = await _fetch_candidates(request, budget, platform, min_rating, max_rating)
+    if not candidates:
+        # wipe prior suggestions
+        async with pool.acquire() as conn:
+            await conn.execute("DELETE FROM smart_buy_suggestions WHERE user_id=$1", user_id)
+        return 0
+
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=SUGGESTION_TTL_MINUTES)
+    inserted = 0
+
+    # we read history and insert in one DB connection for efficiency
+    async with pool.acquire() as conn:
+        # wipe previous
+        await conn.execute("DELETE FROM smart_buy_suggestions WHERE user_id=$1", user_id)
+
+        for card in candidates:
+            cid = str(card["card_id"])
+            series = await _load_history_24h(conn, cid, platform)
+            stats = _stats_from_series(series)
+            if not stats or stats["n"] < MIN_HISTORY_POINTS_24H:
+                continue
+
+            cur   = stats["cur"]
+            avg24 = stats["avg24"]
+            drop  = stats["drop_pct"]
+            vol   = stats["vol_pct"]
+
+            # Only consider mild fallers with at least X% below 24h mean
+            if drop < FALLER_DROP_PCT_MIN:
+                continue
+
+            # derive risk vs user's tolerance
+            risk_bucket = _risk_from_vol(vol)
+            if risk_pref == "conservative" and risk_bucket == "high":
+                continue
+            if risk_pref == "moderate" and risk_bucket == "high":
+                # allow but lower priority later (we can still skip if you want)
+                pass
+
+            # expected target = current + fraction of mean reversion towards avg24
+            target_price = int(round(cur + (avg24 - cur) * RECOVERY_TARGET_PCT))
+            expected_profit = int(round((target_price - cur) * 0.95))  # after 5% EA tax on sale
+
+            if expected_profit < min_profit:
+                continue
+
+            confidence = _confidence(drop, vol)
+            priority   = _priority(expected_profit, confidence, cur)
+
             await conn.execute(
-                "DELETE FROM smart_buy_suggestions WHERE expires_at IS NOT NULL AND expires_at < NOW() - INTERVAL '1 day'"
+                """
+                INSERT INTO smart_buy_suggestions (
+                    user_id, card_id, suggestion_type, current_price, target_price,
+                    expected_profit, risk_level, confidence_score, priority_score,
+                    reasoning, time_to_profit, platform, market_state, created_at, expires_at
+                ) VALUES (
+                    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13, NOW(), $14
+                )
+                """,
+                user_id,
+                cid,
+                "recovery_play",
+                int(cur),
+                int(target_price),
+                int(expected_profit),
+                risk_bucket,
+                int(confidence),
+                int(priority),
+                f"Dropped {drop:.1f}% vs 24h avg with {vol:.1f}% volatility.",
+                "6-48h" if horizon in ("quick_flip", "short") else "2-7d",
+                platform,
+                "normal",
+                expires_at,
             )
-    return {"ok": True, "ran": "cleanup_expired_suggestions"}
+            inserted += 1
+            if inserted >= MAX_SUGGESTIONS:
+                break
+
+    return inserted
+
+# ----------------------------
+# Endpoints
+# ----------------------------
+@router.post("/refresh")
+async def refresh_suggestions(request: Request, payload: RefreshPayload):
+    user_id = await _get_user_id(request)
+
+    # read prefs as defaults
+    pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        pref = await conn.fetchrow(
+            """
+            SELECT default_budget, risk_tolerance, preferred_time_horizon
+            FROM smart_buy_preferences WHERE user_id=$1
+            """,
+            user_id,
+        )
+
+    budget  = payload.budget or (pref["default_budget"] if pref else 100_000)
+    risk    = payload.risk or (pref["risk_tolerance"] if pref else "moderate")
+    horizon = payload.horizon or (pref["preferred_time_horizon"] if pref else "short")
+    platform = (payload.platform or "ps").lower()
+
+    inserted = await _build_suggestions_for_user(request, user_id, int(budget), risk, horizon, platform)
+    return {"ok": True, "inserted": inserted}
+
+@router.get("/suggestions")
+async def get_suggestions(
+    request: Request,
+    platform: Literal["ps","xbox","pc"] = "ps",
+    max_items: int = Query(30, ge=1, le=100),
+    budget: Optional[int] = None,
+    risk: Optional[Literal["low","medium","high"]] = None,
+    horizon: Optional[Literal["quick_flip","short","long_term"]] = None,
+):
+    user_id = await _get_user_id(request)
+    pool = request.app.state.pool
+
+    clauses = ["user_id = $1", "platform = $2", "(expires_at IS NULL OR expires_at > NOW())"]
+    params: List[Any] = [user_id, platform]
+    pi = 3
+
+    if budget is not None:
+        clauses.append(f"current_price <= ${pi}")
+        params.append(budget); pi += 1
+    if risk is not None:
+        clauses.append(f"risk_level = ${pi}")
+        params.append(risk); pi += 1
+    if horizon is not None:
+        # stored as "6-48h" or "2-7d"; map roughly
+        if horizon in ("quick_flip", "short"):
+            clauses.append("time_to_profit IN ('6-48h')")
+        else:
+            clauses.append("time_to_profit IN ('2-7d')")
+
+    sql = f"""
+        SELECT id, user_id, card_id, suggestion_type, current_price, target_price,
+               expected_profit, risk_level, confidence_score, priority_score, reasoning,
+               time_to_profit, platform, market_state, created_at, expires_at
+        FROM smart_buy_suggestions
+        WHERE {' AND '.join(clauses)}
+        ORDER BY priority_score DESC, confidence_score DESC, expected_profit DESC
+        LIMIT {max_items}
+    """
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(sql, *params)
+
+    # enrich with player meta for UI
+    player_pool = request.app.state.player_pool
+    ids = [r["card_id"] for r in rows]
+    meta_map: Dict[str, Dict[str, Any]] = {}
+    if ids:
+        async with player_pool.acquire() as pconn:
+            meta_rows = await pconn.fetch(
+                """
+                SELECT card_id::text AS card_id, name, rating, version, image_url, league, nation, club
+                FROM fut_players
+                WHERE card_id = ANY($1::text[])
+                """,
+                ids,
+            )
+        meta_map = {m["card_id"]: dict(m) for m in meta_rows}
+
+    out = []
+    for r in rows:
+        m = meta_map.get(r["card_id"], {})
+        d = dict(r)
+        d["player"] = {
+            "name": m.get("name"),
+            "rating": m.get("rating"),
+            "version": m.get("version"),
+            "image_url": m.get("image_url"),
+            "league": m.get("league"),
+            "nation": m.get("nation"),
+            "club": m.get("club"),
+        }
+        out.append(d)
+
+    return {"items": out}
