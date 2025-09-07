@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import random
 import asyncio
 from statistics import pstdev
 from typing import Any, Dict, List, Optional, Tuple
@@ -11,9 +12,7 @@ from fastapi import APIRouter, Depends, Query, Request, HTTPException
 
 from app.services.price_history import get_price_history
 
-# ⚡ prefix = "/smart-buy" only; main.py mounts with prefix="/api"
 smart_buy_router = APIRouter(prefix="/smart-buy", tags=["smart-buy"])
-
 
 # ---------------------------
 # Pools
@@ -27,22 +26,29 @@ async def player_pool(req: Request) -> asyncpg.Pool:
 
 
 # ---------------------------
-# Helpers
+# Utils
 # ---------------------------
 
 def _norm_platform(p: str) -> str:
     p = (p or "").lower()
-    if p in ("ps", "playstation", "console"): return "ps"
-    if p in ("xbox", "xb"): return "xbox"
-    if p in ("pc", "origin"): return "pc"
+    if p in ("ps", "playstation", "console"):
+        return "ps"
+    if p in ("xbox", "xb"):
+        return "xbox"
+    if p in ("pc", "origin"):
+        return "pc"
     return "ps"
 
 def _horizon_bucket(h: str) -> str:
     h = (h or "").lower()
-    if "flip" in h: return "flip"
-    if "short" in h: return "short"
-    if "mid" in h or "medium" in h: return "mid"
-    if "long" in h: return "long"
+    if "flip" in h:
+        return "flip"
+    if "short" in h:
+        return "short"
+    if "mid" in h or "medium" in h:
+        return "mid"
+    if "long" in h:
+        return "long"
     return "short"
 
 def _profit_after_tax(buy: int, sell: int) -> Tuple[int, int]:
@@ -60,7 +66,7 @@ def _now_iso() -> str:
 # ---------------------------
 
 def _series_from_hist(hist: list[dict]) -> list[tuple[int, float]]:
-    out: list[tuple[int, float]] = []
+    out = []
     for p in hist or []:
         t = p.get("t") or p.get("ts") or p.get("time")
         v = p.get("price") or p.get("v") or p.get("y")
@@ -73,14 +79,17 @@ def _series_from_hist(hist: list[dict]) -> list[tuple[int, float]]:
     return out
 
 def _pct_volatility(prices: list[float]) -> float:
-    if not prices or len(prices) < 6: return 0.0
+    if not prices or len(prices) < 6:
+        return 0.0
     m = sum(prices) / len(prices)
-    if m <= 0: return 0.0
+    if m <= 0:
+        return 0.0
     return float(pstdev(prices) / m)
 
 def _lin_slope(prices: list[float]) -> float:
     n = len(prices)
-    if n < 3: return 0.0
+    if n < 3:
+        return 0.0
     xb = (n - 1) / 2.0
     yb = sum(prices) / n
     num = sum((i - xb) * (y - yb) for i, y in enumerate(prices))
@@ -88,14 +97,18 @@ def _lin_slope(prices: list[float]) -> float:
     return float(num / den) if den else 0.0
 
 def _liq_proxy(series: list[tuple[int, float]]) -> float:
-    if not series: return 0.25
+    if not series:
+        return 0.25
     n = len(series)
-    if n < 6: return 0.30
+    if n < 6:
+        return 0.30
     vals = [v for _, v in series[-min(96, n):]]
     diffs = [abs(vals[i] - vals[i - 1]) for i in range(1, len(vals))]
-    if not diffs: return 0.35
+    if not diffs:
+        return 0.35
     avg = sum(vals) / len(vals)
-    if avg <= 0: return 0.35
+    if avg <= 0:
+        return 0.35
     tiny_moves = sum(1 for d in diffs if d / avg < 0.01)
     density = min(1.0, len(vals) / 96.0)
     smooth = min(1.0, tiny_moves / max(1, len(diffs)))
@@ -106,8 +119,17 @@ def _liq_proxy(series: list[tuple[int, float]]) -> float:
 # AI text
 # ---------------------------
 
-def _ai_blurb(name: str, rating: Optional[int], risk: str, vol: float, liq: float,
-              slope: float, uplift_pct: float, horizon: str, after_tax: int) -> str:
+def _ai_blurb(
+    name: str,
+    rating: Optional[int],
+    risk: str,
+    vol: float,
+    liq: float,
+    slope: float,
+    uplift_pct: float,
+    horizon: str,
+    after_tax: int,
+) -> str:
     rtxt = f"{rating}" if rating is not None else "–"
     trend = "uptrend" if slope > 0 else "controlled dip"
     vol_txt = "low" if vol < 0.10 else "moderate" if vol < 0.20 else "high"
@@ -115,14 +137,14 @@ def _ai_blurb(name: str, rating: Optional[int], risk: str, vol: float, liq: floa
     win = "1–6h" if horizon == "flip" else "6–24h" if horizon == "short" else "2–4d" if horizon == "mid" else "4–10d"
     return (
         f"{name} ({rtxt}) — {risk}. Intraday {trend}, volatility {vol_txt} ({vol:.0%}), "
-        f"liquidity {liq_txt}. Aim +{int(round(uplift_pct*100))}% → ~{after_tax:,}c after tax. "
+        f"liquidity {liq_txt}. Aim +{int(round(uplift_pct * 100))}% → ~{after_tax:,}c after tax. "
         f"Expected window: {win}. "
-        f"{'Avoid chasing spikes; scale in.' if vol_txt!='low' else 'Stable tape; good RR.'}"
+        f"{'Avoid chasing spikes; scale in.' if vol_txt != 'low' else 'Stable tape; good RR.'}"
     )
 
 
 # ---------------------------
-# Endpoints
+# Light endpoints
 # ---------------------------
 
 @smart_buy_router.get("/market-intelligence")
@@ -173,15 +195,21 @@ async def feedback(payload: Dict[str, Any], pool: asyncpg.Pool = Depends(core_po
         raise HTTPException(400, f"feedback error: {e}")
 
 
+# ---------------------------
+# Suggestions (with fixes)
+# ---------------------------
+
 @smart_buy_router.get("/suggestions")
 async def suggestions(
+    request: Request,
     budget: int = Query(100_000, ge=1_000, le=5_000_000),
     risk_tolerance: str = Query("moderate"),
-    time_horizon: str = Query("short"),
+    time_horizon: str = Query("short_term"),
     platform: str = Query("ps"),
-    min_rating: Optional[int] = Query(None),
-    max_rating: Optional[int] = Query(None),
     limit: int = Query(30, ge=1, le=100),
+    # OPTIONAL advanced filters (only applied if explicitly provided by caller)
+    min_rating: Optional[int] = Query(None, ge=60, le=99),
+    max_rating: Optional[int] = Query(None, ge=60, le=99),
     ppool: asyncpg.Pool = Depends(player_pool),
     cpool: asyncpg.Pool = Depends(core_pool),
 ):
@@ -190,12 +218,14 @@ async def suggestions(
     risk_name = "Conservative" if risk.startswith("cons") else "Aggressive" if risk.startswith("agg") else "Moderate"
     horizon = _horizon_bucket(time_horizon)
 
+    # Base uplift by horizon (then risk tweak)
     base = {"flip": 0.030, "short": 0.060, "mid": 0.100, "long": 0.150}[horizon]
     risk_boost = {"Conservative": 0.00, "Moderate": 0.03, "Aggressive": 0.06}[risk_name]
     if risk_name == "Aggressive" and horizon == "flip":
-        risk_boost += 0.02
+        risk_boost += 0.02  # punchier for quick flip
     uplift = base + risk_boost
 
+    # Risk gates (tight → loose through fallback rounds)
     BASE = {
         "Conservative": dict(min_rating=86, min_after=3000, max_vol=0.10, min_liq=0.55, slope_gate=0.0),
         "Moderate":     dict(min_rating=82, min_after=1800, max_vol=0.18, min_liq=0.35, slope_gate=-0.10),
@@ -203,9 +233,7 @@ async def suggestions(
     }
     base_knobs = BASE[risk_name]
 
-    if isinstance(min_rating, int):
-        base_knobs["min_rating"] = max(60, min_rating)
-
+    # ---- Candidate pool (price-first ordering to diversify) ----
     cand_rows = await ppool.fetch(
         """
         WITH c AS (
@@ -216,8 +244,8 @@ async def suggestions(
           FROM fut_players
           WHERE price ~ '^[0-9]+$'
             AND price::int BETWEEN 300 AND $1
-          ORDER BY rating DESC NULLS LAST
-          LIMIT 2000
+          ORDER BY price::int ASC, rating DESC
+          LIMIT 5000
         )
         SELECT * FROM c
         """,
@@ -226,8 +254,43 @@ async def suggestions(
     if not cand_rows:
         return {"items": [], "count": 0}
 
-    prelim = [r for r in cand_rows if int(r["price_int"] or 0) > 0][:320]
+    # Ensure numeric and positive
+    rows = [r for r in cand_rows if int(r["price_int"] or 0) > 0]
 
+    # Respect user *explicit* rating bounds only if provided in the query string
+    qp = request.query_params
+    user_set_min = "min_rating" in qp
+    user_set_max = "max_rating" in qp
+    if user_set_min:
+        rows = [r for r in rows if (r["rating"] is None or int(r["rating"]) >= int(min_rating or 60))]
+    if user_set_max:
+        rows = [r for r in rows if (r["rating"] is None or int(r["rating"]) <= int(max_rating or 99))]
+
+    if not rows:
+        return {"items": [], "count": 0}
+
+    # ---- Stratified sampling (cheap/mid/high) so big budgets don't collapse to zero ----
+    N_TARGET = 420  # total we’ll evaluate features for
+    if len(rows) <= N_TARGET:
+        prelim = rows
+    else:
+        tercile = len(rows) // 3
+        low = rows[:tercile]
+        mid = rows[tercile:2 * tercile]
+        high = rows[2 * tercile:]
+
+        # small shuffle for variety without hurting determinism too much
+        random.shuffle(low)
+        random.shuffle(mid)
+        random.shuffle(high)
+
+        take_each = N_TARGET // 3
+        prelim = low[:take_each] + mid[:take_each] + high[:take_each]
+        if len(prelim) < N_TARGET:  # top up from remaining tail
+            tail = low[take_each:] + mid[take_each:] + high[take_each:]
+            prelim += tail[: (N_TARGET - len(prelim))]
+
+    # ---- Feature extraction (fallback to synthetic when history is thin) ----
     async def _feat(card_id: int) -> Dict[str, Any]:
         try:
             hist = await get_price_history(int(card_id), plat, "today")
@@ -244,6 +307,7 @@ async def suggestions(
 
     feats = await asyncio.gather(*(_feat(int(r["card_id"])) for r in prelim))
 
+    # ---- Progressive rounds: widen gates until we have enough ----
     rounds = [
         dict(mult_vol=1.00, mult_liq=1.00, slope_add=0.00, min_rating_delta=0,  min_after_delta=0),
         dict(mult_vol=1.20, mult_liq=0.85, slope_add=-0.10, min_rating_delta=-2, min_after_delta=-200),
@@ -252,9 +316,8 @@ async def suggestions(
         dict(mult_vol=3.50, mult_liq=0.40, slope_add=-0.60, min_rating_delta=-8, min_after_delta=-1200),
     ]
 
-    selected: List[Dict[str, Any]] = []
-
     def _score_item(cur: int, aft: int, rating: int, liq: float, vol: float, slope: float) -> int:
+        # 1..99 score
         return int(max(1, min(99, round(
             rating * 0.55
             + (aft / 1000.0) * 0.85
@@ -264,15 +327,17 @@ async def suggestions(
             + (1.0 - min(1.0, cur / max(1, budget))) * 8.0
         ))))
 
+    selected: List[Dict[str, Any]] = []
+
     for r in rounds:
         if len(selected) >= limit:
             break
 
-        max_vol = base_knobs["max_vol"] * r["mult_vol"]
-        min_liq = base_knobs["min_liq"] * r["mult_liq"]
-        slope_gate = base_knobs["slope_gate"] + r["slope_add"]
-        min_rate_gate = max(60, base_knobs["min_rating"] + r["min_rating_delta"])
-        min_after = max(200, base_knobs["min_after"] + r["min_after_delta"])
+        max_vol = BASE[risk_name]["max_vol"] * r["mult_vol"]
+        min_liq = BASE[risk_name]["min_liq"] * r["mult_liq"]
+        slope_gate = BASE[risk_name]["slope_gate"] + r["slope_add"]
+        min_r = max(60, BASE[risk_name]["min_rating"] + r["min_rating_delta"])
+        min_after = max(200, BASE[risk_name]["min_after"] + r["min_after_delta"])
 
         batch: List[Dict[str, Any]] = []
 
@@ -280,14 +345,16 @@ async def suggestions(
             cur = int(row["price_int"] or 0)
             rating = int(row["rating"] or 0)
 
-            if rating < min_rate_gate:
+            if rating < min_r:
                 continue
-            if isinstance(max_rating, int) and rating > max_rating:
+            if user_set_min and min_rating is not None and rating < int(min_rating):
+                continue
+            if user_set_max and max_rating is not None and rating > int(max_rating):
                 continue
 
             vol = float(f["vol"]); liq = float(f["liq"]); slope = float(f["slope"])
 
-            if vol > max_vol: 
+            if vol > max_vol:
                 continue
             if liq < min_liq:
                 continue
@@ -321,8 +388,9 @@ async def suggestions(
                 "confidence_score": conf,
                 "priority_score": prio,
                 "reasoning": (
-                    f"{risk_name} • vol={vol:.2%}, liq={liq:.0%}, slope={'+' if slope>=0 else ''}{slope:.0f}; "
-                    f"target +{int(round(uplift*100))}% for {horizon}."
+                    f"{risk_name} • vol={vol:.2%}, liq={liq:.0%}, "
+                    f"slope={'+' if slope >= 0 else ''}{slope:.0f}; "
+                    f"target +{int(round(uplift * 100))}% for {horizon}."
                 ),
                 "ai_analysis": ai_text,
                 "analysis": ai_text,
@@ -349,6 +417,7 @@ async def suggestions(
     selected.sort(key=lambda x: (x["priority_score"], x["confidence_score"], x["expected_profit"]), reverse=True)
     selected = selected[:limit]
 
+    # Persist best-effort (non-blocking if it fails)
     if selected:
         try:
             await cpool.executemany(
@@ -384,6 +453,5 @@ async def suggestions(
 
     return {"items": selected, "suggestions": selected, "count": len(selected)}
 
-
-# export as router for main.py
+# Keep this line so main.py can do: from app.routers.smart_buy import router
 router = smart_buy_router
