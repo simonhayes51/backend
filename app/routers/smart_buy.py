@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, HTTPException, Query, Body
 
-# reuse your existing services (fallbacks)
+# Reuse existing services
 from app.services.prices import get_player_price
 from app.services.price_history import get_price_history
 
@@ -18,6 +18,7 @@ _player_pool: Optional[asyncpg.Pool] = None
 
 # ---------------- DB Pools ----------------
 async def pool() -> asyncpg.Pool:
+    """Main app DB (for feedback/cache)."""
     global _main_pool
     if _main_pool is None:
         if not DB_URL:
@@ -27,6 +28,7 @@ async def pool() -> asyncpg.Pool:
     return _main_pool
 
 async def get_player_pool() -> asyncpg.Pool:
+    """Players DB (table fut_players lives here)."""
     global _player_pool
     if _player_pool is None:
         if not PLAYER_DB_URL:
@@ -64,13 +66,8 @@ def _pct(new: Optional[float], old: Optional[float]) -> float:
     except ZeroDivisionError:
         return 0.0
 
-def _split_csv(v: Optional[str]) -> List[str]:
-    if not v:
-        return []
-    return [x.strip() for x in v.split(",") if x.strip()]
-
 async def _safe_price(card_id: int, platform: str) -> Optional[float]:
-    # Fallback live price fetcher (used only if DB price is missing)
+    """Fallback live price if DB price is missing."""
     try:
         p = await get_player_price(card_id, platform)
         if isinstance(p, dict):
@@ -84,6 +81,11 @@ async def _safe_hist(card_id: int, platform: str, span: str) -> List[Dict[str, A
         return await get_price_history(card_id, platform, span) or []
     except Exception:
         return []
+
+def _split_csv(v: Optional[str]) -> List[str]:
+    if not v:
+        return []
+    return [x.strip() for x in v.split(",") if x.strip()]
 
 # ---------------- Market Intelligence ----------------
 @router.get("/market-intelligence")
@@ -120,10 +122,9 @@ async def _candidate_cards(
     limit: int = 300
 ) -> List[asyncpg.Record]:
     """
-    Pull candidates from fut_players using the numeric mirror column `price_num`.
+    Pull candidates from fut_players using the NUMERIC mirror column price_num.
     """
     player = await get_player_pool()
-
     sql = ["""
         SELECT
           card_id,
@@ -153,7 +154,6 @@ async def _candidate_cards(
         sql.append(f"AND nation = ANY(${len(params)})")
 
     sql.append("ORDER BY rating DESC NULLS LAST, price_num ASC NULLS LAST LIMIT {}".format(limit))
-
     try:
         async with player.acquire() as c:
             return await c.fetch(" ".join(sql), *params)
@@ -162,7 +162,7 @@ async def _candidate_cards(
 
 async def _score(card: asyncpg.Record, platform: str, budget: int, horizon: str) -> Optional[Dict[str, Any]]:
     """
-    Build a suggestion score. Prefer DB price (price_num) and only fall back to live price if needed.
+    Scoring with DB price preferred; fallback to live price if needed.
     """
     price_now: Optional[float] = None
     db_price = card.get("price")
@@ -174,7 +174,7 @@ async def _score(card: asyncpg.Record, platform: str, budget: int, horizon: str)
     if not price_now or price_now <= 0 or price_now > budget:
         return None
 
-    # history for momentum
+    # History for momentum (best-effort)
     h4 = await _safe_hist(int(card["card_id"]), platform, "4h")
     h24 = await _safe_hist(int(card["card_id"]), platform, "24h")
 
@@ -216,8 +216,8 @@ async def _score(card: asyncpg.Record, platform: str, budget: int, horizon: str)
 @router.get("/suggestions")
 async def suggestions(
     budget: int = Query(100000),
-    risk_tolerance: str = Query("moderate"),      # conservative | moderate | aggressive
-    time_horizon: str = Query("short"),           # quick_flip | short | long_term
+    risk_tolerance: str = Query("moderate"),
+    time_horizon: str = Query("short"),
     platform: str = Query("ps"),
     categories: Optional[str] = Query(None),
     exclude_positions: Optional[str] = Query(None),
@@ -232,22 +232,22 @@ async def suggestions(
     nations = _split_csv(preferred_nations)
 
     cards = await _candidate_cards(min_rating, max_rating, excl, leagues, nations, budget, limit=300)
-    computed: List[Dict[str, Any]] = []
+    results: List[Dict[str, Any]] = []
     for c in cards:
         s = await _score(c, platform, budget, time_horizon)
         if s:
-            computed.append(s)
+            results.append(s)
 
-    # risk filter
-    filtered = computed
+    # Risk filter
+    filtered = results
     if risk_tolerance == "conservative":
-        filtered = [r for r in computed if r["est_profit"] >= 1500]
+        filtered = [r for r in results if r["est_profit"] >= 1500]
     elif risk_tolerance == "moderate":
-        filtered = [r for r in computed if r["est_profit"] >= 800]
+        filtered = [r for r in results if r["est_profit"] >= 800]
 
-    # fallback so UI isn't empty
-    if not filtered and computed:
-        filtered = sorted(computed, key=lambda r: (r["score"], r["est_profit"]), reverse=True)[:20]
+    # Fallback so UI isn't blank
+    if not filtered and results:
+        filtered = sorted(results, key=lambda r: (r["score"], r["est_profit"]), reverse=True)[:20]
 
     filtered.sort(key=lambda r: (r["score"], r["est_profit"]), reverse=True)
 
@@ -262,7 +262,7 @@ async def suggestions(
 # ---------------- Suggestion detail ----------------
 @router.get("/suggestion/{card_id}")
 async def suggestion_detail(card_id: int, platform: str = Query("ps")) -> Dict[str, Any]:
-    # prefer price_num from DB; fallback to live
+    # Prefer DB numeric price
     price: Optional[float] = None
     try:
         async with (await get_player_pool()).acquire() as c:
@@ -279,5 +279,71 @@ async def suggestion_detail(card_id: int, platform: str = Query("ps")) -> Dict[s
 
     hist = await _safe_hist(card_id, platform, "24h")
 
-    # similar by rating+position
-    sims: List[Dict[str, Any]] =
+    # Similar by rating+position
+    sims: List[Dict[str, Any]] = []
+    try:
+        async with (await get_player_pool()).acquire() as c:
+            base = await c.fetchrow("SELECT rating, position FROM fut_players WHERE card_id=$1::text", str(card_id))
+            if base:
+                rows = await c.fetch("""
+                  SELECT card_id, name, rating, position
+                  FROM fut_players
+                  WHERE rating=$1 AND position=$2 AND card_id<>$3::text
+                  ORDER BY random() LIMIT 6
+                """, int(base["rating"]), base["position"], str(card_id))
+                for r in rows:
+                    sims.append({
+                        "card_id": int(r["card_id"]), "name": r["name"],
+                        "rating": int(r["rating"] or 0), "position": r["position"]
+                    })
+    except Exception:
+        pass
+
+    return {
+        "card_id": card_id,
+        "analysis": {
+            "price_now": price,
+            "liquidity_hint": "medium",
+            "risk_factors": ["EA tax", "supply spikes on content drops"],
+            "notes": "Use 50–100 coin undercuts to accelerate sales."
+        },
+        "price_history": hist,
+        "similar_cards": sims,
+        "risk_factors": ["EA tax", "supply spikes on content drops"],
+        "profit_scenarios": {
+            "sell_2pc": max(0, int((price or 0) * 1.02 * 0.95) - int(price or 0)),
+            "sell_5pc": max(0, int((price or 0) * 1.05 * 0.95) - int(price or 0)),
+            "sell_8pc": max(0, int((price or 0) * 1.08 * 0.95) - int(price or 0)),
+        }
+    }
+
+# ---------------- Feedback ----------------
+@router.post("/feedback")
+async def feedback(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    card_id = int(payload.get("card_id"))
+    action = str(payload.get("action") or "")
+    notes = str(payload.get("notes") or "")
+    platform = str(payload.get("platform") or "ps")
+    if action not in {"bought", "ignored", "watchlisted"}:
+        raise HTTPException(400, "Invalid action")
+    async with (await pool()).acquire() as c:
+        await c.execute(
+            "INSERT INTO smart_buy_feedback (card_id, action, notes, platform) VALUES ($1,$2,$3,$4)",
+            card_id, action, notes, platform
+        )
+    return {"success": True}
+
+# ---------------- Stats ----------------
+@router.get("/stats")
+async def stats() -> Dict[str, Any]:
+    async with (await pool()).acquire() as c:
+        total = await c.fetchval("SELECT COUNT(*) FROM smart_buy_feedback")
+        taken = await c.fetchval("SELECT COUNT(*) FROM smart_buy_feedback WHERE action='bought'")
+    return {
+        "total_suggestions": int(total or 0),
+        "suggestions_taken": int(taken or 0),
+        "success_rate": round((taken or 0) / max(1, total or 1), 2),
+        "avg_profit": 0,
+        "total_profit": 0,
+        "category_performance": {}
+    }
