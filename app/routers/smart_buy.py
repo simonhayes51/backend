@@ -1,41 +1,28 @@
 # app/routers/smart_buy.py
 import os, math, json, asyncpg
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, HTTPException, Query, Body
 
+# reuse your existing services
 from app.services.prices import get_player_price
 from app.services.price_history import get_price_history
 
 router = APIRouter(prefix="/smart-buy", tags=["smart-buy"])
 
-# ---------- ENV / POOLS ----------
 DB_URL = os.getenv("DATABASE_URL")
-PLAYER_DB_URL = os.getenv("PLAYER_DATABASE_URL", DB_URL)
-
-_main_pool: Optional[asyncpg.Pool] = None
-_player_pool: Optional[asyncpg.Pool] = None
+_pool: Optional[asyncpg.Pool] = None
 
 
+# ---------- pool & schema ----------
 async def pool() -> asyncpg.Pool:
-    """Main app DB (cache + feedback)."""
-    global _main_pool
-    if _main_pool is None:
+    global _pool
+    if _pool is None:
         if not DB_URL:
             raise RuntimeError("DATABASE_URL missing")
-        _main_pool = await asyncpg.create_pool(DB_URL, min_size=1, max_size=4)
-        await _ensure_schema(_main_pool)
-    return _main_pool
-
-
-async def get_player_pool() -> asyncpg.Pool:
-    """Players DB where fut_players lives."""
-    global _player_pool
-    if _player_pool is None:
-        if not PLAYER_DB_URL:
-            raise RuntimeError("PLAYER_DATABASE_URL missing")
-        _player_pool = await asyncpg.create_pool(PLAYER_DB_URL, min_size=1, max_size=4)
-    return _player_pool
+        _pool = await asyncpg.create_pool(DB_URL, min_size=1, max_size=4)
+        await _ensure_schema(_pool)
+    return _pool
 
 
 async def _ensure_schema(p: asyncpg.Pool) -> None:
@@ -56,68 +43,64 @@ async def _ensure_schema(p: asyncpg.Pool) -> None:
           updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )""")
 
-# ---------- HELPERS ----------
+
+# ---------- helpers ----------
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
+
 def _pct(new: Optional[float], old: Optional[float]) -> float:
-    if not new or not old:
+    if new is None or old is None or old == 0:
         return 0.0
     try:
         return round((new - old) / old * 100.0, 2)
-    except ZeroDivisionError:
+    except Exception:
         return 0.0
 
+
+def _fl(xs: List[Dict[str, Any]]) -> Tuple[Optional[float], Optional[float]]:
+    """extract first/last price from a history array with {price|v|y}"""
+    if not xs:
+        return (None, None)
+    def _get(p):
+        v = p.get("price")
+        if v is None:
+            v = p.get("v")
+        if v is None:
+            v = p.get("y")
+        try:
+            return float(v) if v is not None else None
+        except Exception:
+            return None
+    return (_get(xs[0]), _get(xs[-1]))
+
+
 async def _safe_price(card_id: int, platform: str) -> Optional[float]:
+    """Return a positive float or None. Treat 0 / '0' as no price."""
     try:
         p = await get_player_price(card_id, platform)
         if isinstance(p, dict):
             p = p.get("price") or p.get("console") or p.get("ps")
-        return float(p) if p else None
+        if p in (None, "", 0, "0", "0.0"):
+            return None
+        v = float(p)
+        return v if v > 0 else None
     except Exception:
         return None
 
+
 async def _safe_hist(card_id: int, platform: str, span: str) -> List[Dict[str, Any]]:
     try:
-        return await get_price_history(card_id, platform, span) or []
+        data = await get_price_history(card_id, platform, span)
+        return data or []
     except Exception:
         return []
 
-def _split_csv(v: Optional[str]) -> List[str]:
-    return [x.strip() for x in (v or "").split(",") if x and x.strip()]
 
-# Robust history parsing
-def _extract_prices(xs) -> List[float]:
-    out: List[float] = []
-    for p in xs or []:
-        if isinstance(p, (int, float)):
-            out.append(float(p)); continue
-        if isinstance(p, dict):
-            v = p.get("price")
-            if v is None: v = p.get("v")
-            if v is None: v = p.get("y")
-            if isinstance(v, (int, float)): out.append(float(v))
-            continue
-        if isinstance(p, (list, tuple)) and p:
-            cand = p[-1]
-            if isinstance(cand, (int, float)): out.append(float(cand))
-    return out
-
-def _first_last_pct(xs) -> float:
-    vals = _extract_prices(xs)
-    if len(vals) < 2: return 0.0
-    first, last = vals[0], vals[-1]
-    if not first: return 0.0
-    try:
-        return round((last - first) / first * 100.0, 2)
-    except ZeroDivisionError:
-        return 0.0
-
-# ---------- MARKET INTELLIGENCE ----------
+# ---------- Market Intelligence ----------
 @router.get("/market-intelligence")
 async def market_intelligence() -> Dict[str, Any]:
-    """Always returns 200; reads JSONB as TEXT then json.loads for safety."""
-    fallback = {
+    default_payload = {
         "current_state": "normal",
         "upcoming_events": [],
         "crash_probability": 0.12,
@@ -128,92 +111,83 @@ async def market_intelligence() -> Dict[str, Any]:
     try:
         p = await pool()
         async with p.acquire() as c:
-            row = await c.fetchrow(
-                "SELECT payload::text AS payload_text FROM smart_buy_market_cache WHERE id=1"
-            )
-        if row and row["payload_text"]:
-            try:
-                return json.loads(row["payload_text"])
-            except Exception:
-                pass  # corrupted cache, reseed below
-
-        # seed cache
-        async with (await pool()).acquire() as c:
+            row = await c.fetchrow("SELECT payload FROM smart_buy_market_cache WHERE id = 1")
+            if row and row["payload"]:
+                return row["payload"]
+        # seed if missing
+        async with p.acquire() as c:
             await c.execute("""
                 INSERT INTO smart_buy_market_cache (id, payload, updated_at)
                 VALUES (1, $1::jsonb, NOW())
-                ON CONFLICT (id) DO UPDATE
-                  SET payload = EXCLUDED.payload,
-                      updated_at = NOW()
-            """, json.dumps(fallback))
-        return fallback
+                ON CONFLICT (id) DO UPDATE SET payload=EXCLUDED.payload, updated_at=NOW()
+            """, json.dumps(default_payload))
+        return default_payload
     except Exception:
-        return fallback
+        # never 500 the page; just return defaults
+        return default_payload
 
-# ---------- SUGGESTIONS ----------
-async def _candidate_cards(
-    min_rating: int,
-    max_rating: int,
-    exclude_positions: List[str],
-    preferred_leagues: List[str],
-    preferred_nations: List[str],
-    budget: int,
-    limit: int = 300,
-) -> List[asyncpg.Record]:
-    """Pull candidates from fut_players using price_num."""
-    player = await get_player_pool()
-    sql = ["""
-        SELECT
-          card_id, name, rating, position, league, nation,
-          price_num AS price
-        FROM fut_players
-        WHERE rating >= $1
-          AND rating <= $2
-          AND price_num IS NOT NULL
-          AND price_num > 0
-          AND price_num <= $3
-    """]
-    params: List[Any] = [min_rating, max_rating, budget]
 
-    if exclude_positions:
-        params.append(exclude_positions)
-        sql.append(f"AND position <> ALL(${len(params)})")
-    if preferred_leagues:
-        params.append(preferred_leagues)
-        sql.append(f"AND league = ANY(${len(params)})")
-    if preferred_nations:
-        params.append(preferred_nations)
-        sql.append(f"AND nation = ANY(${len(params)})")
-
-    sql.append("ORDER BY rating DESC NULLS LAST, price_num ASC NULLS LAST")
-    sql.append(f"LIMIT {int(limit)}")
-
+# ---------- Suggestions ----------
+async def _candidate_cards(min_rating: int, max_rating: int, budget: int, limit: int = 120) -> List[asyncpg.Record]:
+    """
+    Pulls only tradable cards:
+      - price_num IS NOT NULL AND > 0
+      - price_num <= budget (so we don't score things we can't buy)
+    """
     try:
-        async with player.acquire() as c:
-            return await c.fetch(" ".join(sql), *params)
+        async with (await pool()).acquire() as c:
+            return await c.fetch("""
+              SELECT card_id, name, rating, position, league, nation, price_num AS price
+              FROM fut_players
+              WHERE rating >= $1
+                AND rating <= $2
+                AND price_num IS NOT NULL
+                AND price_num > 0
+                AND price_num <= $3
+              ORDER BY rating DESC NULLS LAST
+              LIMIT $4
+            """, min_rating, max_rating, budget, limit)
     except Exception:
         return []
 
+
 async def _score(card: asyncpg.Record, platform: str, budget: int, horizon: str) -> Optional[Dict[str, Any]]:
-    """Score each candidate; prefer DB price; fallback to live price."""
-    db_price = card.get("price")
-    price_now: Optional[float] = float(db_price) if isinstance(db_price, (int, float)) and db_price > 0 else None
-    if price_now is None:
+    # Parse price from DB (price_num alias as price)
+    raw_price = card.get("price")
+    price_now: Optional[float] = None
+    try:
+        if raw_price is not None:
+            price_now = float(raw_price)
+    except (TypeError, ValueError):
+        price_now = None
+
+    # If missing from DB, try live
+    if price_now is None or price_now <= 0:
         price_now = await _safe_price(int(card["card_id"]), platform)
 
-    if not price_now or price_now <= 0 or price_now > budget:
+    # Final guard: exclude untradables / budget overflow
+    if price_now is None or price_now <= 0 or price_now > budget:
         return None
 
-    h4  = await _safe_hist(int(card["card_id"]), platform, "4h")
+    # momentum windows
+    h4 = await _safe_hist(int(card["card_id"]), platform, "4h")
     h24 = await _safe_hist(int(card["card_id"]), platform, "24h")
-    mom4  = _first_last_pct(h4)
-    mom24 = _first_last_pct(h24)
+    f4, l4 = _fl(h4)
+    f24, l24 = _fl(h24)
+    mom4, mom24 = _pct(l4, f4), _pct(l24, f24)
 
     rating = float(card["rating"] or 0)
-    value_ratio = rating / max(2.0, math.log(max(2.0, price_now)))
-    bias = {"quick_flip": 1.2, "short": 1.0, "long_term": 0.8}.get(horizon, 1.0)
+    # higher rating at same coin cost = better value
+    value_ratio = rating / max(2.0, math.log(price_now))
 
+    # horizon bias
+    bias_map = {"quick_flip": 1.25, "short": 1.0, "long_term": 0.85}
+    bias = bias_map.get(horizon, 1.0)
+
+    # composite score – positive for cheap high-rated, penalise strong uptrends
     score = ((value_ratio * 10) - 0.4 * mom24 - 0.2 * mom4) * bias
+
+    # conservative sell target (slightly higher if current momentum <= 0)
     target = round(price_now * (1.08 if mom4 <= 0 else 1.04))
     tax = int(target * 0.05)
     est = max(0, target - tax - int(price_now))
@@ -233,6 +207,7 @@ async def _score(card: asyncpg.Record, platform: str, budget: int, horizon: str)
         "est_profit": est
     }
 
+
 @router.get("/suggestions")
 async def suggestions(
     budget: int = Query(100000),
@@ -247,62 +222,46 @@ async def suggestions(
     preferred_nations: Optional[str] = Query(None),
 ) -> Dict[str, Any]:
 
-    excl = _split_csv(exclude_positions)
-    leagues = _split_csv(preferred_leagues)
-    nations = _split_csv(preferred_nations)
+    cards = await _candidate_cards(min_rating, max_rating, budget, 120)
 
-    cards = await _candidate_cards(min_rating, max_rating, excl, leagues, nations, budget, limit=300)
-    results: List[Dict[str, Any]] = []
+    out: List[Dict[str, Any]] = []
     for c in cards:
         s = await _score(c, platform, budget, time_horizon)
         if s:
-            results.append(s)
+            out.append(s)
 
     # risk filters
-    filtered = results
     if risk_tolerance == "conservative":
-        filtered = [r for r in results if r["est_profit"] >= 1500]
+        out = [r for r in out if r["est_profit"] >= 1500]
     elif risk_tolerance == "moderate":
-        filtered = [r for r in results if r["est_profit"] >= 800]
+        out = [r for r in out if r["est_profit"] >= 800]
+    # aggressive – no extra filter
 
-    if not filtered and results:
-        filtered = sorted(results, key=lambda r: (r["score"], r["est_profit"]), reverse=True)[:20]
-
-    filtered.sort(key=lambda r: (r["score"], r["est_profit"]), reverse=True)
+    out.sort(key=lambda r: (r["score"], r["est_profit"]), reverse=True)
 
     return {
         "market_state": "normal",
         "market_analysis": {"note": "heuristics-based suggestions"},
         "next_update": (now_utc() + timedelta(minutes=15)).isoformat(),
         "confidence_score": 0.62,
-        "suggestions": filtered[:20],
+        "suggestions": out[:20],
     }
 
-# ---------- SUGGESTION DETAIL ----------
+
+# ---------- Suggestion detail ----------
 @router.get("/suggestion/{card_id}")
 async def suggestion_detail(card_id: int, platform: str = Query("ps")) -> Dict[str, Any]:
-    # Prefer DB numeric price
-    price: Optional[float] = None
-    try:
-        async with (await get_player_pool()).acquire() as c:
-            r = await c.fetchrow(
-                "SELECT price_num FROM fut_players WHERE card_id=$1::text",
-                str(card_id)
-            )
-        if r and r["price_num"] is not None:
-            price = float(r["price_num"])
-    except Exception:
-        pass
-    if price is None:
-        price = await _safe_price(card_id, platform)
-
+    price = await _safe_price(card_id, platform)
     hist = await _safe_hist(card_id, platform, "24h")
 
-    # Similar by rating+position
+    # similar by rating+position
     sims: List[Dict[str, Any]] = []
     try:
-        async with (await get_player_pool()).acquire() as c:
-            base = await c.fetchrow("SELECT rating, position FROM fut_players WHERE card_id=$1::text", str(card_id))
+        async with (await pool()).acquire() as c:
+            base = await c.fetchrow(
+                "SELECT rating, position FROM fut_players WHERE card_id=$1::text",
+                str(card_id)
+            )
             if base:
                 rows = await c.fetch("""
                   SELECT card_id, name, rating, position
@@ -320,6 +279,11 @@ async def suggestion_detail(card_id: int, platform: str = Query("ps")) -> Dict[s
     except Exception:
         pass
 
+    # simple profit ladder from current
+    p = float(price or 0)
+    def _p(x: float) -> int:
+        return max(0, int(p * (1.0 + x) * 0.95) - int(p))
+
     return {
         "card_id": card_id,
         "analysis": {
@@ -332,13 +296,14 @@ async def suggestion_detail(card_id: int, platform: str = Query("ps")) -> Dict[s
         "similar_cards": sims,
         "risk_factors": ["EA tax", "supply spikes on content drops"],
         "profit_scenarios": {
-            "sell_2pc": max(0, int((price or 0) * 1.02 * 0.95) - int(price or 0)),
-            "sell_5pc": max(0, int((price or 0) * 1.05 * 0.95) - int(price or 0)),
-            "sell_8pc": max(0, int((price or 0) * 1.08 * 0.95) - int(price or 0)),
+            "sell_2pc": _p(0.02),
+            "sell_5pc": _p(0.05),
+            "sell_8pc": _p(0.08),
         }
     }
 
-# ---------- FEEDBACK ----------
+
+# ---------- Feedback ----------
 @router.post("/feedback")
 async def feedback(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     card_id = int(payload.get("card_id"))
@@ -354,63 +319,21 @@ async def feedback(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
         )
     return {"success": True}
 
-# ---------- STATS ----------
+
+# ---------- Stats ----------
 @router.get("/stats")
 async def stats() -> Dict[str, Any]:
-    async with (await pool()).acquire() as c:
-        total = await c.fetchval("SELECT COUNT(*) FROM smart_buy_feedback")
-        taken = await c.fetchval("SELECT COUNT(*) FROM smart_buy_feedback WHERE action='bought'")
+    try:
+        async with (await pool()).acquire() as c:
+            total = await c.fetchval("SELECT COUNT(*) FROM smart_buy_feedback")
+            taken = await c.fetchval("SELECT COUNT(*) FROM smart_buy_feedback WHERE action='bought'")
+    except Exception:
+        total = taken = 0
     return {
         "total_suggestions": int(total or 0),
         "suggestions_taken": int(taken or 0),
-        "success_rate": round((taken or 0) / max(1, total or 1), 2),
+        "success_rate": round((taken or 0)/max(1, total or 1), 2),
         "avg_profit": 0,
         "total_profit": 0,
         "category_performance": {}
     }
-
-# ---------- DEBUG ----------
-@router.get("/_debug")
-async def smart_buy_debug() -> Dict[str, Any]:
-    info: Dict[str, Any] = {
-        "env_seen": {
-            "DATABASE_URL_set": bool(DB_URL),
-            "PLAYER_DATABASE_URL_set": bool(PLAYER_DB_URL),
-        }
-    }
-    # main DB
-    try:
-        p = await pool()
-        async with p.acquire() as c:
-            await c.fetchval("SELECT 1")
-        info["main_db_ok"] = True
-    except Exception as e:
-        info["main_db_ok"] = False
-        info["main_db_error"] = str(e)
-
-    # players DB / table / column counts
-    try:
-        pp = await get_player_pool()
-        async with pp.acquire() as c:
-            exists = await c.fetchval("SELECT to_regclass('public.fut_players') IS NOT NULL")
-            info["players_table_exists"] = bool(exists)
-            has_price_num = await c.fetchval("""
-                SELECT EXISTS (
-                  SELECT 1
-                  FROM information_schema.columns
-                  WHERE table_schema='public'
-                    AND table_name='fut_players'
-                    AND column_name='price_num'
-                )
-            """)
-            info["has_price_num"] = bool(has_price_num)
-            if exists:
-                info["players_rowcount"] = int(await c.fetchval("SELECT COUNT(*) FROM fut_players") or 0)
-            if has_price_num:
-                info["price_num_non_null"] = int(await c.fetchval(
-                    "SELECT COUNT(*) FROM fut_players WHERE price_num IS NOT NULL"
-                ) or 0)
-    except Exception as e:
-        info["player_db_error"] = str(e)
-
-    return info
