@@ -1,6 +1,6 @@
 # app/routers/smart_buy.py
-import json
 from typing import Any, Dict, List, Optional, Literal
+import json
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from pydantic import BaseModel
@@ -11,17 +11,20 @@ router = APIRouter(tags=["Smart Buy"])
 # Helpers / Dependencies
 # -----------------------
 
-def _get_current_user(request: Request) -> str:
+def _current_user(request: Request) -> str:
     user_id = request.session.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="Not authenticated")
     return user_id
 
 async def _db(request: Request):
-    """Yield a connection from the main pool attached in main.lifespan()."""
+    """
+    Yield a connection from the **main** DB pool attached in main.lifespan().
+    (This is the pool where smart_buy_* tables live.)
+    """
     pool = getattr(request.app.state, "pool", None)
     if pool is None:
-        raise HTTPException(500, "Database pool not initialized")
+        raise HTTPException(status_code=500, detail="Database pool not initialized")
     async with pool.acquire() as conn:
         yield conn
 
@@ -29,32 +32,6 @@ async def _db(request: Request):
 # -----------------------
 # Models
 # -----------------------
-
-class SuggestionOut(BaseModel):
-    id: int
-    user_id: str
-    card_id: str
-    suggestion_type: str
-    current_price: int
-    target_price: int
-    expected_profit: int
-    risk_level: str
-    confidence_score: int
-    priority_score: int
-    reasoning: str
-    time_to_profit: Optional[str] = None
-    platform: str
-    market_state: str
-    created_at: Optional[str] = None
-    expires_at: Optional[str] = None
-
-class FeedbackIn(BaseModel):
-    card_id: str
-    action: Literal["bought", "ignored", "watchlisted"]
-    notes: Optional[str] = None
-    actual_buy_price: Optional[int] = None
-    actual_sell_price: Optional[int] = None
-    actual_profit: Optional[int] = None
 
 class PreferencesIn(BaseModel):
     default_budget: Optional[int] = 100000
@@ -69,6 +46,14 @@ class PreferencesIn(BaseModel):
     min_profit: Optional[int] = 1000
     notifications_enabled: Optional[bool] = True
 
+class FeedbackIn(BaseModel):
+    card_id: str
+    action: Literal["bought", "ignored", "watchlisted"]
+    notes: Optional[str] = None
+    actual_buy_price: Optional[int] = None
+    actual_sell_price: Optional[int] = None
+    actual_profit: Optional[int] = None
+
 
 # -----------------------
 # Suggestions
@@ -77,14 +62,13 @@ class PreferencesIn(BaseModel):
 @router.get("/smart-buy/suggestions", response_model=Dict[str, Any])
 async def list_suggestions(
     request: Request,
-    user_id: str = Depends(_get_current_user),
+    user_id: str = Depends(_current_user),
     conn = Depends(_db),
     platform: Optional[Literal["ps", "xbox", "pc"]] = Query(None),
     limit: int = Query(20, ge=1, le=100),
 ):
     """
-    Return latest Smart Buy suggestions for the current user.
-    If `platform` is provided, filter on it.
+    Latest Smart Buy suggestions for the current user.
     """
     if platform:
         rows = await conn.fetch(
@@ -108,9 +92,7 @@ async def list_suggestions(
             """,
             user_id, limit
         )
-
-    items = [dict(r) for r in rows]
-    return {"items": items, "count": len(items)}
+    return {"items": [dict(r) for r in rows]}
 
 
 # -----------------------
@@ -121,18 +103,14 @@ async def list_suggestions(
 async def create_feedback(
     payload: FeedbackIn,
     request: Request,
-    user_id: str = Depends(_get_current_user),
+    user_id: str = Depends(_current_user),
     conn = Depends(_db),
 ):
-    """
-    Store user feedback about a suggestion / action taken.
-    """
     row = await conn.fetchrow(
         """
         INSERT INTO smart_buy_feedback (
             user_id, card_id, action, notes, actual_buy_price, actual_sell_price, actual_profit, timestamp
-        )
-        VALUES ($1,$2,$3,$4,$5,$6,$7, NOW())
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7, NOW())
         RETURNING id, user_id, card_id, action, notes, actual_buy_price, actual_sell_price, actual_profit, timestamp
         """,
         user_id,
@@ -153,13 +131,14 @@ async def create_feedback(
 @router.get("/smart-buy/preferences", response_model=Dict[str, Any])
 async def get_preferences(
     request: Request,
-    user_id: str = Depends(_get_current_user),
+    user_id: str = Depends(_current_user),
     conn = Depends(_db),
 ):
     row = await conn.fetchrow(
         """
-        SELECT user_id, default_budget, risk_tolerance, preferred_time_horizon, preferred_categories, excluded_positions,
-               preferred_leagues, preferred_nations, min_rating, max_rating, min_profit, notifications_enabled,
+        SELECT user_id, default_budget, risk_tolerance, preferred_time_horizon,
+               preferred_categories, excluded_positions, preferred_leagues, preferred_nations,
+               min_rating, max_rating, min_profit, notifications_enabled,
                created_at, updated_at
         FROM smart_buy_preferences
         WHERE user_id = $1
@@ -167,7 +146,7 @@ async def get_preferences(
         user_id
     )
     if not row:
-        # Return sensible defaults (match table defaults from main.py)
+        # Defaults mirror your table defaults in main.py
         return {
             "user_id": user_id,
             "default_budget": 100000,
@@ -183,7 +162,7 @@ async def get_preferences(
             "notifications_enabled": True,
         }
     out = dict(row)
-    # Ensure JSONB fields are native lists
+    # Ensure JSONB are lists
     for k in ("preferred_categories", "excluded_positions", "preferred_leagues", "preferred_nations"):
         v = out.get(k)
         if isinstance(v, str):
@@ -198,12 +177,9 @@ async def get_preferences(
 async def upsert_preferences(
     payload: PreferencesIn,
     request: Request,
-    user_id: str = Depends(_get_current_user),
+    user_id: str = Depends(_current_user),
     conn = Depends(_db),
 ):
-    """
-    Upsert user preferences.
-    """
     await conn.execute(
         """
         INSERT INTO smart_buy_preferences (
@@ -254,6 +230,9 @@ async def latest_market_state(
     conn = Depends(_db),
     platform: Literal["ps", "xbox", "pc"] = Query("ps"),
 ):
+    """
+    Latest detected market regime for a platform.
+    """
     row = await conn.fetchrow(
         """
         SELECT platform, state, confidence_score, detected_at, indicators
@@ -265,8 +244,21 @@ async def latest_market_state(
         platform
     )
     if not row:
-        return {"platform": platform, "state": None, "confidence_score": None, "detected_at": None, "indicators": None}
+        return {
+            "platform": platform,
+            "state": None,
+            "confidence_score": 0,
+            "detected_at": None,
+            "indicators": None
+        }
     out = dict(row)
+    # psql JSONB -> Python dict is fine; if text, try JSON-load
+    inds = out.get("indicators")
+    if isinstance(inds, str):
+        try:
+            out["indicators"] = json.loads(inds)
+        except Exception:
+            pass
     return out
 
 
@@ -276,7 +268,7 @@ async def smart_buy_market_cache(
     conn = Depends(_db),
 ):
     """
-    Return the latest precomputed Smart Buy market cache blob (if used).
+    Latest precomputed Smart Buy market cache blob (if you populate it).
     """
     row = await conn.fetchrow(
         """
@@ -287,4 +279,36 @@ async def smart_buy_market_cache(
     )
     if not row:
         return {"payload": None, "updated_at": None}
-    return {"payload": row["payload"], "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None}
+    payload = row["payload"]
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except Exception:
+            pass
+    return {
+        "payload": payload,
+        "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None
+    }
+
+
+# -----------------------
+# Frontend alias (workaround)
+# -----------------------
+
+@router.get("/smart-buy/market-intelligence", response_model=Dict[str, Any])
+async def market_intelligence_alias(
+    request: Request,
+    conn = Depends(_db),
+    # Default to PS to match most consoles; FE can pass ?platform=...
+    platform: Literal["ps", "xbox", "pc"] = Query("ps"),
+):
+    """
+    Alias to satisfy frontend call:
+    Returns both market state (regime) and market cache in one payload.
+    """
+    state = await latest_market_state(request, conn=conn, platform=platform)
+    cache = await smart_buy_market_cache(request, conn=conn)
+    return {
+        "state": state,
+        "cache": cache
+    }
