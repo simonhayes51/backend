@@ -392,3 +392,4 @@ async def suggestions(
             pass
 
     return {"items": selected, "suggestions": selected, "count": len(selected)}
+    router = smart_buy_router
