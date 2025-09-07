@@ -1,361 +1,378 @@
-# app/routers/smart_buy.py
+from typing import Any, Dict, List, Optional, Literal
+from datetime import datetime, timedelta
 
-from __future__ import annotations
-from typing import Any, Dict, List, Literal, Optional
-
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from pydantic import BaseModel
 
-router = APIRouter()
+router = APIRouter(prefix="/api/smart-buy", tags=["smart-buy"])
 
-# --------- Models ---------
-class SmartBuyPreferencesIn(BaseModel):
-    default_budget: Optional[int] = 100_000
-    risk_tolerance: Literal["low", "moderate", "high"] = "moderate"
-    preferred_time_horizon: Literal["very_short", "short", "medium", "long"] = "short"
+# --------------------------
+# Models (payloads)
+# --------------------------
+class FeedbackCreate(BaseModel):
+    card_id: str
+    action: Literal["bought", "ignored", "watchlisted"]
+    notes: Optional[str] = None
+    actual_buy_price: Optional[int] = None
+    actual_sell_price: Optional[int] = None
+
+class PreferencesUpsert(BaseModel):
+    default_budget: Optional[int] = 120_000
+    risk_tolerance: Optional[Literal["low","moderate","high"]] = "moderate"
+    preferred_time_horizon: Optional[Literal["short","swing","long"]] = "short"
     preferred_categories: Optional[List[str]] = []
     excluded_positions: Optional[List[str]] = []
     preferred_leagues: Optional[List[str]] = []
     preferred_nations: Optional[List[str]] = []
-    min_rating: Optional[int] = 75
+    min_rating: Optional[int] = 78
     max_rating: Optional[int] = 95
     min_profit: Optional[int] = 1000
     notifications_enabled: Optional[bool] = True
 
-class SmartBuyFeedbackIn(BaseModel):
-    card_id: str
-    action: Literal["bought", "ignored", "watchlisted"]
-    notes: Optional[str] = ""
-    actual_buy_price: Optional[int] = None
-    actual_sell_price: Optional[int] = None
-    actual_profit: Optional[int] = None
+# --------------------------
+# Helpers
+# --------------------------
+def _risk_to_where(risk: Optional[str]) -> str:
+    if not risk:
+        return "TRUE"
+    # normalize
+    r = risk.lower()
+    if r in ("low","moderate","high"):
+        return "LOWER(s.risk_level) = $risk"
+    return "TRUE"
 
-# --------- Dependencies ---------
-async def _db(request: Request):
-    async with request.app.state.pool.acquire() as conn:
-        yield conn
+def _horizon_to_hours(h: Optional[str]) -> int:
+    if not h:
+        return 72  # default 3 days
+    h = h.lower()
+    if h == "short":
+        return 24
+    if h in ("swing", "mid"):
+        return 72
+    if h == "long":
+        return 168
+    return 72
 
-async def _player_db(request: Request):
-    async with request.app.state.player_pool.acquire() as conn:
-        yield conn
-
-def _get_user_id(request: Request) -> Optional[str]:
-    return request.session.get("user_id")
-
-# --------- Helpers ---------
-def _platform_norm(p: str) -> str:
-    p = (p or "").lower()
-    if p in ("ps", "playstation", "console"):
+def _platform_norm(p: Optional[str]) -> str:
+    p = (p or "ps").lower()
+    if p in ("ps","playstation","console"):
         return "ps"
-    if p in ("xbox", "xb"):
+    if p in ("xbox","xb"):
         return "xbox"
-    if p in ("pc", "origin"):
+    if p in ("pc","origin"):
         return "pc"
     return "ps"
 
-def _map_risk(label: Optional[str]) -> Optional[str]:
-    s = (label or "").strip().lower()
-    if s in ("low", "moderate", "high"):
-        return s
-    return None
-
-def _map_horizons(label: Optional[str]) -> List[str]:
-    s = (label or "").strip().lower()
-    if s in ("very_short", "very-short", "0-6h"):
-        return ["0-6h"]
-    if s in ("short", "short_term", "short-term", "6-24h", "6-48h"):
-        return ["6-24h", "6-48h"]
-    if s in ("medium", "24-72h", "1-3d"):
-        return ["24-72h", "1-3d"]
-    if s in ("long", "3-7d", "1-2w"):
-        return ["3-7d", "1-2w"]
-    return []  # no filter
-
-async def _enrich(player_conn, card_ids: List[str]) -> Dict[str, Dict[str, Any]]:
-    if not card_ids:
-        return {}
-    rows = await player_conn.fetch(
-        """
-        SELECT card_id, name, rating, version, image_url, club, league, nation, position, altposition
-        FROM fut_players
-        WHERE card_id = ANY($1::text[])
-        """,
-        card_ids,
-    )
-    return {
-        str(r["card_id"]): {
-            "name": r["name"],
-            "rating": r["rating"],
-            "version": r["version"],
-            "image_url": r["image_url"],
-            "club": r["club"],
-            "league": r["league"],
-            "nation": r["nation"],
-            "position": r["position"],
-            "altposition": r["altposition"],
-        }
-        for r in rows
-    }
-
-# --------- Suggestions ---------
-@router.get("/smart-buy/suggestions")
-async def smart_buy_suggestions(
+# --------------------------
+# GET /suggestions
+# --------------------------
+@router.get("/suggestions")
+async def list_suggestions(
     request: Request,
-    conn=Depends(_db),
-    player_conn=Depends(_player_db),
-
-    # FE may send snake_case; accept both. The first set reads snake_case; the second reads camelCase aliases.
-    budget: Optional[int] = Query(None),
-    risk_tolerance: Optional[str] = Query(None, alias="riskTolerance"),
-    time_horizon: Optional[str] = Query(None, alias="timeHorizon"),
-    platform: str = Query("ps"),
-    limit: int = Query(24, ge=1, le=100),
-) -> Dict[str, Any]:
+    # filters with sensible defaults
+    budget: Optional[int] = Query(120_000, ge=0, description="Max current_price"),
+    platform: Optional[str] = Query("ps"),
+    risk_tolerance: Optional[str] = Query("moderate"),
+    time_horizon: Optional[str] = Query("short"),
+    min_rating: Optional[int] = Query(0, ge=0, le=99),
+    max_rating: Optional[int] = Query(99, ge=0, le=99),
+    league: Optional[str] = Query(None, description="free text contains"),
+    nation: Optional[str] = Query(None, description="free text contains"),
+    position: Optional[str] = Query(None, description="exact match on primary or any alt"),
+    q: Optional[str] = Query(None, description="free-text search on player name"),
+    limit: int = Query(30, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+):
     """
-    Returns filtered smart-buy suggestions.
-    Falls back to user_id='global' when the user has no rows.
-    On error: returns 200 with empty payload so FE doesn't show a red error panel.
+    Returns enriched Smart Buy suggestions joined with fut_players.
+    Data source: **Players DB** via request.app.state.player_pool
     """
-    try:
-        uid = _get_user_id(request)
-        plat = _platform_norm(platform)
+    player_pool = getattr(request.app.state, "player_pool", None)
+    if player_pool is None:
+        raise HTTPException(500, "Player DB not configured")
 
-        risk = _map_risk(risk_tolerance)
-        horizons = _map_horizons(time_horizon)
-
-        where = ["platform = $1"]
-        params: List[Any] = [plat]
-
-        if isinstance(budget, int) and budget > 0:
-            where.append("current_price <= $%d" % (len(params) + 1))
-            params.append(budget)
-
-        if risk:
-            where.append("risk_level = $%d" % (len(params) + 1))
-            params.append(risk)
-
-        if horizons:
-            where.append("time_to_profit = ANY($%d)" % (len(params) + 1))
-            params.append(horizons)
-
-        # Try user-specific first (only if logged in)
-        rows: List[Any] = []
-        if uid:
-            sql_user = f"""
-                SELECT *
-                  FROM smart_buy_suggestions
-                 WHERE {' AND '.join(where)} AND user_id = $%d
-              ORDER BY priority_score DESC, confidence_score DESC, expected_profit DESC, created_at DESC
-                 LIMIT $%d
-            """ % (len(params) + 1, len(params) + 2)
-            rows = await conn.fetch(sql_user, *params, uid, limit)
-
-        # Fallback: global pool
-        if not rows:
-            sql_global = f"""
-                SELECT *
-                  FROM smart_buy_suggestions
-                 WHERE {' AND '.join(where)} AND user_id = 'global'
-              ORDER BY priority_score DESC, confidence_score DESC, expected_profit DESC, created_at DESC
-                 LIMIT $%d
-            """ % (len(params) + 1)
-            rows = await conn.fetch(sql_global, *params, limit)
-
-        if not rows:
-            return {"items": [], "count": 0}
-
-        meta = await _enrich(player_conn, [str(r["card_id"]) for r in rows])
-
-        items = []
-        for r in rows:
-            cid = str(r["card_id"])
-            m = meta.get(cid, {})
-            items.append(
-                {
-                    "card_id": cid,
-                    "platform": r["platform"],
-                    "suggestion_type": r["suggestion_type"],
-                    "current_price": int(r["current_price"]) if r["current_price"] is not None else None,
-                    "target_price": int(r["target_price"]) if r["target_price"] is not None else None,
-                    "expected_profit": int(r["expected_profit"]) if r["expected_profit"] is not None else None,
-                    "risk_level": r["risk_level"],
-                    "confidence_score": int(r["confidence_score"]),
-                    "priority_score": int(r["priority_score"]),
-                    "reasoning": r["reasoning"],
-                    "time_to_profit": r["time_to_profit"],
-                    "market_state": r["market_state"],
-                    "created_at": r["created_at"].isoformat() if r["created_at"] else None,
-                    # meta
-                    "name": m.get("name"),
-                    "rating": m.get("rating"),
-                    "version": m.get("version"),
-                    "image_url": m.get("image_url"),
-                    "club": m.get("club"),
-                    "league": m.get("league"),
-                    "nation": m.get("nation"),
-                    "position": m.get("position"),
-                    "altposition": m.get("altposition"),
-                }
-            )
-
-        return {"items": items[:limit], "count": len(items[:limit])}
-
-    except Exception as e:
-        # Keep FE happy: return 200 + empty payload with a hint
-        return {"items": [], "count": 0, "note": "fallback-empty", "error": str(e)}
-
-# --------- Market intelligence ---------
-@router.get("/smart-buy/market-state")
-async def latest_market_state(request: Request, conn=Depends(_db), platform: str = Query("ps")) -> Dict[str, Any]:
     plat = _platform_norm(platform)
-    row = await conn.fetchrow(
-        """
-        SELECT platform, state, confidence_score, detected_at, indicators
-          FROM market_states
-         WHERE platform = $1
-      ORDER BY detected_at DESC
-         LIMIT 1
-        """,
-        plat,
+    horizon_hours = _horizon_to_hours(time_horizon)
+
+    # dynamic WHEREs
+    where_clauses = [
+        "s.platform = $1",
+        "s.current_price <= $2",
+        "s.created_at >= NOW() - ($3 || ' hours')::interval",
+    ]
+
+    params: List[Any] = [plat, budget, horizon_hours]
+    named_map: Dict[str, Any] = {}
+
+    # risk filter
+    if risk_tolerance:
+        where_clauses.append("LOWER(s.risk_level) = $risk")
+        named_map["risk"] = risk_tolerance.lower()
+
+    # rating guard (from fut_players)
+    if min_rating is not None:
+        where_clauses.append("(fp.rating IS NULL OR fp.rating >= $min_rating)")
+        named_map["min_rating"] = min_rating
+    if max_rating is not None:
+        where_clauses.append("(fp.rating IS NULL OR fp.rating <= $max_rating)")
+        named_map["max_rating"] = max_rating
+
+    # league/nation text filters
+    if league:
+        where_clauses.append("fp.league ILIKE $league")
+        named_map["league"] = f"%{league}%"
+    if nation:
+        where_clauses.append("fp.nation ILIKE $nation")
+        named_map["nation"] = f"%{nation}%"
+
+    # position filter (checks primary OR any altposition token)
+    if position:
+        where_clauses.append("""
+        (
+          UPPER(fp.position) = $position
+          OR (
+            COALESCE(fp.altposition, '') <> ''
+            AND EXISTS (
+              SELECT 1
+              FROM regexp_split_to_table(fp.altposition, '[,;/|\\s]+') ap
+              WHERE UPPER(TRIM(ap)) = $position
+            )
+          )
+        )
+        """)
+        named_map["position"] = position.upper()
+
+    # free text on name
+    if q:
+        where_clauses.append("fp.name ILIKE $name_q")
+        named_map["name_q"] = f"%{q}%"
+
+    where_sql = " AND ".join(where_clauses) if where_clauses else "TRUE"
+
+    # NOTE:
+    # - s.card_id is TEXT (our seed created it that way)
+    # - fut_players.card_id is also TEXT in your DB
+    # If your fut_players.card_id were INT, you would use fp.card_id::text = s.card_id
+    sql = f"""
+    WITH filtered AS (
+      SELECT
+        s.card_id,
+        s.platform,
+        s.suggestion_type,
+        s.current_price,
+        s.target_price,
+        s.expected_profit,
+        s.risk_level,
+        s.confidence_score,
+        s.priority_score,
+        s.reasoning,
+        s.time_to_profit,
+        s.market_state,
+        s.created_at
+      FROM smart_buy_suggestions s
+      WHERE {where_sql}
+      ORDER BY s.priority_score DESC, s.confidence_score DESC, s.created_at DESC
+      LIMIT $4 OFFSET $5
     )
-    if not row:
-        return {"platform": plat, "state": "unknown", "confidence_score": 0, "indicators": {}}
-    return {
-        "platform": row["platform"],
-        "state": row["state"],
-        "confidence_score": int(row["confidence_score"]),
-        "detected_at": row["detected_at"].isoformat() if row["detected_at"] else None,
-        "indicators": row["indicators"] or {},
-    }
+    SELECT
+      f.card_id,
+      f.platform,
+      f.suggestion_type,
+      f.current_price,
+      f.target_price,
+      f.expected_profit,
+      f.risk_level,
+      f.confidence_score,
+      f.priority_score,
+      f.reasoning,
+      f.time_to_profit,
+      f.market_state,
+      f.created_at,
+      fp.name,
+      fp.rating,
+      fp.version,
+      fp.image_url,
+      fp.club,
+      fp.league,
+      fp.nation,
+      fp.position,
+      fp.altposition
+    FROM filtered f
+    LEFT JOIN fut_players fp
+      ON fp.card_id = f.card_id
+    """
 
-@router.get("/smart-buy/market-cache")
-async def smart_buy_market_cache(request: Request, conn=Depends(_db)) -> Dict[str, Any]:
-    row = await conn.fetchrow("SELECT payload, updated_at FROM smart_buy_market_cache WHERE id = 1")
-    if not row:
-        return {"payload": {}, "updated_at": None}
-    return {"payload": row["payload"] or {}, "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None}
+    # count query (for pagination)
+    count_sql = f"""
+      SELECT COUNT(*) AS c
+      FROM smart_buy_suggestions s
+      LEFT JOIN fut_players fp ON fp.card_id = s.card_id
+      WHERE {where_sql}
+    """
 
-# Alias the FE expects
-@router.get("/smart-buy/market-intelligence")
-async def market_intelligence_alias(request: Request, conn=Depends(_db)) -> Dict[str, Any]:
-    state = await latest_market_state(request, conn=conn, platform="ps")
-    cache = await smart_buy_market_cache(request, conn=conn)
-    return {"state": state, "cache": cache}
+    # build final params in order: $1.. positional + named
+    # positional
+    params_all: List[Any] = [plat, budget, horizon_hours, limit, offset]
+    # named (psycopg-style with asyncpg named mapping)
+    # asyncpg doesn't support $name directly; we replace them by positions:
+    # We'll compile a mapping now:
+    replace_order: List[str] = []
+    for k in ["risk","min_rating","max_rating","league","nation","position","name_q"]:
+        if k in named_map:
+            replace_order.append(k)
 
-# --------- Preferences ---------
-@router.get("/smart-buy/preferences")
-async def get_preferences(request: Request, conn=Depends(_db)) -> Dict[str, Any]:
-    uid = _get_user_id(request)
-    if not uid:
-        return SmartBuyPreferencesIn().dict()
+    def _replace_named(sql_text: str, start_index: int) -> (str, List[Any]):
+        out_params: List[Any] = []
+        i = start_index
+        for k in replace_order:
+            sql_text = sql_text.replace(f"${k}", f"${i}")
+            out_params.append(named_map[k])
+            i += 1
+        return sql_text, out_params
 
-    row = await conn.fetchrow(
-        """
-        SELECT default_budget, risk_tolerance, preferred_time_horizon, preferred_categories,
-               excluded_positions, preferred_leagues, preferred_nations, min_rating, max_rating,
-               min_profit, notifications_enabled
-          FROM smart_buy_preferences
-         WHERE user_id = $1
-        """,
-        uid,
-    )
-    if not row:
-        return SmartBuyPreferencesIn().dict()
+    sql_final, named_params = _replace_named(sql, len(params_all) + 1)
+    params_all_sql = params_all + named_params
 
-    return {
-        "default_budget": row["default_budget"],
-        "risk_tolerance": row["risk_tolerance"],
-        "preferred_time_horizon": row["preferred_time_horizon"],
-        "preferred_categories": row["preferred_categories"] or [],
-        "excluded_positions": row["excluded_positions"] or [],
-        "preferred_leagues": row["preferred_leagues"] or [],
-        "preferred_nations": row["preferred_nations"] or [],
-        "min_rating": row["min_rating"],
-        "max_rating": row["max_rating"],
-        "min_profit": row["min_profit"],
-        "notifications_enabled": row["notifications_enabled"],
-    }
+    count_sql_final, count_named_params = _replace_named(count_sql, 3 + 1)  # first 3 are (plat, budget, horizon)
+    count_params_all = [plat, budget, horizon_hours] + count_named_params
 
-@router.put("/smart-buy/preferences")
-async def upsert_preferences(request: Request, payload: SmartBuyPreferencesIn, conn=Depends(_db)) -> Dict[str, Any]:
-    uid = _get_user_id(request)
-    if not uid:
-        raise HTTPException(status_code=401, detail="Not authenticated")
+    async with player_pool.acquire() as conn:
+        rows = await conn.fetch(sql_final, *params_all_sql)
+        cnt = await conn.fetchval(count_sql_final, *count_params_all)
 
-    await conn.execute(
-        """
-        INSERT INTO smart_buy_preferences
-        (user_id, default_budget, risk_tolerance, preferred_time_horizon,
-         preferred_categories, excluded_positions, preferred_leagues, preferred_nations,
-         min_rating, max_rating, min_profit, notifications_enabled, created_at, updated_at)
-        VALUES
-        ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7::jsonb,$8::jsonb,$9,$10,$11,$12,NOW(),NOW())
-        ON CONFLICT (user_id) DO UPDATE SET
-          default_budget = EXCLUDED.default_budget,
-          risk_tolerance = EXCLUDED.risk_tolerance,
-          preferred_time_horizon = EXCLUDED.preferred_time_horizon,
-          preferred_categories = EXCLUDED.preferred_categories,
-          excluded_positions = EXCLUDED.excluded_positions,
-          preferred_leagues = EXCLUDED.preferred_leagues,
-          preferred_nations = EXCLUDED.preferred_nations,
-          min_rating = EXCLUDED.min_rating,
-          max_rating = EXCLUDED.max_rating,
-          min_profit = EXCLUDED.min_profit,
-          notifications_enabled = EXCLUDED.notifications_enabled,
-          updated_at = NOW()
-        """,
-        uid,
-        payload.default_budget,
-        payload.risk_tolerance,
-        payload.preferred_time_horizon,
-        (payload.preferred_categories or []),
-        (payload.excluded_positions or []),
-        (payload.preferred_leagues or []),
-        (payload.preferred_nations or []),
-        payload.min_rating,
-        payload.max_rating,
-        payload.min_profit,
-        payload.notifications_enabled,
-    )
+    items = [dict(r) for r in rows]
+    return {"items": items, "count": int(cnt)}
+
+# --------------------------
+# POST /feedback
+# --------------------------
+@router.post("/feedback")
+async def submit_feedback(
+    request: Request,
+    payload: FeedbackCreate,
+):
+    player_pool = getattr(request.app.state, "player_pool", None)
+    if player_pool is None:
+        raise HTTPException(500, "Player DB not configured")
+
+    # derive user_id from session if you have it, else use 'global'
+    user_id = request.session.get("user_id") or "global"
+
+    async with player_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO smart_buy_feedback
+              (user_id, card_id, action, notes, actual_buy_price, actual_sell_price, actual_profit, timestamp)
+            VALUES ($1,$2,$3,$4,$5,$6,
+              CASE
+                WHEN $5 IS NOT NULL AND $6 IS NOT NULL THEN ($6 - $5)
+                ELSE NULL
+              END,
+              NOW())
+            """,
+            user_id,
+            payload.card_id,
+            payload.action,
+            payload.notes,
+            payload.actual_buy_price,
+            payload.actual_sell_price,
+        )
     return {"ok": True}
 
-# --------- Feedback ---------
-@router.post("/smart-buy/feedback")
-async def smart_buy_feedback(request: Request, payload: SmartBuyFeedbackIn, conn=Depends(_db)) -> Dict[str, Any]:
-    uid = _get_user_id(request)
-    if not uid:
-        raise HTTPException(status_code=401, detail="Not authenticated")
+# --------------------------
+# GET/POST preferences
+# --------------------------
+@router.get("/preferences")
+async def get_preferences(request: Request):
+    player_pool = getattr(request.app.state, "player_pool", None)
+    if player_pool is None:
+        raise HTTPException(500, "Player DB not configured")
 
-    await conn.execute(
-        """
-        INSERT INTO smart_buy_feedback
-        (user_id, card_id, action, notes, actual_buy_price, actual_sell_price, actual_profit, timestamp)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
-        """,
-        uid,
-        str(payload.card_id),
-        payload.action,
-        payload.notes or "",
-        payload.actual_buy_price,
-        payload.actual_sell_price,
-        payload.actual_profit,
-    )
+    user_id = request.session.get("user_id") or "global"
+    async with player_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM smart_buy_preferences WHERE user_id=$1",
+            user_id
+        )
+    return dict(row) if row else {}
+
+@router.post("/preferences")
+async def upsert_preferences(request: Request, prefs: PreferencesUpsert):
+    player_pool = getattr(request.app.state, "player_pool", None)
+    if player_pool is None:
+        raise HTTPException(500, "Player DB not configured")
+
+    user_id = request.session.get("user_id") or "global"
+    async with player_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO smart_buy_preferences
+              (user_id, default_budget, risk_tolerance, preferred_time_horizon,
+               preferred_categories, excluded_positions, preferred_leagues, preferred_nations,
+               min_rating, max_rating, min_profit, notifications_enabled, created_at, updated_at)
+            VALUES
+              ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7::jsonb,$8::jsonb,$9,$10,$11,$12,NOW(),NOW())
+            ON CONFLICT (user_id)
+            DO UPDATE SET
+              default_budget = EXCLUDED.default_budget,
+              risk_tolerance = EXCLUDED.risk_tolerance,
+              preferred_time_horizon = EXCLUDED.preferred_time_horizon,
+              preferred_categories = EXCLUDED.preferred_categories,
+              excluded_positions = EXCLUDED.excluded_positions,
+              preferred_leagues = EXCLUDED.preferred_leagues,
+              preferred_nations = EXCLUDED.preferred_nations,
+              min_rating = EXCLUDED.min_rating,
+              max_rating = EXCLUDED.max_rating,
+              min_profit = EXCLUDED.min_profit,
+              notifications_enabled = EXCLUDED.notifications_enabled,
+              updated_at = NOW()
+            """,
+            user_id,
+            prefs.default_budget,
+            prefs.risk_tolerance,
+            prefs.preferred_time_horizon,
+            (prefs.preferred_categories or []),
+            (prefs.excluded_positions or []),
+            (prefs.preferred_leagues or []),
+            (prefs.preferred_nations or []),
+            prefs.min_rating,
+            prefs.max_rating,
+            prefs.min_profit,
+            prefs.notifications_enabled,
+        )
     return {"ok": True}
 
-# --------- Small stats (optional UI widget) ---------
-@router.get("/smart-buy/stats")
-async def smart_buy_stats(request: Request, conn=Depends(_db)) -> Dict[str, Any]:
-    row = await conn.fetchrow(
-        """
-        SELECT
-            COUNT(*)                         AS total_rows,
-            COUNT(*) FILTER (WHERE user_id='global') AS global_rows,
-            COUNT(*) FILTER (WHERE user_id<>'global') AS user_rows
-        FROM smart_buy_suggestions
-        """
-    )
+# --------------------------
+# GET /market-intelligence
+# --------------------------
+@router.get("/market-intelligence")
+async def market_intel(request: Request, platform: str = Query("ps")):
+    player_pool = getattr(request.app.state, "player_pool", None)
+    if player_pool is None:
+        raise HTTPException(500, "Player DB not configured")
+
+    plat = _platform_norm(platform)
+    async with player_pool.acquire() as conn:
+        state = await conn.fetchrow(
+            """
+            SELECT state, confidence_score, detected_at, indicators
+            FROM market_states
+            WHERE platform = $1
+            ORDER BY detected_at DESC
+            LIMIT 1
+            """,
+            plat,
+        )
+        cache = await conn.fetchrow(
+            """
+            SELECT payload, updated_at
+            FROM smart_buy_market_cache
+            WHERE id = 1
+            """
+        )
+
     return {
-        "total": int(row["total_rows"] or 0),
-        "global": int(row["global_rows"] or 0),
-        "user": int(row["user_rows"] or 0),
+        "platform": plat,
+        "state": dict(state) if state else None,
+        "cache": dict(cache) if cache else None,
     }
