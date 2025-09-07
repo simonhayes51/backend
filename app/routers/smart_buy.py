@@ -4,7 +4,6 @@ from typing import Any, Dict, List, Optional
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, HTTPException, Query, Body
 
-# Reuse service helpers already in your app
 from app.services.prices import get_player_price
 from app.services.price_history import get_price_history
 
@@ -19,7 +18,7 @@ _player_pool: Optional[asyncpg.Pool] = None
 
 
 async def pool() -> asyncpg.Pool:
-    """Main app DB (cache + feedback, *not* fut_players)."""
+    """Main app DB (cache + feedback)."""
     global _main_pool
     if _main_pool is None:
         if not DB_URL:
@@ -70,7 +69,6 @@ def _pct(new: Optional[float], old: Optional[float]) -> float:
         return 0.0
 
 async def _safe_price(card_id: int, platform: str) -> Optional[float]:
-    """Best-effort live price from your service."""
     try:
         p = await get_player_price(card_id, platform)
         if isinstance(p, dict):
@@ -88,7 +86,7 @@ async def _safe_hist(card_id: int, platform: str, span: str) -> List[Dict[str, A
 def _split_csv(v: Optional[str]) -> List[str]:
     return [x.strip() for x in (v or "").split(",") if x and x.strip()]
 
-# ---- robust history parsing (prevents 500s with mixed formats) ----
+# Robust history parsing
 def _extract_prices(xs) -> List[float]:
     out: List[float] = []
     for p in xs or []:
@@ -118,7 +116,7 @@ def _first_last_pct(xs) -> float:
 # ---------- MARKET INTELLIGENCE ----------
 @router.get("/market-intelligence")
 async def market_intelligence() -> Dict[str, Any]:
-    """Always returns 200; falls back to static payload if cache/DB fails."""
+    """Always returns 200; reads JSONB as TEXT then json.loads for safety."""
     fallback = {
         "current_state": "normal",
         "upcoming_events": [],
@@ -130,16 +128,23 @@ async def market_intelligence() -> Dict[str, Any]:
     try:
         p = await pool()
         async with p.acquire() as c:
-            row = await c.fetchrow("SELECT payload FROM smart_buy_market_cache WHERE id=1")
-        if row and row["payload"]:
-            return row["payload"]
+            row = await c.fetchrow(
+                "SELECT payload::text AS payload_text FROM smart_buy_market_cache WHERE id=1"
+            )
+        if row and row["payload_text"]:
+            try:
+                return json.loads(row["payload_text"])
+            except Exception:
+                pass  # corrupted cache, reseed below
+
         # seed cache
         async with (await pool()).acquire() as c:
             await c.execute("""
                 INSERT INTO smart_buy_market_cache (id, payload, updated_at)
                 VALUES (1, $1::jsonb, NOW())
                 ON CONFLICT (id) DO UPDATE
-                  SET payload=EXCLUDED.payload, updated_at=NOW()
+                  SET payload = EXCLUDED.payload,
+                      updated_at = NOW()
             """, json.dumps(fallback))
         return fallback
     except Exception:
@@ -155,9 +160,7 @@ async def _candidate_cards(
     budget: int,
     limit: int = 300,
 ) -> List[asyncpg.Record]:
-    """
-    Pull candidates from fut_players using price_num (numeric mirror of price).
-    """
+    """Pull candidates from fut_players using price_num."""
     player = await get_player_pool()
     sql = ["""
         SELECT
@@ -201,7 +204,6 @@ async def _score(card: asyncpg.Record, platform: str, budget: int, horizon: str)
     if not price_now or price_now <= 0 or price_now > budget:
         return None
 
-    # momentum
     h4  = await _safe_hist(int(card["card_id"]), platform, "4h")
     h24 = await _safe_hist(int(card["card_id"]), platform, "24h")
     mom4  = _first_last_pct(h4)
@@ -367,7 +369,7 @@ async def stats() -> Dict[str, Any]:
         "category_performance": {}
     }
 
-# ---------- DEBUG (remove later) ----------
+# ---------- DEBUG ----------
 @router.get("/_debug")
 async def smart_buy_debug() -> Dict[str, Any]:
     info: Dict[str, Any] = {
