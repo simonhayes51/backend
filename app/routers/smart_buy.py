@@ -1,42 +1,23 @@
 # app/routers/smart_buy.py
-from typing import Any, Dict, List, Optional, Literal
-import json
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Query
+from __future__ import annotations
+
+import os
+from typing import Any, Dict, List, Literal, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
-router = APIRouter(tags=["Smart Buy"])
+router = APIRouter()
 
-# -----------------------
-# Helpers / Dependencies
-# -----------------------
-
-def _current_user(request: Request) -> str:
-    user_id = request.session.get("user_id")
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    return user_id
-
-async def _db(request: Request):
-    """
-    Yield a connection from the **main** DB pool attached in main.lifespan().
-    (This is the pool where smart_buy_* tables live.)
-    """
-    pool = getattr(request.app.state, "pool", None)
-    if pool is None:
-        raise HTTPException(status_code=500, detail="Database pool not initialized")
-    async with pool.acquire() as conn:
-        yield conn
-
-
-# -----------------------
+# ----------------------------
 # Models
-# -----------------------
+# ----------------------------
 
-class PreferencesIn(BaseModel):
-    default_budget: Optional[int] = 100000
-    risk_tolerance: Optional[Literal["low", "moderate", "high"]] = "moderate"
-    preferred_time_horizon: Optional[Literal["short", "medium", "long"]] = "short"
+class SmartBuyPreferencesIn(BaseModel):
+    default_budget: Optional[int] = 100_000
+    risk_tolerance: Literal["low", "moderate", "high"] = "moderate"
+    preferred_time_horizon: Literal["very_short", "short", "medium", "long"] = "short"  # UI "Short Term (6-48h)" -> short
     preferred_categories: Optional[List[str]] = []
     excluded_positions: Optional[List[str]] = []
     preferred_leagues: Optional[List[str]] = []
@@ -46,193 +27,222 @@ class PreferencesIn(BaseModel):
     min_profit: Optional[int] = 1000
     notifications_enabled: Optional[bool] = True
 
-class FeedbackIn(BaseModel):
+class SmartBuyFeedbackIn(BaseModel):
     card_id: str
     action: Literal["bought", "ignored", "watchlisted"]
-    notes: Optional[str] = None
+    notes: Optional[str] = ""
     actual_buy_price: Optional[int] = None
     actual_sell_price: Optional[int] = None
     actual_profit: Optional[int] = None
 
+# ----------------------------
+# Dependencies
+# ----------------------------
 
-# -----------------------
-# Suggestions
-# -----------------------
+async def _db(request: Request):
+    # main DB (pool)
+    async with request.app.state.pool.acquire() as conn:
+        yield conn
 
-@router.get("/smart-buy/suggestions", response_model=Dict[str, Any])
-async def list_suggestions(
-    request: Request,
-    user_id: str = Depends(_current_user),
-    conn = Depends(_db),
-    platform: Optional[Literal["ps", "xbox", "pc"]] = Query(None),
-    limit: int = Query(20, ge=1, le=100),
-):
+async def _player_db(request: Request):
+    # player DB (player_pool)
+    async with request.app.state.player_pool.acquire() as conn:
+        yield conn
+
+def _get_user_id(request: Request) -> Optional[str]:
+    # matches main.py session handling
+    return request.session.get("user_id")
+
+# ----------------------------
+# Helpers
+# ----------------------------
+
+def _map_risk(label: str) -> List[str]:
     """
-    Latest Smart Buy suggestions for the current user.
+    Risk filter mapping. We allow inclusive buckets so 'moderate' still returns
+    some 'low' and some 'high' if needed, but biased in SQL ordering.
     """
-    if platform:
-        rows = await conn.fetch(
-            """
-            SELECT *
-            FROM smart_buy_suggestions
-            WHERE user_id = $1 AND platform = $2
-            ORDER BY created_at DESC
-            LIMIT $3
-            """,
-            user_id, platform, limit
-        )
-    else:
-        rows = await conn.fetch(
-            """
-            SELECT *
-            FROM smart_buy_suggestions
-            WHERE user_id = $1
-            ORDER BY created_at DESC
-            LIMIT $2
-            """,
-            user_id, limit
-        )
-    return {"items": [dict(r) for r in rows]}
+    s = (label or "").lower()
+    if s == "low":
+        return ["low"]
+    if s == "high":
+        return ["high"]
+    return ["moderate"]  # strict match; ordering handles diversity
 
+def _map_horizon(label: str) -> List[str]:
+    """
+    Map FE's time horizon to rows' `time_to_profit` strings.
+    Convention used in DB: '0-6h', '6-24h', '24-72h', '3-7d', etc.
+    We'll treat:
+      very_short -> 0-6h
+      short      -> 6-24h    (FE: 'Short Term (6-48h)' still matches best to 6-24h)
+      medium     -> 24-72h
+      long       -> 3-7d
+    """
+    s = (label or "").lower()
+    if s in ("very_short", "very-short", "0-6h", "0_to_6h"):
+        return ["0-6h"]
+    if s in ("short", "6-24h", "6_to_24h"):
+        return ["6-24h", "6-48h"]  # be lenient
+    if s in ("medium", "24-72h", "24_to_72h"):
+        return ["24-72h", "1-3d"]
+    if s in ("long", "3-7d", "3_to_7d"):
+        return ["3-7d", "1-2w"]
+    # default: don't constrain if unknown
+    return []
 
-# -----------------------
-# Feedback
-# -----------------------
-
-@router.post("/smart-buy/feedback", response_model=Dict[str, Any])
-async def create_feedback(
-    payload: FeedbackIn,
-    request: Request,
-    user_id: str = Depends(_current_user),
-    conn = Depends(_db),
-):
-    row = await conn.fetchrow(
+async def _enrich_with_player_meta(
+    player_conn, card_ids: List[str]
+) -> Dict[str, Dict[str, Any]]:
+    if not card_ids:
+        return {}
+    rows = await player_conn.fetch(
         """
-        INSERT INTO smart_buy_feedback (
-            user_id, card_id, action, notes, actual_buy_price, actual_sell_price, actual_profit, timestamp
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7, NOW())
-        RETURNING id, user_id, card_id, action, notes, actual_buy_price, actual_sell_price, actual_profit, timestamp
+        SELECT card_id, name, rating, version, image_url, club, league, nation, position, altposition
+        FROM fut_players
+        WHERE card_id = ANY($1::text[])
         """,
-        user_id,
-        payload.card_id,
-        payload.action,
-        payload.notes,
-        payload.actual_buy_price,
-        payload.actual_sell_price,
-        payload.actual_profit,
+        card_ids,
     )
-    return {"ok": True, "feedback": dict(row)}
-
-
-# -----------------------
-# Preferences
-# -----------------------
-
-@router.get("/smart-buy/preferences", response_model=Dict[str, Any])
-async def get_preferences(
-    request: Request,
-    user_id: str = Depends(_current_user),
-    conn = Depends(_db),
-):
-    row = await conn.fetchrow(
-        """
-        SELECT user_id, default_budget, risk_tolerance, preferred_time_horizon,
-               preferred_categories, excluded_positions, preferred_leagues, preferred_nations,
-               min_rating, max_rating, min_profit, notifications_enabled,
-               created_at, updated_at
-        FROM smart_buy_preferences
-        WHERE user_id = $1
-        """,
-        user_id
-    )
-    if not row:
-        # Defaults mirror your table defaults in main.py
-        return {
-            "user_id": user_id,
-            "default_budget": 100000,
-            "risk_tolerance": "moderate",
-            "preferred_time_horizon": "short",
-            "preferred_categories": [],
-            "excluded_positions": [],
-            "preferred_leagues": [],
-            "preferred_nations": [],
-            "min_rating": 75,
-            "max_rating": 95,
-            "min_profit": 1000,
-            "notifications_enabled": True,
+    return {
+        str(r["card_id"]): {
+            "name": r["name"],
+            "rating": r["rating"],
+            "version": r["version"],
+            "image_url": r["image_url"],
+            "club": r["club"],
+            "league": r["league"],
+            "nation": r["nation"],
+            "position": r["position"],
+            "altposition": r["altposition"],
         }
-    out = dict(row)
-    # Ensure JSONB are lists
-    for k in ("preferred_categories", "excluded_positions", "preferred_leagues", "preferred_nations"):
-        v = out.get(k)
-        if isinstance(v, str):
-            try:
-                out[k] = json.loads(v)
-            except Exception:
-                pass
-    return out
+        for r in rows
+    }
 
+def _platform_norm(p: str) -> str:
+    p = (p or "").lower()
+    if p in ("ps", "playstation", "console"):
+        return "ps"
+    if p in ("xbox", "xb"):
+        return "xbox"
+    if p in ("pc", "origin"):
+        return "pc"
+    return "ps"
 
-@router.post("/smart-buy/preferences", response_model=Dict[str, Any])
-async def upsert_preferences(
-    payload: PreferencesIn,
+# ----------------------------
+# Routes: Suggestions
+# ----------------------------
+
+@router.get("/smart-buy/suggestions")
+async def smart_buy_suggestions(
     request: Request,
-    user_id: str = Depends(_current_user),
-    conn = Depends(_db),
-):
-    await conn.execute(
-        """
-        INSERT INTO smart_buy_preferences (
-            user_id, default_budget, risk_tolerance, preferred_time_horizon,
-            preferred_categories, excluded_positions, preferred_leagues, preferred_nations,
-            min_rating, max_rating, min_profit, notifications_enabled, created_at, updated_at
+    conn=Depends(_db),
+    player_conn=Depends(_player_db),
+    budget: Optional[int] = Query(None, description="Max buy price (coins)"),
+    riskTolerance: Optional[str] = Query(None, regex="^(low|moderate|high)$", description="low|moderate|high"),
+    timeHorizon: Optional[str] = Query(None, description="very_short|short|medium|long"),
+    platform: str = Query("ps", description="ps|xbox|pc"),
+    limit: int = Query(24, ge=1, le=100),
+) -> Dict[str, Any]:
+
+    uid = _get_user_id(request) or None
+    plat = _platform_norm(platform)
+
+    risk_bucket = _map_risk(riskTolerance or "")
+    horizons = _map_horizon(timeHorizon or "")
+
+    # Build dynamic WHERE
+    where = ["platform = $1"]
+    params: List[Any] = [plat]
+
+    if budget and budget > 0:
+        where.append("current_price <= $%d" % (len(params) + 1))
+        params.append(budget)
+
+    if risk_bucket:
+        where.append("risk_level = $%d" % (len(params) + 1))
+        params.append(risk_bucket[0])
+
+    if horizons:
+        # time_to_profit is free-form varchar; match any of the mapped values
+        where.append("time_to_profit = ANY($%d)" % (len(params) + 1))
+        params.append(horizons)
+
+    # Prefer current user's suggestions first
+    sql_user = f"""
+        SELECT *
+        FROM smart_buy_suggestions
+        WHERE {' AND '.join(where)} AND user_id = $%d
+        ORDER BY priority_score DESC, confidence_score DESC, expected_profit DESC, created_at DESC
+        LIMIT $%d
+    """ % (len(params) + 1, len(params) + 2)
+
+    rows_user = await conn.fetch(sql_user, *params, uid or "")
+    rows: List[Any] = list(rows_user)
+
+    # Fallback to 'global' if user has none
+    if not rows:
+        sql_global = f"""
+            SELECT *
+            FROM smart_buy_suggestions
+            WHERE {' AND '.join(where)} AND user_id = 'global'
+            ORDER BY priority_score DESC, confidence_score DESC, expected_profit DESC, created_at DESC
+            LIMIT $%d
+        """ % (len(params) + 1)
+        rows = await conn.fetch(sql_global, *params, limit)
+
+    if not rows:
+        return {"items": [], "count": 0}
+
+    # Enrich with player meta
+    card_ids = [str(r["card_id"]) for r in rows]
+    meta = await _enrich_with_player_meta(player_conn, card_ids)
+
+    items = []
+    for r in rows[:limit]:
+        cid = str(r["card_id"])
+        m = meta.get(cid, {})
+        items.append(
+            {
+                "card_id": cid,
+                "platform": r["platform"],
+                "suggestion_type": r["suggestion_type"],
+                "current_price": int(r["current_price"]) if r["current_price"] is not None else None,
+                "target_price": int(r["target_price"]) if r["target_price"] is not None else None,
+                "expected_profit": int(r["expected_profit"]) if r["expected_profit"] is not None else None,
+                "risk_level": r["risk_level"],
+                "confidence_score": int(r["confidence_score"]),
+                "priority_score": int(r["priority_score"]),
+                "reasoning": r["reasoning"],
+                "time_to_profit": r["time_to_profit"],
+                "market_state": r["market_state"],
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                # meta
+                "name": m.get("name"),
+                "rating": m.get("rating"),
+                "version": m.get("version"),
+                "image_url": m.get("image_url"),
+                "club": m.get("club"),
+                "league": m.get("league"),
+                "nation": m.get("nation"),
+                "position": m.get("position"),
+                "altposition": m.get("altposition"),
+            }
         )
-        VALUES (
-            $1,$2,$3,$4,$5::jsonb,$6::jsonb,$7::jsonb,$8::jsonb,$9,$10,$11,$12, NOW(), NOW()
-        )
-        ON CONFLICT (user_id) DO UPDATE SET
-            default_budget = EXCLUDED.default_budget,
-            risk_tolerance = EXCLUDED.risk_tolerance,
-            preferred_time_horizon = EXCLUDED.preferred_time_horizon,
-            preferred_categories = EXCLUDED.preferred_categories,
-            excluded_positions = EXCLUDED.excluded_positions,
-            preferred_leagues = EXCLUDED.preferred_leagues,
-            preferred_nations = EXCLUDED.preferred_nations,
-            min_rating = EXCLUDED.min_rating,
-            max_rating = EXCLUDED.max_rating,
-            min_profit = EXCLUDED.min_profit,
-            notifications_enabled = EXCLUDED.notifications_enabled,
-            updated_at = NOW()
-        """,
-        user_id,
-        payload.default_budget,
-        payload.risk_tolerance,
-        payload.preferred_time_horizon,
-        json.dumps(payload.preferred_categories or []),
-        json.dumps(payload.excluded_positions or []),
-        json.dumps(payload.preferred_leagues or []),
-        json.dumps(payload.preferred_nations or []),
-        payload.min_rating,
-        payload.max_rating,
-        payload.min_profit,
-        payload.notifications_enabled,
-    )
-    return {"message": "Preferences saved"}
 
+    return {"items": items, "count": len(items)}
 
-# -----------------------
-# Market state / cache
-# -----------------------
+# ----------------------------
+# Routes: Market intelligence
+# ----------------------------
 
-@router.get("/smart-buy/market/state", response_model=Dict[str, Any])
+@router.get("/smart-buy/market-state")
 async def latest_market_state(
     request: Request,
-    conn = Depends(_db),
-    platform: Literal["ps", "xbox", "pc"] = Query("ps"),
-):
-    """
-    Latest detected market regime for a platform.
-    """
+    conn=Depends(_db),
+    platform: str = Query("ps"),
+) -> Dict[str, Any]:
+    plat = _platform_norm(platform)
     row = await conn.fetchrow(
         """
         SELECT platform, state, confidence_score, detected_at, indicators
@@ -241,35 +251,20 @@ async def latest_market_state(
         ORDER BY detected_at DESC
         LIMIT 1
         """,
-        platform
+        plat,
     )
     if not row:
-        return {
-            "platform": platform,
-            "state": None,
-            "confidence_score": 0,
-            "detected_at": None,
-            "indicators": None
-        }
-    out = dict(row)
-    # psql JSONB -> Python dict is fine; if text, try JSON-load
-    inds = out.get("indicators")
-    if isinstance(inds, str):
-        try:
-            out["indicators"] = json.loads(inds)
-        except Exception:
-            pass
-    return out
+        return {"platform": plat, "state": "unknown", "confidence_score": 0, "indicators": {}}
+    return {
+        "platform": row["platform"],
+        "state": row["state"],
+        "confidence_score": int(row["confidence_score"]),
+        "detected_at": row["detected_at"].isoformat() if row["detected_at"] else None,
+        "indicators": row["indicators"] or {},
+    }
 
-
-@router.get("/smart-buy/market/cache", response_model=Dict[str, Any])
-async def smart_buy_market_cache(
-    request: Request,
-    conn = Depends(_db),
-):
-    """
-    Latest precomputed Smart Buy market cache blob (if you populate it).
-    """
+@router.get("/smart-buy/market-cache")
+async def smart_buy_market_cache(request: Request, conn=Depends(_db)) -> Dict[str, Any]:
     row = await conn.fetchrow(
         """
         SELECT payload, updated_at
@@ -278,37 +273,128 @@ async def smart_buy_market_cache(
         """
     )
     if not row:
-        return {"payload": None, "updated_at": None}
-    payload = row["payload"]
-    if isinstance(payload, str):
-        try:
-            payload = json.loads(payload)
-        except Exception:
-            pass
-    return {
-        "payload": payload,
-        "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None
-    }
+        return {"payload": {}, "updated_at": None}
+    return {"payload": row["payload"] or {}, "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None}
 
-
-# -----------------------
-# Frontend alias (workaround)
-# -----------------------
-
-@router.get("/smart-buy/market-intelligence", response_model=Dict[str, Any])
-async def market_intelligence_alias(
-    request: Request,
-    conn = Depends(_db),
-    # Default to PS to match most consoles; FE can pass ?platform=...
-    platform: Literal["ps", "xbox", "pc"] = Query("ps"),
-):
-    """
-    Alias to satisfy frontend call:
-    Returns both market state (regime) and market cache in one payload.
-    """
-    state = await latest_market_state(request, conn=conn, platform=platform)
+# Alias the FE expects (your screenshot showed 404 on this path previously)
+@router.get("/smart-buy/market-intelligence")
+async def market_intelligence_alias(request: Request, conn=Depends(_db)) -> Dict[str, Any]:
+    state = await latest_market_state(request, conn=conn, platform="ps")
     cache = await smart_buy_market_cache(request, conn=conn)
+    return {"state": state, "cache": cache}
+
+# ----------------------------
+# Routes: Preferences
+# ----------------------------
+
+@router.get("/smart-buy/preferences")
+async def get_preferences(request: Request, conn=Depends(_db)) -> Dict[str, Any]:
+    uid = _get_user_id(request)
+    if not uid:
+        # No session, return sensible defaults so FE stays happy
+        return SmartBuyPreferencesIn().dict()
+
+    row = await conn.fetchrow(
+        """
+        SELECT default_budget, risk_tolerance, preferred_time_horizon, preferred_categories,
+               excluded_positions, preferred_leagues, preferred_nations, min_rating, max_rating,
+               min_profit, notifications_enabled
+        FROM smart_buy_preferences
+        WHERE user_id = $1
+        """,
+        uid,
+    )
+    if not row:
+        return SmartBuyPreferencesIn().dict()
+
     return {
-        "state": state,
-        "cache": cache
+        "default_budget": row["default_budget"],
+        "risk_tolerance": row["risk_tolerance"],
+        "preferred_time_horizon": row["preferred_time_horizon"],
+        "preferred_categories": row["preferred_categories"] or [],
+        "excluded_positions": row["excluded_positions"] or [],
+        "preferred_leagues": row["preferred_leagues"] or [],
+        "preferred_nations": row["preferred_nations"] or [],
+        "min_rating": row["min_rating"],
+        "max_rating": row["max_rating"],
+        "min_profit": row["min_profit"],
+        "notifications_enabled": row["notifications_enabled"],
     }
+
+@router.put("/smart-buy/preferences")
+async def upsert_preferences(
+    request: Request,
+    payload: SmartBuyPreferencesIn,
+    conn=Depends(_db),
+) -> Dict[str, Any]:
+    uid = _get_user_id(request)
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    await conn.execute(
+        """
+        INSERT INTO smart_buy_preferences
+        (user_id, default_budget, risk_tolerance, preferred_time_horizon,
+         preferred_categories, excluded_positions, preferred_leagues, preferred_nations,
+         min_rating, max_rating, min_profit, notifications_enabled, created_at, updated_at)
+        VALUES
+        ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7::jsonb,$8::jsonb,$9,$10,$11,$12,NOW(),NOW())
+        ON CONFLICT (user_id) DO UPDATE SET
+          default_budget = EXCLUDED.default_budget,
+          risk_tolerance = EXCLUDED.risk_tolerance,
+          preferred_time_horizon = EXCLUDED.preferred_time_horizon,
+          preferred_categories = EXCLUDED.preferred_categories,
+          excluded_positions = EXCLUDED.excluded_positions,
+          preferred_leagues = EXCLUDED.preferred_leagues,
+          preferred_nations = EXCLUDED.preferred_nations,
+          min_rating = EXCLUDED.min_rating,
+          max_rating = EXCLUDED.max_rating,
+          min_profit = EXCLUDED.min_profit,
+          notifications_enabled = EXCLUDED.notifications_enabled,
+          updated_at = NOW()
+        """,
+        uid,
+        payload.default_budget,
+        payload.risk_tolerance,
+        payload.preferred_time_horizon,
+        # Arrays/lists stored as JSONB
+        (payload.preferred_categories or []),
+        (payload.excluded_positions or []),
+        (payload.preferred_leagues or []),
+        (payload.preferred_nations or []),
+        payload.min_rating,
+        payload.max_rating,
+        payload.min_profit,
+        payload.notifications_enabled,
+    )
+    return {"ok": True}
+
+# ----------------------------
+# Routes: Feedback
+# ----------------------------
+
+@router.post("/smart-buy/feedback")
+async def smart_buy_feedback(
+    request: Request,
+    payload: SmartBuyFeedbackIn,
+    conn=Depends(_db),
+) -> Dict[str, Any]:
+    uid = _get_user_id(request)
+    if not uid:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    await conn.execute(
+        """
+        INSERT INTO smart_buy_feedback
+        (user_id, card_id, action, notes, actual_buy_price, actual_sell_price, actual_profit, timestamp)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
+        """,
+        uid,
+        str(payload.card_id),
+        payload.action,
+        payload.notes or "",
+        payload.actual_buy_price,
+        payload.actual_sell_price,
+        payload.actual_profit,
+    )
+    return {"ok": True}
