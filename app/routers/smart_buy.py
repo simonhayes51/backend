@@ -87,6 +87,40 @@ def _split_csv(v: Optional[str]) -> List[str]:
         return []
     return [x.strip() for x in v.split(",") if x.strip()]
 
+# -------- robust history parsing (prevents 500s) --------
+def _extract_prices(xs):
+    """Return a list of float prices from mixed history formats."""
+    out: List[float] = []
+    for p in xs or []:
+        if isinstance(p, (int, float)):
+            out.append(float(p))
+            continue
+        if isinstance(p, dict):
+            v = p.get("price")
+            if v is None: v = p.get("v")
+            if v is None: v = p.get("y")
+            if isinstance(v, (int, float)):
+                out.append(float(v))
+            continue
+        if isinstance(p, (list, tuple)) and p:
+            cand = p[-1]
+            if isinstance(cand, (int, float)):
+                out.append(float(cand))
+    return out
+
+def _first_last_pct(xs) -> float:
+    """Momentum % using first & last valid values; 0.0 if insufficient."""
+    vals = _extract_prices(xs)
+    if len(vals) < 2:
+        return 0.0
+    first, last = vals[0], vals[-1]
+    if not first:
+        return 0.0
+    try:
+        return round((last - first) / first * 100.0, 2)
+    except ZeroDivisionError:
+        return 0.0
+
 # ---------------- Market Intelligence ----------------
 @router.get("/market-intelligence")
 async def market_intelligence() -> Dict[str, Any]:
@@ -174,27 +208,18 @@ async def _score(card: asyncpg.Record, platform: str, budget: int, horizon: str)
     if not price_now or price_now <= 0 or price_now > budget:
         return None
 
-    # History for momentum (best-effort)
+    # History for momentum (best-effort, robust parsing)
     h4 = await _safe_hist(int(card["card_id"]), platform, "4h")
     h24 = await _safe_hist(int(card["card_id"]), platform, "24h")
-
-    def first_last(xs):
-        if not xs:
-            return (None, None)
-        f = xs[0].get("price") or xs[0].get("v") or xs[0].get("y")
-        l = xs[-1].get("price") or xs[-1].get("v") or xs[-1].get("y")
-        return (float(f) if f else None, float(l) if l else None)
-
-    f4, l4 = first_last(h4)
-    f24, l24 = first_last(h24)
-    mom4, mom24 = _pct(l4, f4), _pct(l24, f24)
+    mom4  = _first_last_pct(h4)
+    mom24 = _first_last_pct(h24)
 
     rating = float(card["rating"] or 0)
     value_ratio = rating / max(2.0, math.log(max(2.0, price_now)))
     bias = {"quick_flip": 1.2, "short": 1.0, "long_term": 0.8}.get(horizon, 1.0)
 
-    score = ((value_ratio * 10) - 0.4 * (mom24 or 0) - 0.2 * (mom4 or 0)) * bias
-    target = round(price_now * (1.08 if (mom4 or 0) <= 0 else 1.04))
+    score = ((value_ratio * 10) - 0.4 * mom24 - 0.2 * mom4) * bias
+    target = round(price_now * (1.08 if mom4 <= 0 else 1.04))
     tax = int(target * 0.05)
     est = max(0, target - tax - int(price_now))
 
@@ -206,8 +231,8 @@ async def _score(card: asyncpg.Record, platform: str, budget: int, horizon: str)
         "league": card["league"],
         "nation": card["nation"],
         "price_now": int(price_now),
-        "momentum_4h": mom4 or 0.0,
-        "momentum_24h": mom24 or 0.0,
+        "momentum_4h": mom4,
+        "momentum_24h": mom24,
         "score": round(score, 2),
         "suggested_sell": target,
         "est_profit": est
