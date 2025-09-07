@@ -1795,25 +1795,17 @@ async def search_players(q: str = "", pos: Optional[str] = None):
                 )
                 """)
 
-            if not where:
-                return {"players": []}
-
+            base_where = " AND ".join(where) if where else "TRUE"
             sql = f"""
                 SELECT
-                  card_id,
-                  name,
-                  rating,
-                  version,
-                  image_url,
-                  club,
-                  league,
-                  nation,
-                  position,
-                  altposition,
-                  price
+                  card_id, name, rating, version, image_url, club, league, nation,
+                  position, altposition, price
                 FROM fut_players
-                WHERE {' AND '.join(where)}
-                ORDER BY rating DESC NULLS LAST, name ASC
+                WHERE {base_where}
+                ORDER BY
+                  CASE WHEN price IS NULL THEN 1 ELSE 0 END,
+                  rating DESC NULLS LAST,
+                  name ASC
                 LIMIT 50
             """
 
@@ -1837,6 +1829,7 @@ async def search_players(q: str = "", pos: Optional[str] = None):
     except Exception as e:
         logging.error(f"Player search error: {e}")
         return {"players": [], "error": str(e)}
+
 
 # ----------------- DEBUG -----------------
 @app.get("/api/debug/session")
