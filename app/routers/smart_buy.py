@@ -193,12 +193,9 @@ async def suggestions(
     base = {"flip": 0.030, "short": 0.060, "mid": 0.100, "long": 0.150}[horizon]
     risk_boost = {"Conservative": 0.00, "Moderate": 0.03, "Aggressive": 0.06}[risk_name]
     if risk_name == "Aggressive" and horizon == "flip":
-        risk_boost += 0.02  # punchier for quick flip
+        risk_boost += 0.02
     uplift = base + risk_boost
 
-    # Risk gates (tight → loose through fallback rounds)
-    # Each round relaxes max_vol (higher allowed), min_liq (lower required), slope_gate (more negative allowed),
-    # min_rating (lower allowed), min_after_tax_profit (lower requirement).
     BASE = {
         "Conservative": dict(min_rating=86, min_after=3000, max_vol=0.10, min_liq=0.55, slope_gate=0.0),
         "Moderate":     dict(min_rating=82, min_after=1800, max_vol=0.18, min_liq=0.35, slope_gate=-0.10),
@@ -227,30 +224,25 @@ async def suggestions(
     if not cand_rows:
         return {"items": [], "count": 0}
 
-    # Light prefilter
     prelim: List[asyncpg.Record] = [r for r in cand_rows if int(r["price_int"] or 0) > 0]
-    prelim = prelim[:320]  # keep concurrency sensible
+    prelim = prelim[:320]
 
-    # Feature extraction (with synthetic fallback if history is thin)
     async def _feat(card_id: int) -> Dict[str, Any]:
         try:
             hist = await get_price_history(int(card_id), plat, "today")
             series = _series_from_hist(hist)
             vals = [v for _, v in series]
             if len(vals) < 6:
-                # synthetic, “safe” features so we *never* drop to zero
                 return {"ok": True, "vol": 0.14, "liq": 0.40, "slope": 0.0}
             vol = _pct_volatility(vals)
             slope = _lin_slope(vals[-min(24, len(vals)):]) if vals else 0.0
             liq = _liq_proxy(series)
             return {"ok": True, "vol": float(vol), "slope": float(slope), "liq": float(liq)}
         except Exception:
-            # network/glitch → synthetic
             return {"ok": True, "vol": 0.16, "liq": 0.38, "slope": 0.0}
 
     feats = await asyncio.gather(*(_feat(int(r["card_id"])) for r in prelim))
 
-    # Progressive rounds: widen the gates until we have enough
     rounds = [
         dict(mult_vol=1.00, mult_liq=1.00, slope_add=0.00, min_rating_delta=0,  min_after_delta=0),
         dict(mult_vol=1.20, mult_liq=0.85, slope_add=-0.10, min_rating_delta=-2, min_after_delta=-200),
@@ -275,7 +267,6 @@ async def suggestions(
         if len(selected) >= limit:
             break
 
-        # compute this round’s gates
         max_vol = base_knobs["max_vol"] * r["mult_vol"]
         min_liq = base_knobs["min_liq"] * r["mult_liq"]
         slope_gate = base_knobs["slope_gate"] + r["slope_add"]
@@ -292,8 +283,7 @@ async def suggestions(
 
             vol = float(f["vol"]); liq = float(f["liq"]); slope = float(f["slope"])
 
-            # gates
-            if vol > max_vol: 
+            if vol > max_vol:
                 continue
             if liq < min_liq:
                 continue
@@ -347,17 +337,14 @@ async def suggestions(
                 "altposition": row["altposition"] or None,
             })
 
-        # order this round and take what we still need
         if batch:
             batch.sort(key=lambda x: (x["priority_score"], x["confidence_score"], x["expected_profit"]), reverse=True)
             remaining = max(0, limit - len(selected))
             selected.extend(batch[:remaining])
 
-    # final sort + trim (in case multiple rounds overfilled a bit)
     selected.sort(key=lambda x: (x["priority_score"], x["confidence_score"], x["expected_profit"]), reverse=True)
     selected = selected[:limit]
 
-    # persist best-effort
     if selected:
         try:
             await cpool.executemany(
@@ -392,4 +379,7 @@ async def suggestions(
             pass
 
     return {"items": selected, "suggestions": selected, "count": len(selected)}
-    router = smart_buy_router
+
+# ---- EXPORTS (module level) ----
+router = smart_buy_router
+__all__ = ["smart_buy_router", "router"]
