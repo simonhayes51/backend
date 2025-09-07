@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, HTTPException, Query, Body
 
-# reuse your existing services
+# Reuse existing services
 from app.services.prices import get_player_price
 from app.services.price_history import get_price_history
 
@@ -97,10 +97,11 @@ async def _safe_hist(card_id: int, platform: str, span: str) -> List[Dict[str, A
         return []
 
 
-# ---------- Market Intelligence ----------
+# ---------- Market Intelligence (no-DB, never-500) ----------
 @router.get("/market-intelligence")
 async def market_intelligence() -> Dict[str, Any]:
-    default_payload = {
+    # Simple, safe default payload for the banner/cards
+    return {
         "current_state": "normal",
         "upcoming_events": [],
         "crash_probability": 0.12,
@@ -108,23 +109,6 @@ async def market_intelligence() -> Dict[str, Any]:
         "whale_activity": [],
         "meta_shifts": []
     }
-    try:
-        p = await pool()
-        async with p.acquire() as c:
-            row = await c.fetchrow("SELECT payload FROM smart_buy_market_cache WHERE id = 1")
-            if row and row["payload"]:
-                return row["payload"]
-        # seed if missing
-        async with p.acquire() as c:
-            await c.execute("""
-                INSERT INTO smart_buy_market_cache (id, payload, updated_at)
-                VALUES (1, $1::jsonb, NOW())
-                ON CONFLICT (id) DO UPDATE SET payload=EXCLUDED.payload, updated_at=NOW()
-            """, json.dumps(default_payload))
-        return default_payload
-    except Exception:
-        # never 500 the page; just return defaults
-        return default_payload
 
 
 # ---------- Suggestions ----------
@@ -279,7 +263,6 @@ async def suggestion_detail(card_id: int, platform: str = Query("ps")) -> Dict[s
     except Exception:
         pass
 
-    # simple profit ladder from current
     p = float(price or 0)
     def _p(x: float) -> int:
         return max(0, int(p * (1.0 + x) * 0.95) - int(p))
