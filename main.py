@@ -31,12 +31,9 @@ from starlette.middleware.sessions import SessionMiddleware
 from pydantic import BaseModel
 
 from app.services.price_history import get_price_history
-from app.services.prices import get_player_price
+from app.services.prices import get_player_price  # still imported (not strictly required after unification)
 from app.routers.smart_buy import router as smart_buy_router
-
-# ✅ Trade Finder router
 from app.routers.trade_finder import router as trade_finder_router
-
 
 # ----------------- BOOTSTRAP -----------------
 logging.basicConfig(level=logging.INFO)
@@ -56,7 +53,7 @@ DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID")
 DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
 DISCORD_REDIRECT_URI = os.getenv("DISCORD_REDIRECT_URI")
 SECRET_KEY = os.getenv("SECRET_KEY")
-FRONTEND_URL = (os.getenv("FRONTEND_URL", "https://app.futhub.co.uk").rstrip("/"))
+FRONTEND_URL = os.getenv("FRONTEND_URL", "https://app.futhub.co.uk").rstrip("/")
 PORT = int(os.getenv("PORT", 8000))
 
 ENV = os.getenv("ENV", "production").lower()
@@ -87,7 +84,7 @@ FUTGG_BASE = "https://www.fut.gg/api/fut/player-prices/25"
 PRICE_CACHE_TTL = 5  # seconds
 _price_cache: Dict[str, Dict[str, Any]] = {}
 
-# ----------------- FUT.GG MOMENTUM (NEW) -----------------
+# ----------------- FUT.GG MOMENTUM -----------------
 MOMENTUM_BASE = "https://www.fut.gg/players/momentum"
 MOMENTUM_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
@@ -170,7 +167,6 @@ async def _momentum_page_items(tf: str, page: int) -> tuple[list[dict], str]:
     return _extract_items(html), html
 
 
-# ----------------- HELPERS -----------------
 def parse_coin_amount(v) -> int:
     if v is None:
         return 0
@@ -214,9 +210,7 @@ def is_within_quiet_hours(dt: datetime, quiet_start: Optional[dt_time], quiet_en
     if quiet_start <= quiet_end:
         return quiet_start <= t < quiet_end
     return t >= quiet_start or t < quiet_end
-
-
-# ----------------- MODELS -----------------
+    
 class UserSettings(BaseModel):
     default_platform: Optional[str] = "Console"
     custom_tags: Optional[List[str]] = []
@@ -261,7 +255,6 @@ class WatchlistCreate(BaseModel):
     platform: str  # "ps" | "xbox"
     notes: Optional[str] = None
 
-# Alerts config
 class WatchlistAlertCreate(BaseModel):
     card_id: int
     platform: str  # ps|xbox|pc
@@ -274,9 +267,7 @@ class WatchlistAlertCreate(BaseModel):
     quiet_end: Optional[str] = None    # "07:00"
     prefer_dm: Optional[bool] = True
     fallback_channel_id: Optional[str] = None
-
-
-# ----------------- POOLS & LIFESPAN -----------------
+    
 pool = None
 player_pool = None
 watchlist_pool = None
@@ -287,128 +278,120 @@ async def lifespan(app: FastAPI):
     global pool, player_pool, watchlist_pool, _watchlist_task
 
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+    player_pool = pool if PLAYER_DATABASE_URL == DATABASE_URL else await asyncpg.create_pool(PLAYER_DATABASE_URL, min_size=1, max_size=10)
+    watchlist_pool = pool if WATCHLIST_DATABASE_URL == DATABASE_URL else await asyncpg.create_pool(WATCHLIST_DATABASE_URL, min_size=1, max_size=10)
 
-    if PLAYER_DATABASE_URL == DATABASE_URL:
-        player_pool = pool
-    else:
-        player_pool = await asyncpg.create_pool(PLAYER_DATABASE_URL, min_size=1, max_size=10)
-
-    if WATCHLIST_DATABASE_URL == DATABASE_URL:
-        watchlist_pool = pool
-    else:
-        watchlist_pool = await asyncpg.create_pool(WATCHLIST_DATABASE_URL, min_size=1, max_size=10)
-
-    # ✅ expose pools to routers/services that access request.app.state.*
+    # Expose pools
     app.state.pool = pool
     app.state.player_pool = player_pool
     app.state.watchlist_pool = watchlist_pool
 
-    # Core tables + indexes
-    # ✅ Smart Buy tables: create in MAIN database (not player database)
+    # ---------- Core tables (create-first so fresh DBs work) ----------
     async with pool.acquire() as conn:
+        # trades
         await conn.execute("""
-            CREATE TABLE IF NOT EXISTS smart_buy_feedback (
-                id SERIAL PRIMARY KEY,
-                card_id BIGINT NOT NULL,
-                action TEXT NOT NULL,  -- bought|ignored|watchlisted
-                notes TEXT DEFAULT '',
-                platform TEXT DEFAULT 'ps',
-                ts TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-        """)
-        
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS smart_buy_market_cache (
-                id SMALLINT PRIMARY KEY DEFAULT 1,
-                payload JSONB NOT NULL,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-        """)
-    
-        # Smart Buy indexes
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_smart_buy_feedback_card ON smart_buy_feedback(card_id)")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_smart_buy_feedback_action ON smart_buy_feedback(action)")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_smart_buy_feedback_ts ON smart_buy_feedback(ts)")
-    
-        print("✅ Smart Buy tables created in main database")
-    
-    async with pool.acquire() as conn:
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS usersettings (
-                id SERIAL PRIMARY KEY,
-                user_id VARCHAR(255) UNIQUE NOT NULL,
-                default_platform VARCHAR(50) DEFAULT 'Console',
-                custom_tags JSONB DEFAULT '[]',
-                currency_format VARCHAR(20) DEFAULT 'coins',
-                theme VARCHAR(20) DEFAULT 'dark',
-                timezone VARCHAR(50) DEFAULT 'UTC',
-                date_format VARCHAR(10) DEFAULT 'US',
-                include_tax_in_profit BOOLEAN DEFAULT true,
-                default_chart_range VARCHAR(10) DEFAULT '30d',
-                visible_widgets JSONB DEFAULT '["profit", "tax", "balance", "trades"]',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS user_profiles (
-                id SERIAL PRIMARY KEY,
-                user_id VARCHAR(255) UNIQUE NOT NULL,
-                username VARCHAR(255),
-                avatar_url TEXT,
-                global_name VARCHAR(255),
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS trading_goals (
-                id SERIAL PRIMARY KEY,
-                user_id VARCHAR(255) NOT NULL,
-                title VARCHAR(255) NOT NULL,
-                target_amount INTEGER NOT NULL,
-                target_date DATE,
-                goal_type VARCHAR(50) DEFAULT 'profit',
-                is_completed BOOLEAN DEFAULT FALSE,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                completed_at TIMESTAMP
-            )
-        """)
-        await conn.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS trade_id BIGINT")
+        CREATE TABLE IF NOT EXISTS trades (
+            user_id TEXT NOT NULL,
+            player TEXT NOT NULL,
+            version TEXT NOT NULL,
+            buy INTEGER NOT NULL,
+            sell INTEGER NOT NULL,
+            quantity INTEGER NOT NULL DEFAULT 1,
+            platform TEXT NOT NULL,
+            profit INTEGER NOT NULL DEFAULT 0,
+            ea_tax INTEGER NOT NULL DEFAULT 0,
+            tag TEXT,
+            notes TEXT,
+            timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            trade_id BIGINT
+        )""")
         await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS trades_user_trade_uidx ON trades (user_id, trade_id)")
         await conn.execute("DROP INDEX IF EXISTS idx_trades_date")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_user_ts ON trades(user_id, timestamp)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_tag ON trades(user_id, tag)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_platform ON trades(user_id, platform)")
-        # Backfill trade_id
+
+        # portfolio
         await conn.execute("""
-            WITH to_fix AS (
-              SELECT ctid, user_id,
-                     ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY timestamp, player) AS rn
-              FROM trades
-              WHERE trade_id IS NULL
-            )
-            UPDATE trades t
-               SET trade_id = ((EXTRACT(EPOCH FROM NOW())*1000)::bigint) + tf.rn
-            FROM to_fix tf
-            WHERE t.ctid = tf.ctid AND t.trade_id IS NULL
-        """)
+        CREATE TABLE IF NOT EXISTS portfolio (
+            user_id TEXT PRIMARY KEY,
+            starting_balance INTEGER NOT NULL DEFAULT 0
+        )""")
+
+        # usersettings
         await conn.execute("""
-            CREATE TABLE IF NOT EXISTS fut_trades (
-              id           BIGSERIAL PRIMARY KEY,
-              discord_id   TEXT NOT NULL,
-              trade_id     BIGINT NOT NULL,
-              player_name  TEXT NOT NULL,
-              card_version TEXT,
-              buy_price    INTEGER,
-              sell_price   INTEGER NOT NULL,
-              ts           TIMESTAMP WITH TIME ZONE NOT NULL,
-              source       TEXT DEFAULT 'webapp'
-            )
+        CREATE TABLE IF NOT EXISTS usersettings (
+            id SERIAL PRIMARY KEY,
+            user_id VARCHAR(255) UNIQUE NOT NULL,
+            default_platform VARCHAR(50) DEFAULT 'Console',
+            custom_tags JSONB DEFAULT '[]',
+            currency_format VARCHAR(20) DEFAULT 'coins',
+            theme VARCHAR(20) DEFAULT 'dark',
+            timezone VARCHAR(50) DEFAULT 'UTC',
+            date_format VARCHAR(10) DEFAULT 'US',
+            include_tax_in_profit BOOLEAN DEFAULT true,
+            default_chart_range VARCHAR(10) DEFAULT '30d',
+            visible_widgets JSONB DEFAULT '["profit", "tax", "balance", "trades"]',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+
+        # user_profiles
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_profiles (
+            id SERIAL PRIMARY KEY,
+            user_id VARCHAR(255) UNIQUE NOT NULL,
+            username VARCHAR(255),
+            avatar_url TEXT,
+            global_name VARCHAR(255),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+
+        # trading_goals
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS trading_goals (
+            id SERIAL PRIMARY KEY,
+            user_id VARCHAR(255) NOT NULL,
+            title VARCHAR(255) NOT NULL,
+            target_amount INTEGER NOT NULL,
+            target_date DATE,
+            goal_type VARCHAR(50) DEFAULT 'profit',
+            is_completed BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            completed_at TIMESTAMP
+        )""")
+
+        # backfill trade_id if NULL (compat)
+        await conn.execute("""
+        WITH to_fix AS (
+          SELECT ctid, user_id,
+                 ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY timestamp, player) AS rn
+          FROM trades
+          WHERE trade_id IS NULL
+        )
+        UPDATE trades t
+           SET trade_id = ((EXTRACT(EPOCH FROM NOW())*1000)::bigint) + tf.rn
+        FROM to_fix tf
+        WHERE t.ctid = tf.ctid AND t.trade_id IS NULL
         """)
+
+        # fut_trades raw ingest
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS fut_trades (
+          id           BIGSERIAL PRIMARY KEY,
+          discord_id   TEXT NOT NULL,
+          trade_id     BIGINT NOT NULL,
+          player_name  TEXT NOT NULL,
+          card_version TEXT,
+          buy_price    INTEGER,
+          sell_price   INTEGER NOT NULL,
+          ts           TIMESTAMPTZ NOT NULL,
+          source       TEXT DEFAULT 'webapp'
+        )""")
         await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS fut_trades_uidx ON fut_trades (discord_id, trade_id)")
 
-        # Events table (for Next Promo)
+        # events (Next Promo)
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS events (
           id BIGSERIAL PRIMARY KEY,
@@ -423,30 +406,85 @@ async def lifespan(app: FastAPI):
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_events_start ON events(start_at)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind)")
 
-    # Existing watchlist table on watchlist_pool
+        # Smart Buy tables (single, rich schema only)
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS smart_buy_suggestions (
+            id BIGSERIAL PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            card_id TEXT NOT NULL,
+            suggestion_type VARCHAR(50) NOT NULL,
+            current_price INTEGER NOT NULL,
+            target_price INTEGER NOT NULL,
+            expected_profit INTEGER NOT NULL,
+            risk_level VARCHAR(20) NOT NULL,
+            confidence_score INTEGER NOT NULL,
+            priority_score INTEGER NOT NULL,
+            reasoning TEXT NOT NULL,
+            time_to_profit VARCHAR(50),
+            platform VARCHAR(10) NOT NULL,
+            market_state VARCHAR(30) NOT NULL,
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            expires_at TIMESTAMPTZ
+        )""")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_smart_buy_suggestions_user_created ON smart_buy_suggestions(user_id, created_at DESC)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_smart_buy_suggestions_card_platform ON smart_buy_suggestions(card_id, platform)")
+
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS smart_buy_feedback (
+            id BIGSERIAL PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            card_id TEXT NOT NULL,
+            action VARCHAR(20) NOT NULL,
+            notes TEXT,
+            actual_buy_price INTEGER,
+            actual_sell_price INTEGER,
+            actual_profit INTEGER,
+            timestamp TIMESTAMPTZ DEFAULT NOW()
+        )""")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_smart_buy_feedback_user_action ON smart_buy_feedback(user_id, action)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_smart_buy_feedback_card ON smart_buy_feedback(card_id)")
+
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS market_states (
+            id BIGSERIAL PRIMARY KEY,
+            platform VARCHAR(10) NOT NULL,
+            state VARCHAR(30) NOT NULL,
+            confidence_score INTEGER NOT NULL,
+            detected_at TIMESTAMPTZ DEFAULT NOW(),
+            indicators JSONB
+        )""")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_market_states_platform_detected ON market_states(platform, detected_at DESC)")
+
+        # small cache table (if you want to keep it)
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS smart_buy_market_cache (
+            id SMALLINT PRIMARY KEY DEFAULT 1,
+            payload JSONB NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""")
+
+    # watchlist DB objects (on watchlist_pool)
     async with watchlist_pool.acquire() as wconn:
         await wconn.execute("""
-            CREATE TABLE IF NOT EXISTS watchlist (
-              id SERIAL PRIMARY KEY,
-              user_id TEXT NOT NULL,
-              card_id BIGINT NOT NULL,
-              player_name TEXT NOT NULL,
-              version TEXT,
-              platform TEXT NOT NULL,
-              started_price INTEGER NOT NULL,
-              started_at TIMESTAMP NOT NULL DEFAULT NOW(),
-              last_price INTEGER,
-              last_checked TIMESTAMP,
-              notes TEXT
-            )
-        """)
+        CREATE TABLE IF NOT EXISTS watchlist (
+          id SERIAL PRIMARY KEY,
+          user_id TEXT NOT NULL,
+          card_id BIGINT NOT NULL,
+          player_name TEXT NOT NULL,
+          version TEXT,
+          platform TEXT NOT NULL,
+          started_price INTEGER NOT NULL,
+          started_at TIMESTAMP NOT NULL DEFAULT NOW(),
+          last_price INTEGER,
+          last_checked TIMESTAMP,
+          notes TEXT
+        )""")
         await wconn.execute("CREATE INDEX IF NOT EXISTS idx_watchlist_user ON watchlist(user_id)")
         await wconn.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_watchlist_unique
-            ON watchlist(user_id, card_id, platform)
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_watchlist_unique
+        ON watchlist(user_id, card_id, platform)
         """)
 
-        # Alerts config + log
         await wconn.execute("""
         CREATE TABLE IF NOT EXISTS watchlist_alerts (
           id BIGSERIAL PRIMARY KEY,
@@ -454,7 +492,7 @@ async def lifespan(app: FastAPI):
           user_discord_id TEXT,
           card_id BIGINT NOT NULL,
           platform TEXT NOT NULL CHECK (platform IN ('ps','xbox','pc')),
-          ref_mode TEXT NOT NULL DEFAULT 'last_close', -- last_close | fixed | started_price
+          ref_mode TEXT NOT NULL DEFAULT 'last_close',
           ref_price NUMERIC,
           rise_pct NUMERIC DEFAULT 5,
           fall_pct NUMERIC DEFAULT 5,
@@ -485,79 +523,6 @@ async def lifespan(app: FastAPI):
         )""")
         await wconn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_user_time ON alerts_log(user_id, sent_at)")
 
-        # ✅ Smart Buy tables: must be inside a fresh acquire on `pool`
-    async with pool.acquire() as conn:
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS smart_buy_suggestions (
-                id BIGSERIAL PRIMARY KEY,
-                user_id TEXT NOT NULL,
-                card_id TEXT NOT NULL,
-                suggestion_type VARCHAR(50) NOT NULL,
-                current_price INTEGER NOT NULL,
-                target_price INTEGER NOT NULL,
-                expected_profit INTEGER NOT NULL,
-                risk_level VARCHAR(20) NOT NULL,
-                confidence_score INTEGER NOT NULL,
-                priority_score INTEGER NOT NULL,
-                reasoning TEXT NOT NULL,
-                time_to_profit VARCHAR(50),
-                platform VARCHAR(10) NOT NULL,
-                market_state VARCHAR(30) NOT NULL,
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-                expires_at TIMESTAMP WITH TIME ZONE
-            )
-        """)
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_smart_buy_suggestions_user_created ON smart_buy_suggestions(user_id, created_at DESC)")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_smart_buy_suggestions_card_platform ON smart_buy_suggestions(card_id, platform)")
-        
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS smart_buy_feedback (
-                id BIGSERIAL PRIMARY KEY,
-                user_id TEXT NOT NULL,
-                card_id TEXT NOT NULL,
-                action VARCHAR(20) NOT NULL,
-                notes TEXT,
-                actual_buy_price INTEGER,
-                actual_sell_price INTEGER,
-                actual_profit INTEGER,
-                timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-            )
-        """)
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_smart_buy_feedback_user_action ON smart_buy_feedback(user_id, action)")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_smart_buy_feedback_card ON smart_buy_feedback(card_id, action)")
-        
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS market_states (
-                id BIGSERIAL PRIMARY KEY,
-                platform VARCHAR(10) NOT NULL,
-                state VARCHAR(30) NOT NULL,
-                confidence_score INTEGER NOT NULL,
-                detected_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-                indicators JSONB
-            )
-        """)
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_market_states_platform_detected ON market_states(platform, detected_at DESC)")
-
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS smart_buy_preferences (
-                id BIGSERIAL PRIMARY KEY,
-                user_id TEXT UNIQUE NOT NULL,
-                default_budget INTEGER DEFAULT 100000,
-                risk_tolerance VARCHAR(20) DEFAULT 'moderate',
-                preferred_time_horizon VARCHAR(20) DEFAULT 'short',
-                preferred_categories JSONB DEFAULT '[]'::jsonb,
-                excluded_positions JSONB DEFAULT '[]'::jsonb,
-                preferred_leagues JSONB DEFAULT '[]'::jsonb,
-                preferred_nations JSONB DEFAULT '[]'::jsonb,
-                min_rating INTEGER DEFAULT 75,
-                max_rating INTEGER DEFAULT 95,
-                min_profit INTEGER DEFAULT 1000,
-                notifications_enabled BOOLEAN DEFAULT TRUE,
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-                updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-            )
-        """)
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_smart_buy_preferences_user ON smart_buy_preferences(user_id)")
     # Start alerts loop
     _watchlist_task = asyncio.create_task(_alerts_poll_loop())
     logging.info("✅ Watchlist alerts loop started (%ss)", WATCHLIST_POLL_INTERVAL)
@@ -569,16 +534,11 @@ async def lifespan(app: FastAPI):
             _watchlist_task.cancel()
             with suppress(asyncio.CancelledError):
                 await _watchlist_task
-        to_close = {pool, player_pool, watchlist_pool}
-        for p in to_close:
+        for p in {pool, player_pool, watchlist_pool}:
             if p is not None:
                 await p.close()
-
-
-# ----------------- APP & MIDDLEWARE -----------------
+                
 app = FastAPI(lifespan=lifespan)
-
-FRONTEND_URL = os.getenv("FRONTEND_ORIGIN", "https://app.futhub.co.uk")
 
 app.add_middleware(
     CORSMiddleware,
@@ -586,7 +546,7 @@ app.add_middleware(
         FRONTEND_URL,
         "https://app.futhub.co.uk",
         "https://www.futhub.co.uk",
-        "https://futhub.co.uk",       # if you ever serve the apex directly
+        "https://futhub.co.uk",
         "http://localhost:5173",
         "http://localhost:3000",
     ],
@@ -605,13 +565,10 @@ app.add_middleware(
     https_only=IS_PROD,
 )
 
-# ✅ mount Trade Finder API
+# Routers
 app.include_router(trade_finder_router)
-
 app.include_router(smart_buy_router, prefix="/api")
 
-
-# ----------------- DEPENDENCIES & HELPERS -----------------
 async def get_db():
     async with pool.acquire() as connection:
         yield connection
@@ -662,7 +619,7 @@ def require_extension_jwt(request: Request):
         raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
     return SimpleNamespace(discord_id=payload.get("sub"))
 
-# --------- FUT.GG price fetch ---------
+# Unified FUT.GG price fetch with lightweight cache
 async def fetch_price(card_id: int, platform: str) -> Dict[str, Any]:
     platform = (platform or "").lower()
     key = f"{card_id}|{platform}"
@@ -697,30 +654,22 @@ async def fetch_price(card_id: int, platform: str) -> Dict[str, Any]:
 
     _price_cache[key] = {"at": now, "price": price, "isExtinct": is_extinct, "updatedAt": updated_at}
     return {"price": price, "isExtinct": is_extinct, "updatedAt": updated_at}
-
-
-# ----------------- EXTENSION ROUTER (no NameError) -----------------
+    
 ext_router = APIRouter()
 
 @ext_router.get("/ext/ping")
 async def ext_ping(auth = Depends(require_extension_jwt)):
-    """Sanity check for the extension – proves the JWT is valid."""
     return {"ok": True, "sub": auth.discord_id}
 
 @ext_router.post("/ext/trades")
 async def ext_add_trade(
     sale: ExtSale,
-    auth = Depends(require_extension_jwt),   # extension JWT, not web session
+    auth = Depends(require_extension_jwt),
     conn = Depends(get_db),
 ):
-    """
-    Ingest a sold item from the Chrome extension.
-    The extension must send Authorization: Bearer <token> (issued during OAuth).
-    """
     discord_id = auth.discord_id or "unknown"
     ts = datetime.fromtimestamp(int(sale.timestamp_ms) / 1000, tz=timezone.utc)
 
-    # 1) Raw log into fut_trades (idempotent per discord_id + trade_id)
     await conn.execute("""
         INSERT INTO fut_trades (discord_id, trade_id, player_name, card_version, buy_price, sell_price, ts, source)
         VALUES ($1,$2,$3,$4,$5,$6,$7,'webapp')
@@ -733,13 +682,12 @@ async def ext_add_trade(
             ts           = EXCLUDED.ts
     """, discord_id, int(sale.trade_id), sale.player_name, sale.card_version, sale.buy_price, sale.sell_price, ts)
 
-    # 2) Mirror into main trades so the dashboard shows it immediately
     player   = sale.player_name
     version  = str(sale.card_version or "Standard")
     qty      = 1
     buy      = int(sale.buy_price or 0)
     sell     = int(sale.sell_price or 0)
-    platform = "ps"     # pick a default; user can edit in UI
+    platform = "ps"
     tag      = "fut-webapp"
     ea_tax   = int(round(sell * qty * 0.05))
     profit   = (sell - buy) * qty
@@ -765,11 +713,8 @@ async def ext_add_trade(
 
     return {"ok": True}
 
-# mount it
 app.include_router(ext_router)
 
-
-# ----------------- ROUTES -----------------
 @app.get("/")
 async def root():
     return {"message": "FUT Dashboard API", "status": "healthy"}
@@ -783,7 +728,6 @@ async def health_check():
     except Exception as e:
         return {"status": "unhealthy", "database": "disconnected", "error": str(e)}
 
-# OAuth – dashboard
 @app.get("/api/login")
 async def login():
     state = secrets.token_urlsafe(24)
@@ -872,15 +816,12 @@ async def callback(request: Request):
                 "ON CONFLICT (user_id) DO NOTHING",
                 user_id, 0,
             )
-            await conn.execute(
-                """
+            await conn.execute("""
                 INSERT INTO user_profiles (user_id, username, avatar_url, global_name, updated_at)
                 VALUES ($1, $2, $3, $4, NOW())
                 ON CONFLICT (user_id)
                 DO UPDATE SET username = $2, avatar_url = $3, global_name = $4, updated_at = NOW()
-                """,
-                user_id, username, avatar_url, global_name,
-            )
+            """, user_id, username, avatar_url, global_name)
 
         return RedirectResponse(f"{FRONTEND_URL}/auth/done")
     except HTTPException:
@@ -899,7 +840,6 @@ async def logout_post(request: Request):
     request.session.clear()
     return {"message": "Logged out successfully"}
 
-# OAuth – Chrome extension
 @app.get("/oauth/start")
 async def oauth_start(redirect_uri: str):
     if not redirect_uri.startswith("https://") or "chromiumapp.org" not in redirect_uri:
@@ -915,9 +855,7 @@ async def oauth_start(redirect_uri: str):
         "prompt": "consent",
     }
     return RedirectResponse(f"{DISCORD_OAUTH_AUTHORIZE}?{urlencode(params)}")
-
-
-# ----------------- BUSINESS ROUTES -----------------
+    
 async def fetch_dashboard_data(user_id: str, conn):
     portfolio = await conn.fetchrow("SELECT starting_balance FROM portfolio WHERE user_id=$1", user_id)
     stats = await conn.fetchrow(
@@ -959,7 +897,7 @@ async def get_dashboard(user_id: str = Depends(get_current_user), conn=Depends(g
 @app.get("/api/profile")
 async def get_profile(user_id: str = Depends(get_current_user), conn=Depends(get_db)):
     return await fetch_dashboard_data(user_id, conn)
-
+    
 @app.post("/api/trades")
 async def add_trade(request: Request, user_id: str = Depends(get_current_user), conn=Depends(get_db)):
     data = await request.json()
@@ -977,7 +915,6 @@ async def add_trade(request: Request, user_id: str = Depends(get_current_user), 
     except (ValueError, TypeError):
         raise HTTPException(status_code=400, detail="Invalid numeric values")
 
-    # ✅ trade_id: sanitize or generate
     trade_id = data.get("trade_id")
     if isinstance(trade_id, str):
         tid = trade_id.strip()
@@ -986,27 +923,22 @@ async def add_trade(request: Request, user_id: str = Depends(get_current_user), 
         trade_id = None
 
     if trade_id is None:
-        # generate snowflake-ish id + ensure uniqueness for this user
         base = int(time.time() * 1000)
         trade_id = base + secrets.randbelow(1000)
-        exists = await conn.fetchval(
-            "SELECT 1 FROM trades WHERE user_id=$1 AND trade_id=$2",
-            user_id, trade_id
-        )
+        exists = await conn.fetchval("SELECT 1 FROM trades WHERE user_id=$1 AND trade_id=$2", user_id, trade_id)
         if exists:
             trade_id = base + secrets.randbelow(1000000)
 
     profit = (sell - buy) * quantity
     ea_tax = int(round(sell * quantity * 0.05))
 
-    row = await conn.fetchrow(
-        """
+    row = await conn.fetchrow("""
         INSERT INTO trades (
             user_id, player, version, buy, sell, quantity, platform, profit, ea_tax, tag, notes, timestamp, trade_id
         )
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW(),$12)
         RETURNING player, version, buy, sell, quantity, platform, profit, ea_tax, tag, notes, timestamp, trade_id
-        """,
+    """,
         user_id,
         (data["player"] or "").strip(),
         (data["version"] or "").strip(),
@@ -1020,10 +952,7 @@ async def add_trade(request: Request, user_id: str = Depends(get_current_user), 
         (data.get("notes", "") or "").strip(),
         trade_id,
     )
-    return {
-        "message": "Trade added successfully!",
-        "trade": dict(row)  # includes trade_id, timestamp, profit, ea_tax, etc.
-    }
+    return {"message": "Trade added successfully!", "trade": dict(row)}
 
 @app.get("/api/trades")
 async def get_all_trades(user_id: str = Depends(get_current_user), conn=Depends(get_db)):
@@ -1033,7 +962,7 @@ async def get_all_trades(user_id: str = Depends(get_current_user), conn=Depends(
 @app.put("/api/trades/{trade_id}")
 async def update_trade(
     trade_id: int,
-    payload: 'TradeUpdate',
+    payload: TradeUpdate,
     user_id: str = Depends(get_current_user),
     conn=Depends(get_db),
 ):
@@ -1069,17 +998,14 @@ async def update_trade(
     ea_tax = int(round(sell * qty * 0.05))
     profit = (sell - buy) * qty
 
-    row2 = await conn.fetchrow(
-        """
+    row2 = await conn.fetchrow("""
         UPDATE trades
            SET ea_tax = $1,
                profit = $2
          WHERE trade_id = $3
            AND user_id  = $4
      RETURNING player, version, quantity, buy, sell, platform, tag, notes, ea_tax, profit, timestamp, trade_id
-        """,
-        ea_tax, profit, trade_id, user_id
-    )
+    """, ea_tax, profit, trade_id, user_id)
     return dict(row2)
 
 @app.delete("/api/trades/{trade_id}")
@@ -1088,7 +1014,7 @@ async def delete_trade(trade_id: int, user_id: str = Depends(get_current_user), 
     if result == "DELETE 0":
         raise HTTPException(status_code=404, detail="Trade not found")
     return {"message": "Trade deleted successfully"}
-
+    
 @app.get("/api/fut-player-definition/{card_id}")
 async def get_player_definition(card_id: str):
     try:
@@ -1130,8 +1056,7 @@ async def get_player_price_proxy(card_id: str):
     except Exception as e:
         logging.error(f"Player price fetch error: {e}")
         return {"error": str(e)}
-
-# ----------------- WATCHLIST ROUTES (simple list used by UI) -----------------
+        
 @app.post("/api/watchlist")
 async def add_watch_item(payload: WatchlistCreate, user_id: str = Depends(get_current_user)):
     try:
@@ -1139,8 +1064,7 @@ async def add_watch_item(payload: WatchlistCreate, user_id: str = Depends(get_cu
             live = await fetch_price(payload.card_id, payload.platform)
             start_price = live["price"] if isinstance(live["price"], int) else 0
 
-            row = await conn.fetchrow(
-                """
+            row = await conn.fetchrow("""
                 INSERT INTO watchlist (
                     user_id, card_id, player_name, version, platform, started_price, last_price, last_checked, notes
                 )
@@ -1152,7 +1076,7 @@ async def add_watch_item(payload: WatchlistCreate, user_id: str = Depends(get_cu
                       last_price=EXCLUDED.last_price,
                       last_checked=NOW()
                 RETURNING id
-                """,
+            """,
                 user_id,
                 payload.card_id,
                 payload.player_name,
@@ -1162,14 +1086,9 @@ async def add_watch_item(payload: WatchlistCreate, user_id: str = Depends(get_cu
                 live["price"] if isinstance(live["price"], int) else None,
                 payload.notes,
             )
-            return {
-                "ok": True,
-                "id": row["id"],
-                "start_price": start_price,
-                "is_extinct": live.get("isExtinct", False),
-            }
+            return {"ok": True, "id": row["id"], "start_price": start_price, "is_extinct": live.get("isExtinct", False)}
     except Exception as e:
-        print(f"Watchlist POST error: {e}")
+        logging.error(f"Watchlist POST error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/watchlist")
@@ -1184,19 +1103,13 @@ async def list_watch_items(user_id: str = Depends(get_current_user)):
             card_ids = [str(w["card_id"]) for w in watches if w.get("card_id") is not None]
 
             async with player_pool.acquire() as pconn:
-                meta_rows = await pconn.fetch(
-                    """
+                meta_rows = await pconn.fetch("""
                     SELECT card_id, name, rating, club, nation
                     FROM fut_players
                     WHERE card_id = ANY($1::text[])
-                    """,
-                    card_ids,
-                )
+                """, card_ids)
 
-            meta_map = {
-                str(m["card_id"]): {k: m[k] for k in ("name", "rating", "club", "nation")}
-                for m in meta_rows
-            }
+            meta_map = {str(m["card_id"]): {k: m[k] for k in ("name", "rating", "club", "nation")} for m in meta_rows}
 
             enriched = []
             for w in watches:
@@ -1230,7 +1143,7 @@ async def list_watch_items(user_id: str = Depends(get_current_user)):
                 })
             return {"ok": True, "items": enriched}
     except Exception as e:
-        print(f"Watchlist GET error: {e}")
+        logging.error(f"Watchlist GET error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/api/watchlist/{watch_id}")
@@ -1244,7 +1157,7 @@ async def delete_watch_item(watch_id: int, user_id: str = Depends(get_current_us
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Watchlist DELETE error: {e}")
+        logging.error(f"Watchlist DELETE error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/watchlist/{watch_id}/refresh")
@@ -1271,14 +1184,11 @@ async def refresh_watch_item(watch_id: int, user_id: str = Depends(get_current_u
                 change_pct = round((change / int(w["started_price"])) * 100, 2)
 
             async with player_pool.acquire() as pconn:
-                meta = await pconn.fetchrow(
-                    """
+                meta = await pconn.fetchrow("""
                     SELECT card_id, name, rating, club, nation
                     FROM fut_players
                     WHERE card_id = $1::text
-                    """,
-                    str(w["card_id"]),
-                )
+                """, str(w["card_id"]))
             meta_dict = dict(meta) if meta else {}
 
             return {
@@ -1306,16 +1216,14 @@ async def refresh_watch_item(watch_id: int, user_id: str = Depends(get_current_u
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Watchlist REFRESH error: {e}")
+        logging.error(f"Watchlist REFRESH error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
-# ----------------- WATCHLIST ALERTS (new) -----------------
+        
 async def _send_discord_dm(user_discord_id: str, content: str) -> bool:
     if not DISCORD_BOT_TOKEN or not user_discord_id:
         return False
     try:
         async with aiohttp.ClientSession(headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}", "Content-Type":"application/json"}) as sess:
-            # Create or get DM channel
             async with sess.post("https://discord.com/api/v10/users/@me/channels", json={"recipient_id": user_discord_id}) as r:
                 if r.status not in (200, 201):
                     return False
@@ -1352,7 +1260,6 @@ async def _ref_price_for_alert(row: asyncpg.Record) -> Optional[float]:
     mode = row["ref_mode"]
     if mode == "fixed" and row["ref_price"]:
         return float(row["ref_price"])
-    # started_price: look up user's watchlist baseline
     if mode == "started_price":
         async with watchlist_pool.acquire() as w:
             r = await w.fetchrow(
@@ -1360,7 +1267,6 @@ async def _ref_price_for_alert(row: asyncpg.Record) -> Optional[float]:
                 row["user_id"], row["card_id"], row["platform"]
             )
         return float(r["started_price"]) if r and r["started_price"] else None
-    # last_close: use latest history point
     try:
         hist = await get_price_history(int(row["card_id"]), row["platform"], "today")
         if hist:
@@ -1429,7 +1335,6 @@ async def _alerts_poll_loop():
     await asyncio.sleep(3)
     while True:
         try:
-            # distinct pairs
             async with watchlist_pool.acquire() as w:
                 pairs = await w.fetch("SELECT DISTINCT card_id, platform FROM watchlist_alerts")
             tasks = []
@@ -1454,7 +1359,6 @@ async def _poll_pair_once(card_id: int, platform: str):
     except Exception as e:
         logging.debug("poll pair error: %s", e)
 
-# CRUD for alerts
 @app.get("/api/watchlist-alerts")
 async def list_watchlist_alerts(user_id: str = Depends(get_current_user)):
     async with watchlist_pool.acquire() as w:
@@ -1489,7 +1393,6 @@ async def delete_watchlist_alert(alert_id: int, user_id: str = Depends(get_curre
 
 @app.post("/api/watchlist-alerts/test")
 async def test_alert_endpoint(card_id: int, platform: str = "ps", price: Optional[int] = None, user_id: str = Depends(get_current_user)):
-    # trigger eval once with forced price or live
     if price is None:
         live = await fetch_price(card_id, platform)
         price = live.get("price")
@@ -1497,8 +1400,7 @@ async def test_alert_endpoint(card_id: int, platform: str = "ps", price: Optiona
         raise HTTPException(400, "No price available")
     n = await _eval_alerts_for_pair(card_id, platform, float(price))
     return {"sent": n}
-
-# ----------------- ME / SETTINGS / PORTFOLIO -----------------
+    
 @app.get("/api/me")
 async def get_current_user_info(request: Request):
     uid = request.session.get("user_id")
@@ -1551,8 +1453,7 @@ async def get_user_settings(user_id: str = Depends(get_current_user), conn=Depen
 @app.post("/api/settings")
 async def update_user_settings(settings: UserSettings, user_id: str = Depends(get_current_user), conn=Depends(get_db)):
     try:
-        await conn.execute(
-            """
+        await conn.execute("""
             INSERT INTO usersettings (
                 user_id, default_platform, custom_tags, currency_format, theme, 
                 timezone, date_format, include_tax_in_profit, default_chart_range, 
@@ -1571,7 +1472,7 @@ async def update_user_settings(settings: UserSettings, user_id: str = Depends(ge
                 default_chart_range = EXCLUDED.default_chart_range,
                 visible_widgets = EXCLUDED.visible_widgets,
                 updated_at = NOW()
-            """,
+        """,
             user_id,
             settings.default_platform,
             json.dumps(settings.custom_tags),
@@ -1583,7 +1484,6 @@ async def update_user_settings(settings: UserSettings, user_id: str = Depends(ge
             settings.default_chart_range,
             json.dumps(settings.visible_widgets)
         )
-        
         return {"message": "Settings updated successfully"}
     except Exception as e:
         logging.error(f"Error updating user settings: {e}")
@@ -1600,8 +1500,7 @@ async def update_starting_balance(request: Request, user_id: str = Depends(get_c
         starting_balance,
     )
     return {"message": "Starting balance updated successfully"}
-
-# ----------------- GOALS -----------------
+    
 @app.get("/api/goals")
 async def get_trading_goals(user_id: str = Depends(get_current_user), conn=Depends(get_db)):
     goals = await conn.fetch("SELECT * FROM trading_goals WHERE user_id=$1 ORDER BY created_at DESC", user_id)
@@ -1609,11 +1508,10 @@ async def get_trading_goals(user_id: str = Depends(get_current_user), conn=Depen
 
 @app.post("/api/goals")
 async def create_trading_goal(goal: TradingGoal, user_id: str = Depends(get_current_user), conn=Depends(get_db)):
-    await conn.execute(
-        """
+    await conn.execute("""
         INSERT INTO trading_goals (user_id, title, target_amount, target_date, goal_type, is_completed, created_at)
         VALUES ($1, $2, $3, $4, $5, $6, NOW())
-        """,
+    """,
         user_id,
         goal.title,
         goal.target_amount,
@@ -1623,52 +1521,38 @@ async def create_trading_goal(goal: TradingGoal, user_id: str = Depends(get_curr
     )
     return {"message": "Goal created successfully"}
 
-# ----------------- ANALYTICS -----------------
 @app.get("/api/analytics/advanced")
 async def get_advanced_analytics(user_id: str = Depends(get_current_user), conn=Depends(get_db)):
-    daily_profits = await conn.fetch(
-        """
+    daily_profits = await conn.fetch("""
         SELECT DATE(timestamp) as date, COALESCE(SUM(profit), 0) as daily_profit, COUNT(*) as trades_count
         FROM trades WHERE user_id=$1 AND timestamp >= NOW() - INTERVAL '30 days'
         GROUP BY DATE(timestamp) ORDER BY date
-        """,
-        user_id,
-    )
-    tag_performance = await conn.fetch(
-        """
+    """, user_id)
+    tag_performance = await conn.fetch("""
         SELECT tag, COUNT(*) as trade_count, COALESCE(SUM(profit), 0) as total_profit,
                COALESCE(AVG(profit), 0) as avg_profit,
                COUNT(CASE WHEN profit > 0 THEN 1 END) * 100.0 / COUNT(*) as win_rate
         FROM trades WHERE user_id=$1 AND tag IS NOT NULL AND tag != ''
         GROUP BY tag ORDER BY total_profit DESC
-        """,
-        user_id,
-    )
-    platform_stats = await conn.fetch(
-        """
+    """, user_id)
+    platform_stats = await conn.fetch("""
         SELECT platform, COUNT(*) as trade_count, COALESCE(SUM(profit), 0) as total_profit,
                COALESCE(AVG(profit), 0) as avg_profit
         FROM trades WHERE user_id=$1 GROUP BY platform
-        """,
-        user_id,
-    )
-    monthly_summary = await conn.fetch(
-        """
+    """, user_id)
+    monthly_summary = await conn.fetch("""
         SELECT DATE_TRUNC('month', timestamp) as month, COUNT(*) as trades_count,
                COALESCE(SUM(profit), 0) as total_profit, COALESCE(SUM(ea_tax), 0) as total_tax
         FROM trades WHERE user_id=$1
         GROUP BY DATE_TRUNC('month', timestamp) ORDER BY month DESC LIMIT 12
-        """,
-        user_id,
-    )
+    """, user_id)
     return {
         "daily_profits": [dict(r) for r in daily_profits],
         "tag_performance": [dict(r) for r in tag_performance],
         "platform_stats": [dict(r) for r in platform_stats],
         "monthly_summary": [dict(r) for r in monthly_summary],
     }
-
-# ----------------- BULK / EXPORT / IMPORT / NUKE -----------------
+    
 @app.put("/api/trades/bulk")
 async def bulk_edit_trades(request: Request, user_id: str = Depends(get_current_user), conn=Depends(get_db)):
     data = await request.json()
@@ -1756,31 +1640,18 @@ async def import_trades(file: UploadFile = File(...), user_id: str = Depends(get
             profit = (sell - buy) * quantity
             ea_tax = int(round(sell * quantity * 0.05))
 
-            await conn.execute(
-                """
+            await conn.execute("""
                 INSERT INTO trades (user_id, player, version, buy, sell, quantity, platform, profit, ea_tax, tag, timestamp)
                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
-                """,
-                user_id,
-                player,
-                version,
-                buy,
-                sell,
-                quantity,
-                platform,
-                profit,
-                ea_tax,
-                tag,
+            """,
+                user_id, player, version, buy, sell, quantity, platform, profit, ea_tax, tag
             )
             imported_count += 1
         except Exception as e:
             errors.append(f"Error importing trade {t}: {str(e)}")
 
-    return {
-        "message": f"Successfully imported {imported_count} trades",
-        "imported_count": imported_count,
-        "errors": errors[:10],
-    }
+    return {"message": f"Successfully imported {imported_count} trades",
+            "imported_count": imported_count, "errors": errors[:10]}
 
 @app.delete("/api/data/delete-all")
 async def delete_all_user_data(confirm: bool = False, user_id: str = Depends(get_current_user), conn=Depends(get_db)):
@@ -1790,8 +1661,7 @@ async def delete_all_user_data(confirm: bool = False, user_id: str = Depends(get
     deleted = int(res.split()[-1]) if res.startswith("DELETE ") else 0
     await conn.execute("UPDATE portfolio SET starting_balance = 0 WHERE user_id=$1", user_id)
     return {"message": "All data deleted successfully", "trades_deleted": deleted}
-
-# ----------------- SEARCH PLAYERS -----------------
+    
 @app.get("/api/search-players")
 async def search_players(q: str = "", pos: Optional[str] = None):
     q = (q or "").strip()
@@ -1858,8 +1728,6 @@ async def search_players(q: str = "", pos: Optional[str] = None):
         logging.error(f"Player search error: {e}")
         return {"players": [], "error": str(e)}
 
-
-# ----------------- DEBUG -----------------
 @app.get("/api/debug/session")
 async def debug_session(req: Request):
     return {
@@ -1867,21 +1735,17 @@ async def debug_session(req: Request):
         "session_user_id": req.session.get("user_id"),
         "all_session_keys": list(req.session.keys()),
     }
-
-# ----------------- TRENDING -----------------
+    
 async def _enrich_with_meta(items: list[dict]) -> list[dict]:
     if not items:
         return []
     ids = [str(it["card_id"]) for it in items]
     async with player_pool.acquire() as pconn:
-        rows = await pconn.fetch(
-            """
+        rows = await pconn.fetch("""
             SELECT card_id, name, rating, version, image_url, club, league
               FROM fut_players
              WHERE card_id = ANY($1::text[])
-            """,
-            ids,
-        )
+        """, ids)
     meta = {str(r["card_id"]): dict(r) for r in rows}
     out = []
     for it in items:
@@ -1901,18 +1765,22 @@ async def _enrich_with_meta(items: list[dict]) -> list[dict]:
     return out
 
 async def _attach_prices_ps(items: list[dict]) -> list[dict]:
-    tasks = [get_player_price(it["pid"], "ps") for it in items]
+    # Use our unified FUT.GG fetcher for consistency
+    tasks = [fetch_price(it["pid"], "ps") for it in items]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     for it, val in zip(items, results):
-        it["price_ps"] = int(val) if isinstance(val, (int, float)) else None
+        if isinstance(val, dict) and isinstance(val.get("price"), (int, float)):
+            it["price_ps"] = int(val["price"])
+        else:
+            it["price_ps"] = None
     return items
 
 @app.get("/api/trending")
 async def api_trending(
-    type: Literal["risers","fallers"],
+    trend_type: Literal["risers","fallers"],
     tf: Optional[str] = "24",
 ):
-    kind = (type or "fallers").lower()
+    kind = (trend_type or "fallers").lower()
     tf_norm = _norm_tf(tf)
 
     if kind == "fallers":
@@ -1926,13 +1794,12 @@ async def api_trending(
         items.sort(key=lambda x: x["percent"], reverse=True)
         pick = items[:10]
     else:
-        raise HTTPException(status_code=400, detail="type must be 'risers' or 'fallers'")
+        raise HTTPException(status_code=400, detail="trend_type must be 'risers' or 'fallers'")
 
     enriched = await _enrich_with_meta(pick)
     enriched = await _attach_prices_ps(enriched)
     return {"type": kind, "timeframe": f"{tf_norm}h", "items": enriched}
-
-# ----------------- COMPARE: side-by-side player data -----------------
+    
 def _cmp_now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -2039,14 +1906,11 @@ async def player_compare(
     plat = _cmp_platform(platform)
 
     async with player_pool.acquire() as pconn:
-        meta_rows = await pconn.fetch(
-            """
+        meta_rows = await pconn.fetch("""
             SELECT card_id, name, rating, position, league, nation, club, image_url
             FROM fut_players
             WHERE card_id = ANY($1::text[])
-            """,
-            raw_ids,
-        )
+        """, raw_ids)
     meta = {str(r["card_id"]): dict(r) for r in meta_rows}
 
     players_out: List[Dict[str, Any]] = []
@@ -2057,6 +1921,7 @@ async def player_compare(
         except Exception:
             cid_int = None
 
+        # If you want to align with the unified fetcher, you could replace below with fetch_price(...).get("price")
         console_price = await get_player_price(cid_int, plat) if cid_int is not None else None
         pc_price = await get_player_price(cid_int, "pc") if (cid_int is not None and include_pc) else None
 
@@ -2101,21 +1966,18 @@ async def player_compare(
 
     return {"players": players_out}
 
-# ----------------- Next Promo endpoint -----------------
 @app.get("/api/events/next")
 async def next_event():
-    # If no events, fallback to next 18:00 UK "Daily Content Drop"
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT name, kind, start_at, confidence FROM events WHERE start_at > $1 ORDER BY start_at ASC LIMIT 1",
             now_utc()
         )
     if row:
-        return {"name": row["name"], "kind": row["kind"], "start_at": row["start_at"].isoformat(), "confidence": "confidence" in row and row["confidence"] or "heuristic"}
+        return {"name": row["name"], "kind": row["kind"], "start_at": row["start_at"].isoformat(), "confidence": row["confidence"] or "heuristic"}
     nxt = next_daily_london_hour(18)
     return {"name": "Daily Content Drop", "kind": "promo", "start_at": nxt.isoformat(), "confidence": "heuristic"}
 
-# ----------------- Deal Confidence endpoint -----------------
 @app.get("/api/deal-confidence/{card_id}")
 async def deal_confidence(card_id: int, platform: str = "ps"):
     try:
@@ -2170,7 +2032,6 @@ async def deal_confidence(card_id: int, platform: str = "ps"):
         "catalystBoost": round(catalyst,3)
     }}
 
-# ----------------- Backtest endpoint (simple dip->tp/sl) -----------------
 @app.post("/api/backtest")
 async def backtest(payload: Dict[str, Any]):
     players: List[int] = payload.get("players") or []
@@ -2237,8 +2098,7 @@ async def backtest(payload: Dict[str, Any]):
         "avg_hold_h": round(sum(((tr["t_out"]-tr["t_in"])/3600000.0) for tr in all_trades)/len(all_trades), 2) if all_trades else 0.0,
     }
     return {"equity": equity, "summary": summary, "trades": all_trades}
-
-# ----------------- INCLUDE OPTIONAL ROUTERS -----------------
+    
 try:
     from app.routers.squad import router as squad_router  # type: ignore
     app.include_router(squad_router, prefix="/api")
@@ -2246,7 +2106,6 @@ try:
 except Exception as e:
     logging.warning("⚠️ Squad router not loaded: %s", e)
 
-# ----------------- ENTRYPOINT -----------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=PORT)
