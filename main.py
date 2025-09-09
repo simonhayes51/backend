@@ -1777,34 +1777,89 @@ async def _attach_prices_ps(items: list[dict]) -> list[dict]:
 
 from fastapi import Query
 
+from fastapi import Query
+
 @app.get("/api/trending")
 async def api_trending(
-    # accept ?type=risers|fallers (frontend uses this)
-    type_: Optional[Literal["risers","fallers"]] = Query(None, alias="type"),
-    # also accept ?trend_type=... just in case
-    trend_type: Optional[Literal["risers","fallers"]] = None,
+    # keep alias so your frontend can still send ?type=
+    type_: Optional[Literal["risers","fallers","smart"]] = Query(None, alias="type"),
+    trend_type: Optional[Literal["risers","fallers","smart"]] = None,
     tf: Optional[str] = "24",
 ):
     kind = (type_ or trend_type or "fallers").lower()
     tf_norm = _norm_tf(tf)
 
+    async def _collect_minmax_items(tf_str: str, pages_each_side: int = 2) -> Dict[int, float]:
+        # Grab first and last pages to cover both extremes
+        first_html = await _fetch_momentum_page(tf_str, 1)
+        last_page = _parse_last_page_number(first_html)
+        items: Dict[int, float] = {}
 
-    if kind == "fallers":
-        items, _ = await _momentum_page_items(tf_norm, 1)
-        items.sort(key=lambda x: x["percent"])
-        pick = items[:10]
-    elif kind == "risers":
-        _, html = await _momentum_page_items(tf_norm, 1)
-        last = _parse_last_page_number(html)
-        items, _ = await _momentum_page_items(tf_norm, last)
-        items.sort(key=lambda x: x["percent"], reverse=True)
-        pick = items[:10]
-    else:
-        raise HTTPException(status_code=400, detail="trend_type must be 'risers' or 'fallers'")
+        # first N pages (fallers-heavy)
+        for p in range(1, min(last_page, pages_each_side) + 1):
+            for it in _extract_items(await _fetch_momentum_page(tf_str, p)):
+                items[int(it["card_id"])] = float(it["percent"])
+
+        # last N pages (risers-heavy)
+        for p in range(max(1, last_page - pages_each_side + 1), last_page + 1):
+            for it in _extract_items(await _fetch_momentum_page(tf_str, p)):
+                items[int(it["card_id"])] = float(it["percent"])
+
+        return items
+
+    if kind in ("fallers", "risers"):
+        if kind == "fallers":
+            items, _ = await _momentum_page_items(tf_norm, 1)
+            items.sort(key=lambda x: x["percent"])
+            pick = items[:10]
+        else:
+            _, html = await _momentum_page_items(tf_norm, 1)
+            last = _parse_last_page_number(html)
+            items, _ = await _momentum_page_items(tf_norm, last)
+            items.sort(key=lambda x: x["percent"], reverse=True)
+            pick = items[:10]
+
+        enriched = await _enrich_with_meta(pick)
+        enriched = await _attach_prices_ps(enriched)
+        return {"type": kind, "timeframe": f"{tf_norm}h", "items": enriched}
+
+    # ---- SMART MOVERS ----
+    # Compare 6h vs 24h; include cards where the signs differ (one up, one down).
+    items6 = await _collect_minmax_items("6")
+    items24 = await _collect_minmax_items("24")
+
+    smart_candidates = []
+    for cid, p6 in items6.items():
+        if cid in items24:
+            p24 = items24[cid]
+            if p6 * p24 < 0:  # opposite signs
+                # optional: require a minimum move to avoid noise
+                if abs(p6) >= 0.5 or abs(p24) >= 0.5:
+                    smart_candidates.append({
+                        "card_id": cid,
+                        "percent_6h": round(p6, 2),
+                        "percent_24h": round(p24, 2),
+                        # keep a 'percent' for compatibility (show 6h by default)
+                        "percent": round(p6, 2),
+                    })
+
+    # Sort by combined magnitude so the most meaningful flips surface first
+    smart_candidates.sort(key=lambda x: (abs(x["percent_6h"]) + abs(x["percent_24h"])), reverse=True)
+    pick = smart_candidates[:10]
 
     enriched = await _enrich_with_meta(pick)
-    enriched = await _attach_prices_ps(enriched)
-    return {"type": kind, "timeframe": f"{tf_norm}h", "items": enriched}
+    # Preserve the smart fields on the enriched objects
+    meta_map = {it["pid"]: it for it in enriched}
+    for raw in pick:
+        pid = raw["card_id"]
+        if pid in meta_map:
+            meta_map[pid]["percent_6h"] = raw["percent_6h"]
+            meta_map[pid]["percent_24h"] = raw["percent_24h"]
+            meta_map[pid]["percent"] = raw["percent"]
+
+    enriched = await _attach_prices_ps(list(meta_map.values()))
+    return {"type": "smart", "timeframe": "6h_vs_24h", "items": enriched}
+
     
 def _cmp_now_ms() -> int:
     return int(time.time() * 1000)
