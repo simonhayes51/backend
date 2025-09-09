@@ -1779,40 +1779,27 @@ from fastapi import Query
 
 from fastapi import Query
 
+from fastapi import Query
+from typing import Optional, Literal
+
 @app.get("/api/trending")
 async def api_trending(
-    # keep alias so your frontend can still send ?type=
+    # keep the alias so the frontend can send ?type=
     type_: Optional[Literal["risers","fallers","smart"]] = Query(None, alias="type"),
+    # also accept ?trend_type=... (back-compat)
     trend_type: Optional[Literal["risers","fallers","smart"]] = None,
     tf: Optional[str] = "24",
 ):
     kind = (type_ or trend_type or "fallers").lower()
     tf_norm = _norm_tf(tf)
 
-    async def _collect_minmax_items(tf_str: str, pages_each_side: int = 2) -> Dict[int, float]:
-        # Grab first and last pages to cover both extremes
-        first_html = await _fetch_momentum_page(tf_str, 1)
-        last_page = _parse_last_page_number(first_html)
-        items: Dict[int, float] = {}
-
-        # first N pages (fallers-heavy)
-        for p in range(1, min(last_page, pages_each_side) + 1):
-            for it in _extract_items(await _fetch_momentum_page(tf_str, p)):
-                items[int(it["card_id"])] = float(it["percent"])
-
-        # last N pages (risers-heavy)
-        for p in range(max(1, last_page - pages_each_side + 1), last_page + 1):
-            for it in _extract_items(await _fetch_momentum_page(tf_str, p)):
-                items[int(it["card_id"])] = float(it["percent"])
-
-        return items
-
+    # ---------- simple risers/fallers ----------
     if kind in ("fallers", "risers"):
         if kind == "fallers":
             items, _ = await _momentum_page_items(tf_norm, 1)
             items.sort(key=lambda x: x["percent"])
             pick = items[:10]
-        else:
+        else:  # risers
             _, html = await _momentum_page_items(tf_norm, 1)
             last = _parse_last_page_number(html)
             items, _ = await _momentum_page_items(tf_norm, last)
@@ -1823,87 +1810,91 @@ async def api_trending(
         enriched = await _attach_prices_ps(enriched)
         return {"type": kind, "timeframe": f"{tf_norm}h", "items": enriched}
 
-   # ---- SMART MOVERS ----
-    # Strategy: take top-K risers and fallers for both 6h and 24h, then find cards whose signs differ.
+    # ---------- SMART MOVERS (6h vs 24h) ----------
     async def _page_last(tf_str: str) -> int:
         html1 = await _fetch_momentum_page(tf_str, 1)
         return _parse_last_page_number(html1)
     
-    async def _top_sets(tf_str: str, pages_each_side: int = 3) -> tuple[dict[int, float], dict[int, float]]:
-        """Return (fallers_map, risers_map) for a timeframe by scanning first/last pages."""
+    async def _top_sets(tf_str: str, pages_each_side: int = 5):
+        """Return (fallers_map, risers_map) scanning first/last pages for a timeframe."""
         last = await _page_last(tf_str)
         fallers: dict[int, float] = {}
-        risers: dict[int, float] = {}
+        risers:  dict[int, float] = {}
     
-        # First pages: mostly fallers
+        # First pages ≈ fallers
         for p in range(1, min(last, pages_each_side) + 1):
             for it in _extract_items(await _fetch_momentum_page(tf_str, p)):
                 fallers[int(it["card_id"])] = float(it["percent"])
     
-        # Last pages: mostly risers
+        # Last pages ≈ risers
         for p in range(max(1, last - pages_each_side + 1), last + 1):
             for it in _extract_items(await _fetch_momentum_page(tf_str, p)):
                 risers[int(it["card_id"])] = float(it["percent"])
     
         return fallers, risers
     
-    f6, r6 = await _top_sets("6", pages_each_side=4)
-    f24, r24 = await _top_sets("24", pages_each_side=4)
+    f6, r6   = await _top_sets("6",  pages_each_side=5)
+    f24, r24 = await _top_sets("24", pages_each_side=5)
     
-    # Build a percent map for each tf: prefer stronger magnitude if seen twice
-    p6: dict[int, float] = {}
-    for d in (f6, r6):
-        for cid, pct in d.items():
-            if cid not in p6 or abs(pct) > abs(p6[cid]):
-                p6[cid] = pct
+    def _strongest(*maps: dict[int, float]) -> dict[int, float]:
+        out: dict[int, float] = {}
+        for mp in maps:
+            for cid, pct in mp.items():
+                if cid not in out or abs(pct) > abs(out[cid]):
+                    out[cid] = pct
+        return out
     
-    p24: dict[int, float] = {}
-    for d in (f24, r24):
-        for cid, pct in d.items():
-            if cid not in p24 or abs(pct) > abs(p24[cid]):
-                p24[cid] = pct
+    p6  = _strongest(f6,  r6)
+    p24 = _strongest(f24, r24)
     
-    smart_candidates = []
+    smart: list[tuple[int, float, float]] = []
+    seen: set[int] = set()
+    
+    # 1) True sign flips first
     for cid, v6 in p6.items():
         v24 = p24.get(cid)
-        if v24 is None:
+        if v24 is None: 
             continue
-        # Opposite signs = flip/mean-reversion/acceleration
         if v6 * v24 < 0:
-            smart_candidates.append({
-                "card_id": cid,
-                "percent_6h": round(v6, 2),
-                "percent_24h": round(v24, 2),
-                "percent": round(v6, 2),  # default display
-            })
+            smart.append((cid, v6, v24))
+            seen.add(cid)
     
-    # If still empty, widen the net once more (cheap retry)
-    if not smart_candidates:
-        f6b, r6b = await _top_sets("6", pages_each_side=6)
-        f24b, r24b = await _top_sets("24", pages_each_side=6)
-        for d in (f6b, r6b):
-            for cid, pct in d.items():
-                if cid not in p6 or abs(pct) > abs(p6[cid]):
-                    p6[cid] = pct
-        for d in (f24b, r24b):
-            for cid, pct in d.items():
-                if cid not in p24 or abs(pct) > abs(p24[cid]):
-                    p24[cid] = pct
+    # 2) Fallback: biggest divergences (|6h − 24h|)
+    if len(smart) < 10:
+        diffs = []
         for cid, v6 in p6.items():
             v24 = p24.get(cid)
-            if v24 is None:
+            if v24 is None or cid in seen:
                 continue
-            if v6 * v24 < 0:
-                smart_candidates.append({
-                    "card_id": cid,
-                    "percent_6h": round(v6, 2),
-                    "percent_24h": round(v24, 2),
-                    "percent": round(v6, 2),
-                })
+            diffs.append((abs(v6 - v24), cid, v6, v24))
+        diffs.sort(reverse=True)
+        for diff, cid, v6, v24 in diffs:
+            # require at least 5% divergence to avoid noise
+            if diff < 5:
+                break
+            smart.append((cid, v6, v24))
+            seen.add(cid)
+            if len(smart) >= 10:
+                break
     
-    # Sort by combined magnitude and pick 10
-    smart_candidates.sort(key=lambda x: (abs(x["percent_6h"]) + abs(x["percent_24h"])), reverse=True)
-    pick = smart_candidates[:10]
+    # 3) Final fill: largest combined magnitude
+    if len(smart) < 10:
+        fills = []
+        for cid, v6 in p6.items():
+            v24 = p24.get(cid)
+            if v24 is None or cid in seen:
+                continue
+            fills.append((abs(v6) + abs(v24), cid, v6, v24))
+        fills.sort(reverse=True)
+        for _, cid, v6, v24 in fills:
+            smart.append((cid, v6, v24))
+            if len(smart) >= 10:
+                break
+    
+    pick = [
+        {"card_id": cid, "percent_6h": round(v6, 2), "percent_24h": round(v24, 2), "percent": round(v6, 2)}
+        for cid, v6, v24 in smart[:10]
+    ]
     
     enriched = await _enrich_with_meta(pick)
     # attach smart fields
@@ -1917,7 +1908,6 @@ async def api_trending(
     
     enriched = await _attach_prices_ps(list(meta_map.values()))
     return {"type": "smart", "timeframe": "6h_vs_24h", "items": enriched}
-
 
     
 def _cmp_now_ms() -> int:
