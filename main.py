@@ -84,17 +84,17 @@ FUTGG_BASE = "https://www.fut.gg/api/fut/player-prices/25"
 PRICE_CACHE_TTL = 5  # seconds
 _price_cache: Dict[str, Dict[str, Any]] = {}
 
-# ----------------- FUT.GG MOMENTUM -----------------
-MOMENTUM_BASE = "https://www.fut.gg/players/momentum"
-MOMENTUM_HEADERS = {
+# ----------------- Market Summary (FUT.GG momentum) -----------------
+MKT_MOMENTUM_BASE = "https://www.fut.gg/players/momentum"
+MKT_MOMENTUM_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-GB,en;q=0.9",
     "Referer": "https://www.fut.gg/",
 }
-_CARD_HREF_RE = re.compile(r"/players/(\d+)-[a-z0-9-]+/25-(\d+)/?", re.IGNORECASE)
+_CARD_HREF_RE_MKT = re.compile(r"/players/(\d+)-[a-z0-9-]+/25-(\d+)/?", re.IGNORECASE)
 
-def _norm_tf(tf: Optional[str]) -> str:
+def _mkt_norm_tf(tf: str | None) -> str:
     if not tf:
         return "24"
     tf = tf.lower().strip()
@@ -102,66 +102,100 @@ def _norm_tf(tf: Optional[str]) -> str:
         tf = tf[:-1]
     return tf if tf in ("6", "12", "24") else "24"
 
-# Optional: cache momentum pages to reduce upstream load
-_MOMENTUM_CACHE: dict[tuple[str, int], dict] = {}
-MOMENTUM_TTL = 120  # seconds
-
-async def _fetch_momentum_page(tf: str, page: int) -> str:
-    now = time.time()
-    key = (tf, page)
-    hit = _MOMENTUM_CACHE.get(key)
-    if hit and (now - hit["at"] < MOMENTUM_TTL):
-        return hit["html"]
-
-    url = f"{MOMENTUM_BASE}/{tf}/?page={page}"
+async def _mkt_fetch_page(tf: str, page: int) -> str:
+    url = f"{MKT_MOMENTUM_BASE}/{tf}/?page={page}"
     timeout = aiohttp.ClientTimeout(total=12)
-    async with aiohttp.ClientSession(timeout=timeout, headers=MOMENTUM_HEADERS) as sess:
+    async with aiohttp.ClientSession(timeout=timeout, headers=MKT_MOMENTUM_HEADERS) as sess:
         async with sess.get(url) as r:
             if r.status != 200:
                 raise HTTPException(status_code=502, detail=f"MOMENTUM {r.status}")
-            html = await r.text()
+            return await r.text()
 
-    _MOMENTUM_CACHE[key] = {"html": html, "at": now}
-    return html
+def _mkt_parse_last_page_number(html: str) -> int:
+    soup = BeautifulSoup(html, "html.parser")
+    nums = []
+    for a in soup.find_all("a"):
+        href = a.get("href") or ""
+        if "page=" in href:
+            try:
+                n = int(href.split("page=", 1)[1].split("&", 1)[0])
+                nums.append(n)
+            except Exception:
+                pass
+        else:
+            t = a.text.strip()
+            if t.isdigit():
+                nums.append(int(t))
+    return max(nums) if nums else 1
 
-# ---- Market summary (cached) -----------------------------------------------
-market_router = APIRouter()
+def _mkt_extract_items(html: str) -> list[dict]:
+    soup = BeautifulSoup(html, "html.parser")
+    tiles: list[tuple[str, str]] = []
+    for a in soup.find_all("a", href=True):
+        m = _CARD_HREF_RE_MKT.search(a["href"])
+        if not m:
+            continue
+        node = a
+        # Walk up a few levels to find a percentage text
+        for _ in range(4):
+            if node is None or node.name == "body":
+                break
+            txt = node.get_text(separator=" ", strip=True)
+            if "%" in txt:
+                tiles.append((m.group(2), txt))
+                break
+            node = node.parent
 
-_MARKET_SUMMARY_CACHE: dict[tuple[str, float, float], dict] = {}
-MARKET_SUMMARY_TTL = 90  # seconds
+    items = []
+    pct_re = re.compile(r"([+\-]?\s?\d+(?:\.\d+)?)\s*%")
+    seen = set()
+    for cid, text in tiles:
+        if cid in seen:
+            continue
+        m = pct_re.search(text)
+        if not m:
+            continue
+        try:
+            pct = float(m.group(1).replace(" ", ""))
+            items.append({"card_id": int(cid), "percent": pct})
+            seen.add(cid)
+        except Exception:
+            pass
+    return items
 
-@market_router.get("/api/market/summary")
-async def market_summary(tf: str = "24", rise: float = 5.0, fall: float = 5.0):
+async def _mkt_page_items(tf: str, page: int) -> tuple[list[dict], str]:
+    html = await _mkt_fetch_page(tf, page)
+    return _mkt_extract_items(html), html
+
+# ---- Cache for summary ----
+_MKT_SUMMARY_CACHE: dict[tuple[str, float, float], dict] = {}
+MKT_SUMMARY_TTL = 90  # seconds
+
+@app.get("/api/market/summary")
+async def api_market_summary(tf: str = "24", rise: float = 5.0, fall: float = 5.0):
     """
-    Quick snapshot of the market using FUT.GG momentum pages.
+    Snapshot of the market using FUT.GG momentum.
     - tf: "6" | "12" | "24"
-    - rise: % threshold to count as 'trending'
-    - fall: % threshold to count as 'falling' (absolute, e.g. 5 -> <= -5%)
+    - rise: % threshold for 'trending'
+    - fall: % threshold for 'falling' (absolute, e.g. 5 -> <= -5%)
     """
-    tf_norm = _norm_tf(tf)
+    tf_norm = _mkt_norm_tf(tf)
     key = (tf_norm, float(rise), float(fall))
     now = time.time()
 
-    hit = _MARKET_SUMMARY_CACHE.get(key)
-    if hit and (now - hit["at"] < MARKET_SUMMARY_TTL):
+    hit = _MKT_SUMMARY_CACHE.get(key)
+    if hit and (now - hit["at"] < MKT_SUMMARY_TTL):
         return hit["data"]
 
-    # Look at a small slice of the list: first 3 and last 3 pages
-    try:
-        html1 = await _fetch_momentum_page(tf_norm, 1)
-    except Exception:
-        # serve stale cache if available; else empty snapshot
-        if hit:
-            return hit["data"]
-        return {"tf": f"{tf_norm}h", "sample": 0, "trending": 0, "falling": 0, "stable": 0}
-
-    last = _parse_last_page_number(html1)
+    # sample a few pages for speed: first 3 and last 3
+    html1 = await _mkt_fetch_page(tf_norm, 1)
+    last = _mkt_parse_last_page_number(html1)
     pages = sorted({*range(1, min(last, 3) + 1), *range(max(1, last - 2), last + 1)})
 
     percents: list[float] = []
     seen: set[int] = set()
     for p in pages:
-        items, _ = await _momentum_page_items(tf_norm, p)
+        items, _ = await _mkt_page_items(tf_norm, p)
         for it in items:
             cid = int(it["card_id"])
             if cid in seen:
@@ -170,7 +204,7 @@ async def market_summary(tf: str = "24", rise: float = 5.0, fall: float = 5.0):
             try:
                 percents.append(float(it["percent"]))
             except Exception:
-                continue
+                pass
 
     trending = sum(1 for v in percents if v >= rise)
     falling  = sum(1 for v in percents if v <= -abs(fall))
@@ -183,8 +217,10 @@ async def market_summary(tf: str = "24", rise: float = 5.0, fall: float = 5.0):
         "falling": falling,
         "stable": stable,
     }
-    _MARKET_SUMMARY_CACHE[key] = {"at": now, "data": data}
+    _MKT_SUMMARY_CACHE[key] = {"at": now, "data": data}
     return data
+# -------------------------------------------------------------------
+
 
 def _parse_last_page_number(html: str) -> int:
     soup = BeautifulSoup(html, "html.parser")
