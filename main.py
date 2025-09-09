@@ -111,6 +111,60 @@ async def _fetch_momentum_page(tf: str, page: int) -> str:
                 raise HTTPException(status_code=502, detail=f"MOMENTUM {r.status}")
             return await r.text()
 
+# ---- Market summary (cached) -----------------------------------------------
+_MARKET_SUMMARY_CACHE: dict[tuple[str, float, float], dict] = {}
+MARKET_SUMMARY_TTL = 90  # seconds
+
+@app.get("/api/market/summary")
+async def market_summary(tf: str = "24", rise: float = 5.0, fall: float = 5.0):
+    """
+    Quick snapshot of the market using FUT.GG momentum pages.
+    - tf: "6" | "12" | "24"
+    - rise: % threshold to count as 'trending'
+    - fall: % threshold to count as 'falling' (absolute, e.g. 5 -> <= -5%)
+    """
+    tf_norm = _norm_tf(tf)
+    key = (tf_norm, float(rise), float(fall))
+    now = time.time()
+
+    hit = _MARKET_SUMMARY_CACHE.get(key)
+    if hit and (now - hit["at"] < MARKET_SUMMARY_TTL):
+        return hit["data"]
+
+    # Look at a small slice of the list: first 3 and last 3 pages
+    html1 = await _fetch_momentum_page(tf_norm, 1)
+    last = _parse_last_page_number(html1)
+    pages = sorted({*range(1, min(last, 3) + 1), *range(max(1, last - 2), last + 1)})
+
+    percents = []
+    seen = set()
+    for p in pages:
+        # reuse existing helpers
+        items, _ = await _momentum_page_items(tf_norm, p)
+        for it in items:
+            cid = int(it["card_id"])
+            if cid in seen:
+                continue
+            seen.add(cid)
+            try:
+                percents.append(float(it["percent"]))
+            except Exception:
+                continue
+
+    trending = sum(1 for v in percents if v >= rise)
+    falling  = sum(1 for v in percents if v <= -abs(fall))
+    stable   = max(0, len(percents) - trending - falling)
+
+    data = {
+        "tf": f"{tf_norm}h",
+        "sample": len(percents),
+        "trending": trending,
+        "falling": falling,
+        "stable": stable,
+    }
+    _MARKET_SUMMARY_CACHE[key] = {"at": now, "data": data}
+    return data
+
 def _parse_last_page_number(html: str) -> int:
     soup = BeautifulSoup(html, "html.parser")
     nums = []
