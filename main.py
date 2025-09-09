@@ -1775,13 +1775,19 @@ async def _attach_prices_ps(items: list[dict]) -> list[dict]:
             it["price_ps"] = None
     return items
 
+from fastapi import Query
+
 @app.get("/api/trending")
 async def api_trending(
-    trend_type: Literal["risers","fallers"],
+    # accept ?type=risers|fallers (frontend uses this)
+    type_: Optional[Literal["risers","fallers"]] = Query(None, alias="type"),
+    # also accept ?trend_type=... just in case
+    trend_type: Optional[Literal["risers","fallers"]] = None,
     tf: Optional[str] = "24",
 ):
-    kind = (trend_type or "fallers").lower()
+    kind = (type_ or trend_type or "fallers").lower()
     tf_norm = _norm_tf(tf)
+
 
     if kind == "fallers":
         items, _ = await _momentum_page_items(tf_norm, 1)
