@@ -102,20 +102,35 @@ def _norm_tf(tf: Optional[str]) -> str:
         tf = tf[:-1]
     return tf if tf in ("6", "12", "24") else "24"
 
+# Optional: cache momentum pages to reduce upstream load
+_MOMENTUM_CACHE: dict[tuple[str, int], dict] = {}
+MOMENTUM_TTL = 120  # seconds
+
 async def _fetch_momentum_page(tf: str, page: int) -> str:
+    now = time.time()
+    key = (tf, page)
+    hit = _MOMENTUM_CACHE.get(key)
+    if hit and (now - hit["at"] < MOMENTUM_TTL):
+        return hit["html"]
+
     url = f"{MOMENTUM_BASE}/{tf}/?page={page}"
     timeout = aiohttp.ClientTimeout(total=12)
     async with aiohttp.ClientSession(timeout=timeout, headers=MOMENTUM_HEADERS) as sess:
         async with sess.get(url) as r:
             if r.status != 200:
                 raise HTTPException(status_code=502, detail=f"MOMENTUM {r.status}")
-            return await r.text()
+            html = await r.text()
+
+    _MOMENTUM_CACHE[key] = {"html": html, "at": now}
+    return html
 
 # ---- Market summary (cached) -----------------------------------------------
+market_router = APIRouter()
+
 _MARKET_SUMMARY_CACHE: dict[tuple[str, float, float], dict] = {}
 MARKET_SUMMARY_TTL = 90  # seconds
 
-@app.get("/api/market/summary")
+@market_router.get("/api/market/summary")
 async def market_summary(tf: str = "24", rise: float = 5.0, fall: float = 5.0):
     """
     Quick snapshot of the market using FUT.GG momentum pages.
@@ -132,14 +147,20 @@ async def market_summary(tf: str = "24", rise: float = 5.0, fall: float = 5.0):
         return hit["data"]
 
     # Look at a small slice of the list: first 3 and last 3 pages
-    html1 = await _fetch_momentum_page(tf_norm, 1)
+    try:
+        html1 = await _fetch_momentum_page(tf_norm, 1)
+    except Exception:
+        # serve stale cache if available; else empty snapshot
+        if hit:
+            return hit["data"]
+        return {"tf": f"{tf_norm}h", "sample": 0, "trending": 0, "falling": 0, "stable": 0}
+
     last = _parse_last_page_number(html1)
     pages = sorted({*range(1, min(last, 3) + 1), *range(max(1, last - 2), last + 1)})
 
-    percents = []
-    seen = set()
+    percents: list[float] = []
+    seen: set[int] = set()
     for p in pages:
-        # reuse existing helpers
         items, _ = await _momentum_page_items(tf_norm, p)
         for it in items:
             cid = int(it["card_id"])
@@ -219,6 +240,7 @@ def _extract_items(html: str) -> list[dict]:
 async def _momentum_page_items(tf: str, page: int) -> tuple[list[dict], str]:
     html = await _fetch_momentum_page(tf, page)
     return _extract_items(html), html
+
 
 
 def parse_coin_amount(v) -> int:
