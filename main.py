@@ -35,12 +35,13 @@ from app.services.prices import get_player_price  # still imported (not strictly
 from app.routers.smart_buy import router as smart_buy_router
 from app.routers.trade_finder import router as trade_finder_router
 
+
 # ----------------- BOOTSTRAP -----------------
 logging.basicConfig(level=logging.INFO)
 load_dotenv()
 
 # --------- ENV ---------
-required_env_vars = ["DATABASE_URL", "DISCORD_CLIENT_ID", "DISCORD_CLIENT_SECRET", "DISCORD_REDIRECT_URI"]
+required_env_vars = ["DATABASE_URL", "SECRET_KEY"]
 missing_vars = [var for var in required_env_vars if not os.getenv(var)]
 if missing_vars:
     raise ValueError(f"Missing required environment variables: {missing_vars}")
@@ -76,25 +77,22 @@ WATCHLIST_POLL_INTERVAL = int(os.getenv("WATCHLIST_POLL_INTERVAL", "60"))  # sec
 # ephemeral state store
 OAUTH_STATE: Dict[str, Dict[str, Any]] = {}
 
-if not SECRET_KEY:
-    raise ValueError("SECRET_KEY environment variable is required")
-
 # --------- FUT.GG / Watchlist config ---------
 FUTGG_BASE = "https://www.fut.gg/api/fut/player-prices/25"
 PRICE_CACHE_TTL = 5  # seconds
 _price_cache: Dict[str, Dict[str, Any]] = {}
 
-# ----------------- Market Summary (FUT.GG momentum) -----------------
-MKT_MOMENTUM_BASE = "https://www.fut.gg/players/momentum"
-MKT_MOMENTUM_HEADERS = {
+# ----------------- FUT.GG MOMENTUM -----------------
+MOMENTUM_BASE = "https://www.fut.gg/players/momentum"
+MOMENTUM_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-GB,en;q=0.9",
     "Referer": "https://www.fut.gg/",
 }
-_CARD_HREF_RE_MKT = re.compile(r"/players/(\d+)-[a-z0-9-]+/25-(\d+)/?", re.IGNORECASE)
+_CARD_HREF_RE = re.compile(r"/players/(\d+)-[a-z0-9-]+/25-(\d+)/?", re.IGNORECASE)
 
-def _mkt_norm_tf(tf: str | None) -> str:
+def _norm_tf(tf: Optional[str]) -> str:
     if not tf:
         return "24"
     tf = tf.lower().strip()
@@ -102,100 +100,66 @@ def _mkt_norm_tf(tf: str | None) -> str:
         tf = tf[:-1]
     return tf if tf in ("6", "12", "24") else "24"
 
-async def _mkt_fetch_page(tf: str, page: int) -> str:
-    url = f"{MKT_MOMENTUM_BASE}/{tf}/?page={page}"
+# Optional: cache momentum pages to reduce upstream load
+_MOMENTUM_CACHE: dict[tuple[str, int], dict] = {}
+MOMENTUM_TTL = 120  # seconds
+
+async def _fetch_momentum_page(tf: str, page: int) -> str:
+    now = time.time()
+    key = (tf, page)
+    hit = _MOMENTUM_CACHE.get(key)
+    if hit and (now - hit["at"] < MOMENTUM_TTL):
+        return hit["html"]
+
+    url = f"{MOMENTUM_BASE}/{tf}/?page={page}"
     timeout = aiohttp.ClientTimeout(total=12)
-    async with aiohttp.ClientSession(timeout=timeout, headers=MKT_MOMENTUM_HEADERS) as sess:
+    async with aiohttp.ClientSession(timeout=timeout, headers=MOMENTUM_HEADERS) as sess:
         async with sess.get(url) as r:
             if r.status != 200:
                 raise HTTPException(status_code=502, detail=f"MOMENTUM {r.status}")
-            return await r.text()
+            html = await r.text()
 
-def _mkt_parse_last_page_number(html: str) -> int:
-    soup = BeautifulSoup(html, "html.parser")
-    nums = []
-    for a in soup.find_all("a"):
-        href = a.get("href") or ""
-        if "page=" in href:
-            try:
-                n = int(href.split("page=", 1)[1].split("&", 1)[0])
-                nums.append(n)
-            except Exception:
-                pass
-        else:
-            t = a.text.strip()
-            if t.isdigit():
-                nums.append(int(t))
-    return max(nums) if nums else 1
+    _MOMENTUM_CACHE[key] = {"html": html, "at": now}
+    return html
 
-def _mkt_extract_items(html: str) -> list[dict]:
-    soup = BeautifulSoup(html, "html.parser")
-    tiles: list[tuple[str, str]] = []
-    for a in soup.find_all("a", href=True):
-        m = _CARD_HREF_RE_MKT.search(a["href"])
-        if not m:
-            continue
-        node = a
-        # Walk up a few levels to find a percentage text
-        for _ in range(4):
-            if node is None or node.name == "body":
-                break
-            txt = node.get_text(separator=" ", strip=True)
-            if "%" in txt:
-                tiles.append((m.group(2), txt))
-                break
-            node = node.parent
+# ---- Market summary (cached) -----------------------------------------------
+market_router = APIRouter()
 
-    items = []
-    pct_re = re.compile(r"([+\-]?\s?\d+(?:\.\d+)?)\s*%")
-    seen = set()
-    for cid, text in tiles:
-        if cid in seen:
-            continue
-        m = pct_re.search(text)
-        if not m:
-            continue
-        try:
-            pct = float(m.group(1).replace(" ", ""))
-            items.append({"card_id": int(cid), "percent": pct})
-            seen.add(cid)
-        except Exception:
-            pass
-    return items
+_MARKET_SUMMARY_CACHE: dict[tuple[str, float, float], dict] = {}
+MARKET_SUMMARY_TTL = 90  # seconds
 
-async def _mkt_page_items(tf: str, page: int) -> tuple[list[dict], str]:
-    html = await _mkt_fetch_page(tf, page)
-    return _mkt_extract_items(html), html
-
-# ---- Cache for summary ----
-_MKT_SUMMARY_CACHE: dict[tuple[str, float, float], dict] = {}
-MKT_SUMMARY_TTL = 90  # seconds
-
-@app.get("/api/market/summary")
-async def api_market_summary(tf: str = "24", rise: float = 5.0, fall: float = 5.0):
+@market_router.get("/api/market/summary")
+async def market_summary(tf: str = "24", rise: float = 5.0, fall: float = 5.0):
     """
-    Snapshot of the market using FUT.GG momentum.
+    Quick snapshot of the market using FUT.GG momentum pages.
     - tf: "6" | "12" | "24"
-    - rise: % threshold for 'trending'
-    - fall: % threshold for 'falling' (absolute, e.g. 5 -> <= -5%)
+    - rise: % threshold to count as 'trending'
+    - fall: % threshold to count as 'falling' (absolute, e.g. 5 -> <= -5%)
     """
-    tf_norm = _mkt_norm_tf(tf)
+    tf_norm = _norm_tf(tf)
     key = (tf_norm, float(rise), float(fall))
     now = time.time()
 
-    hit = _MKT_SUMMARY_CACHE.get(key)
-    if hit and (now - hit["at"] < MKT_SUMMARY_TTL):
+    hit = _MARKET_SUMMARY_CACHE.get(key)
+    if hit and (now - hit["at"] < MARKET_SUMMARY_TTL):
         return hit["data"]
 
-    # sample a few pages for speed: first 3 and last 3
-    html1 = await _mkt_fetch_page(tf_norm, 1)
-    last = _mkt_parse_last_page_number(html1)
+    # Look at a small slice of the list: first 3 and last 3 pages
+    try:
+        html1 = await _fetch_momentum_page(tf_norm, 1)
+    except Exception:
+        # serve stale cache if available; else empty snapshot
+        if hit:
+            return hit["data"]
+        return {"tf": f"{tf_norm}h", "sample": 0, "trending": 0, "falling": 0, "stable": 0}
+
+    last = _parse_last_page_number(html1)
     pages = sorted({*range(1, min(last, 3) + 1), *range(max(1, last - 2), last + 1)})
 
     percents: list[float] = []
     seen: set[int] = set()
     for p in pages:
-        items, _ = await _mkt_page_items(tf_norm, p)
+        items, _ = await _momentum_page_items(tf_norm, p)
         for it in items:
             cid = int(it["card_id"])
             if cid in seen:
@@ -204,7 +168,7 @@ async def api_market_summary(tf: str = "24", rise: float = 5.0, fall: float = 5.
             try:
                 percents.append(float(it["percent"]))
             except Exception:
-                pass
+                continue
 
     trending = sum(1 for v in percents if v >= rise)
     falling  = sum(1 for v in percents if v <= -abs(fall))
@@ -217,10 +181,8 @@ async def api_market_summary(tf: str = "24", rise: float = 5.0, fall: float = 5.
         "falling": falling,
         "stable": stable,
     }
-    _MKT_SUMMARY_CACHE[key] = {"at": now, "data": data}
+    _MARKET_SUMMARY_CACHE[key] = {"at": now, "data": data}
     return data
-# -------------------------------------------------------------------
-
 
 def _parse_last_page_number(html: str) -> int:
     soup = BeautifulSoup(html, "html.parser")
@@ -680,6 +642,7 @@ app.add_middleware(
 # Routers
 app.include_router(trade_finder_router)
 app.include_router(smart_buy_router, prefix="/api")
+app.include_router(market_router)
 
 async def get_db():
     async with pool.acquire() as connection:
@@ -731,12 +694,13 @@ def require_extension_jwt(request: Request):
         raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
     return SimpleNamespace(discord_id=payload.get("sub"))
 
-# Unified FUT.GG price fetch with lightweight cache
+# Unified FUT.GG price fetch with lightweight cache + timeout + tiny retry
 async def fetch_price(card_id: int, platform: str) -> Dict[str, Any]:
     platform = (platform or "").lower()
     key = f"{card_id}|{platform}"
     now = time.time()
 
+    # serve fresh cache if still valid
     if key in _price_cache and (now - _price_cache[key]["at"] < PRICE_CACHE_TTL):
         c = _price_cache[key]
         return {"price": c["price"], "isExtinct": c["isExtinct"], "updatedAt": c["updatedAt"]}
@@ -749,23 +713,33 @@ async def fetch_price(card_id: int, platform: str) -> Dict[str, Any]:
         "Referer": "https://www.fut.gg/",
         "Origin": "https://www.fut.gg",
     }
+    timeout = aiohttp.ClientTimeout(total=12)
 
-    async with aiohttp.ClientSession() as sess:
-        async with sess.get(url, headers=headers) as r:
-            if r.status != 200:
-                cached = _price_cache.get(key)
-                if cached:
-                    return {"price": cached["price"], "isExtinct": cached["isExtinct"], "updatedAt": cached["updatedAt"]}
-                raise HTTPException(status_code=502, detail="Failed to fetch price")
-            data = await r.json()
+    last_err = None
+    for attempt in (0, 1, 2):  # tiny retry with backoff
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as sess:
+                async with sess.get(url, headers=headers) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        current = (data.get("data") or {}).get("currentPrice") or {}
+                        price = current.get("price")
+                        is_extinct = current.get("isExtinct", False)
+                        updated_at = current.get("priceUpdatedAt")
+                        _price_cache[key] = {"at": now, "price": price, "isExtinct": is_extinct, "updatedAt": updated_at}
+                        return {"price": price, "isExtinct": is_extinct, "updatedAt": updated_at}
+                    last_err = f"HTTP {r.status}"
+        except Exception as e:
+            last_err = str(e)
 
-    current = (data.get("data") or {}).get("currentPrice") or {}
-    price = current.get("price")
-    is_extinct = current.get("isExtinct", False)
-    updated_at = current.get("priceUpdatedAt")
+        # backoff: 0.2s, 0.6s, 1.4s
+        await asyncio.sleep(0.2 * (3 ** attempt))
 
-    _price_cache[key] = {"at": now, "price": price, "isExtinct": is_extinct, "updatedAt": updated_at}
-    return {"price": price, "isExtinct": is_extinct, "updatedAt": updated_at}
+    # fall back to stale cache if available
+    cached = _price_cache.get(key)
+    if cached:
+        return {"price": cached["price"], "isExtinct": cached["isExtinct"], "updatedAt": cached["updatedAt"]}
+    raise HTTPException(status_code=502, detail=f"Failed to fetch price: {last_err}")
     
 ext_router = APIRouter()
 
@@ -1557,10 +1531,10 @@ async def get_user_settings(user_id: str = Depends(get_current_user), conn=Depen
                 "visible_widgets": settings_row["visible_widgets"] or ["profit", "tax", "balance", "trades"]
             }
         else:
-            return UserSettings().dict()
+            return UserSettings().model_dump()
     except Exception as e:
         logging.error(f"Error fetching user settings: {e}")
-        return UserSettings().dict()
+        return UserSettings().model_dump()
 
 @app.post("/api/settings")
 async def update_user_settings(settings: UserSettings, user_id: str = Depends(get_current_user), conn=Depends(get_db)):
@@ -1587,14 +1561,14 @@ async def update_user_settings(settings: UserSettings, user_id: str = Depends(ge
         """,
             user_id,
             settings.default_platform,
-            json.dumps(settings.custom_tags),
+            settings.custom_tags,
             settings.currency_format,
             settings.theme,
             settings.timezone,
             settings.date_format,
             settings.include_tax_in_profit,
             settings.default_chart_range,
-            json.dumps(settings.visible_widgets)
+            settings.visible_widgets
         )
         return {"message": "Settings updated successfully"}
     except Exception as e:
@@ -1721,7 +1695,11 @@ async def export_trades(format: str = "csv", user_id: str = Depends(get_current_
     )
 
 @app.post("/api/import/trades")
-async def import_trades(file: UploadFile = File(...), user_id: str = Depends(get_current_user), conn=Depends(get_db)):
+async def import_trades(
+    file: UploadFile = File(...),
+    user_id: str = Depends(get_current_user),
+    conn=Depends(get_db),
+):
     contents = await file.read()
     if file.filename.endswith(".json"):
         payload = json.loads(contents.decode("utf-8"))
@@ -1886,13 +1864,6 @@ async def _attach_prices_ps(items: list[dict]) -> list[dict]:
         else:
             it["price_ps"] = None
     return items
-
-from fastapi import Query
-
-from fastapi import Query
-
-from fastapi import Query
-from typing import Optional, Literal
 
 @app.get("/api/trending")
 async def api_trending(
@@ -2118,7 +2089,7 @@ async def _cmp_recent_sales_futbin(card_id: str, platform: str) -> List[Dict[str
 @app.get("/api/player-compare")
 async def player_compare(
     ids: str = Query(..., description="CSV of 1 or 2 card_ids (as stored in fut_players)"),
-    platform: str = Query("ps", description="ps|xbox|pc|console"),
+    platform: Literal["ps","xbox","pc","console"] = Query("ps", description="ps|xbox|pc|console"),
     include_pc: bool = Query(True, description="Also return PC current price"),
     include_sales: bool = Query(True, description="Include recent sales list"),
 ):
