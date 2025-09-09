@@ -9,6 +9,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import asyncpg
 from fastapi import APIRouter, Depends, Query, Request, HTTPException
+from app.auth.entitlements import require_feature
+
+router = APIRouter(
+  prefix="/api/smart-buy",
+  tags=["smart-buy"],
+  dependencies=[Depends(require_feature("smart_buy"))],
+)
 
 from app.services.price_history import get_price_history
 
