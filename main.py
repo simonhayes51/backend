@@ -698,10 +698,24 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 @app.get("/api/entitlements")
-async def get_entitlements(user_id: str = Depends(get_current_user), conn=Depends(get_db)):
+async def get_entitlements(request: Request, conn=Depends(get_db)):
     """Get user's current entitlements with real-time validation"""
     
-    # REAL-TIME PREMIUM VALIDATION (same logic as /api/me)
+    # Get user ID from session (same as your /api/me endpoint)
+    uid = request.session.get("user_id")
+    if not uid:
+        return {
+            "user_id": None,
+            "is_premium": False,
+            "features": [],
+            "limits": {
+                "watchlist_max": 3,
+                "trending": {"timeframes": ["24h"], "limit": 5, "smart": False}
+            },
+            "roles": []
+        }
+    
+    # REAL-TIME PREMIUM VALIDATION
     is_premium = False
     premium_until = None
     
@@ -715,7 +729,7 @@ async def get_entitlements(user_id: str = Depends(get_current_user), conn=Depend
         ORDER BY created_at DESC 
         LIMIT 1
         """,
-        user_id
+        uid
     )
     
     if active_subscription:
@@ -734,18 +748,18 @@ async def get_entitlements(user_id: str = Depends(get_current_user), conn=Depend
                 SET is_premium = FALSE, premium_until = NULL, updated_at = NOW()
                 WHERE user_id = $1
                 """,
-                user_id
+                uid
             )
             
             # Remove Discord role immediately
             try:
                 from discord_manager import discord_manager
-                await discord_manager.remove_premium_role(user_id)
+                await discord_manager.remove_premium_role(uid)
             except Exception as e:
-                logger.warning(f"Failed to remove Discord role for expired user {user_id}: {e}")
+                logger.warning(f"Failed to remove Discord role for expired user {uid}: {e}")
     
     return {
-        "user_id": user_id,
+        "user_id": uid,
         "is_premium": is_premium,
         "premium_until": premium_until.isoformat() if premium_until else None,
         "features": ["smart_buy", "trade_finder", "deal_confidence", "backtest", "smart_trending"] if is_premium else [],
