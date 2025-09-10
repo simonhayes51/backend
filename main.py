@@ -670,6 +670,41 @@ async def get_discord_user_info(access_token: str):
                 return None
             return await resp.json()
 
+# --- Premium by Discord Role ---
+DISCORD_PREMIUM_ROLE_ID = os.getenv("DISCORD_PREMIUM_ROLE_ID")
+
+_ROLE_CACHE: dict[str, dict] = {}
+ROLE_CACHE_TTL = 300  # 5 minutes
+
+async def user_has_premium_role(user_id: str) -> bool:
+    """Return True if the member has the Premium role in your guild (cached)."""
+    if not (DISCORD_BOT_TOKEN and DISCORD_SERVER_ID and DISCORD_PREMIUM_ROLE_ID):
+        return False
+
+    now = time.time()
+    hit = _ROLE_CACHE.get(user_id)
+    if hit and (now - hit["at"] < ROLE_CACHE_TTL):
+        return bool(hit["ok"])
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"https://discord.com/api/v10/guilds/{DISCORD_SERVER_ID}/members/{user_id}",
+                headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"}
+            ) as resp:
+                if resp.status != 200:
+                    ok = False
+                else:
+                    js = await resp.json()
+                    roles = js.get("roles") or []
+                    ok = DISCORD_PREMIUM_ROLE_ID in roles
+    except Exception:
+        ok = False
+
+    _ROLE_CACHE[user_id] = {"ok": ok, "at": now}
+    return ok
+
+
 async def check_server_membership(user_id: str) -> bool:
     if not (DISCORD_BOT_TOKEN and DISCORD_SERVER_ID):
         return True
