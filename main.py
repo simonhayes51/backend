@@ -2901,6 +2901,7 @@ async def create_checkout_session(
         if not profile:
             raise HTTPException(status_code=404, detail="User profile not found")
         # Create Stripe checkout session
+        
         session = stripe.checkout.Session.create(
             customer_email=f"{profile['username']}@discord.local",  # Placeholder email
             payment_method_types=['card'],
@@ -2916,6 +2917,7 @@ async def create_checkout_session(
                 'billing_cycle': billing_cycle
             },
             subscription_data={
+                'trial_period_days': data.get('trialDays', 7),  # ← Add this line
                 'metadata': {
                     'user_id': user_id,
                     'discord_id': user_id
