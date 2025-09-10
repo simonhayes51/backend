@@ -3205,7 +3205,21 @@ async def handle_subscription_created(subscription, conn):
     if not user_id:
         return
     
-    # Save subscription to database WITH proper dates
+    # Handle trial periods and missing dates
+    current_period_start = None
+    current_period_end = None
+    
+    # Try to get period dates, with fallbacks for trials
+    if 'current_period_start' in subscription:
+        current_period_start = datetime.fromtimestamp(subscription['current_period_start'], tz=timezone.utc)
+    
+    if 'current_period_end' in subscription:
+        current_period_end = datetime.fromtimestamp(subscription['current_period_end'], tz=timezone.utc)
+    elif 'trial_end' in subscription and subscription['trial_end']:
+        # For trials, use trial_end as the period end
+        current_period_end = datetime.fromtimestamp(subscription['trial_end'], tz=timezone.utc)
+    
+    # Save subscription to database
     await conn.execute(
         """
         INSERT INTO subscriptions (
@@ -3219,8 +3233,8 @@ async def handle_subscription_created(subscription, conn):
         subscription['customer'],
         subscription['status'],
         subscription['items']['data'][0]['price']['id'],
-        datetime.fromtimestamp(subscription['current_period_start'], tz=timezone.utc),  # ← Add this
-        datetime.fromtimestamp(subscription['current_period_end'], tz=timezone.utc)      # ← Add this
+        current_period_start,
+        current_period_end
     )
     # Update user profile
     await conn.execute(
