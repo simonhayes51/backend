@@ -943,18 +943,18 @@ async def health_check():
 
 @app.get("/api/login")
 async def login():
-    _prune_oauth_state()
     state = secrets.token_urlsafe(24)
     OAUTH_STATE[state] = {"flow": "dashboard", "ts": time.time()}
     params = {
         "client_id": DISCORD_CLIENT_ID,
-        "redirect_uri": DISCORD_REDIRECT_URI,
+        "redirect_uri": DISCORD_REDIRECT_URI,   # must match portal exactly
         "response_type": "code",
         "scope": "identify",
         "state": state,
-        "prompt": "none",
+        # "prompt": "consent",  # either use this or omit entirely
     }
     return RedirectResponse(f"{DISCORD_OAUTH_AUTHORIZE}?{urlencode(params)}")
+
 
 @app.get("/api/price-history")
 async def price_history(playerId: int, platform: str = "ps", tf: str = "today"):
@@ -967,7 +967,12 @@ async def price_history(playerId: int, platform: str = "ps", tf: str = "today"):
 
 @app.get("/api/callback")
 async def callback(request: Request):
-    _prune_oauth_state()
+    # Surface provider errors
+    err = request.query_params.get("error")
+    err_desc = request.query_params.get("error_description")
+    if err:
+        raise HTTPException(status_code=400, detail=f"OAuth error from Discord: {err}: {err_desc or ''}".strip())
+
     code = request.query_params.get("code")
     state = request.query_params.get("state")
     if not code:
