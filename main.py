@@ -727,7 +727,7 @@ async def get_entitlements(request: Request):
             SELECT current_period_end, status, cancel_at_period_end
             FROM subscriptions 
             WHERE user_id = $1 
-            AND status IN ('active', 'trialing')
+            AND status IN ('active', 'trialing', 'trial')
             ORDER BY created_at DESC 
             LIMIT 1
             """,
@@ -2003,7 +2003,7 @@ async def get_current_user_info(request: Request, conn=Depends(get_db)):
         SELECT current_period_end, status, cancel_at_period_end
         FROM subscriptions 
         WHERE user_id = $1 
-        AND status IN ('active', 'trialing')
+        AND status IN ('active', 'trialing', 'trial')
         ORDER BY created_at DESC 
         LIMIT 1
         """,
@@ -2085,7 +2085,7 @@ async def validate_premium(user_id: str = Depends(get_current_user), conn=Depend
         SELECT current_period_end, status
         FROM subscriptions 
         WHERE user_id = $1 
-        AND status IN ('active', 'trialing')
+        AND status IN ('active', 'trialing', 'trial')
         AND current_period_end > NOW()
         ORDER BY created_at DESC 
         LIMIT 1
