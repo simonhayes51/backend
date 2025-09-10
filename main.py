@@ -3201,25 +3201,26 @@ async def handle_checkout_completed(session, conn):
         await discord_manager.assign_premium_role(user_id)
 
 async def handle_subscription_created(subscription, conn):
-    """Handle new subscription creation"""
-    user_id = (subscription.get('metadata') or {}).get('user_id')
+    user_id = subscription['metadata'].get('user_id')
     if not user_id:
         return
-    # Save subscription to database
+    
+    # Save subscription to database WITH proper dates
     await conn.execute(
         """
         INSERT INTO subscriptions (
-            user_id, stripe_subscription_id, stripe_customer_id, status, plan_id,
-            current_period_start, current_period_end
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+            user_id, stripe_subscription_id, stripe_customer_id, status, 
+            plan_id, current_period_start, current_period_end
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
         """,
         user_id,
-        subscription.get('id'),
-        subscription.get('customer'),
-        subscription.get('status'),
-        (((subscription.get('items') or {}).get('data') or [{}])[0]).get('price', {}).get('id'),
-        datetime.fromtimestamp(subscription.get('current_period_start'), tz=timezone.utc) if subscription.get('current_period_start') else None,
-        datetime.fromtimestamp(subscription.get('current_period_end'), tz=timezone.utc) if subscription.get('current_period_end') else None
+        subscription['id'],
+        subscription['customer'],
+        subscription['status'],
+        subscription['items']['data'][0]['price']['id'],
+        datetime.fromtimestamp(subscription['current_period_start'], tz=timezone.utc),  # ← Add this
+        datetime.fromtimestamp(subscription['current_period_end'], tz=timezone.utc)      # ← Add this
     )
     # Update user profile
     await conn.execute(
