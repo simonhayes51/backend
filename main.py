@@ -1052,7 +1052,7 @@ app.include_router(ext_router)              # /ext/...
 # Premium-only (hard gate) â mount at /api/smart-buy
 app.include_router(
     smart_buy_router,
-    prefix="/api/smart-buy",
+    prefix="/api",
     dependencies=[Depends(require_feature("smart_buy"))],
 )
 
