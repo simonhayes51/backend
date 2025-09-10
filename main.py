@@ -2905,6 +2905,63 @@ async def next_event():
     nxt = next_daily_london_hour(18)
     return {"name": "Daily Content Drop", "kind": "promo", "start_at": nxt.isoformat(), "confidence": "heuristic"}
 
+@app.post("/api/events")
+async def create_event(request: Request, conn=Depends(get_db)):
+    """Create a new event"""
+    try:
+        data = await request.json()
+        
+        # Validate required fields
+        required_fields = ['name', 'kind', 'start_at']
+        for field in required_fields:
+            if not data.get(field):
+                raise HTTPException(status_code=400, detail=f"Missing required field: {field}")
+        
+        # Parse the datetime
+        try:
+            start_at = datetime.fromisoformat(data['start_at'].replace('Z', '+00:00'))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid start_at format")
+        
+        # Optional end_at
+        end_at = None
+        if data.get('end_at'):
+            try:
+                end_at = datetime.fromisoformat(data['end_at'].replace('Z', '+00:00'))
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid end_at format")
+        
+        # Insert into database
+        row = await conn.fetchrow("""
+            INSERT INTO events (name, kind, start_at, end_at, confidence, source)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING id, name, kind, start_at, end_at, confidence, source, created_at
+        """, 
+            data['name'],
+            data['kind'], 
+            start_at,
+            end_at,
+            data.get('confidence', 'heuristic'),
+            data.get('source', 'manual_entry')
+        )
+        
+        return {
+            "id": row["id"],
+            "name": row["name"],
+            "kind": row["kind"],
+            "start_at": row["start_at"].isoformat(),
+            "end_at": row["end_at"].isoformat() if row["end_at"] else None,
+            "confidence": row["confidence"],
+            "source": row["source"],
+            "created_at": row["created_at"].isoformat()
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Create event error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to create event")
+
 @app.get("/api/deal-confidence/{card_id}")
 async def deal_confidence(card_id: int, platform: str = "ps"):
     try:
