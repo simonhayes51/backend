@@ -616,6 +616,12 @@ async def lifespan(app: FastAPI):
 # --- FastAPI app ---
 app = FastAPI(lifespan=lifespan)
 
+# in main.py (or a small router), add:
+from app.auth.entitlements import compute_entitlements
+
+@app.get("/api/entitlements")
+async def entitlements(request: Request):
+    return await compute_entitlements(request)
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
