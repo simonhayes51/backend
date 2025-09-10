@@ -1,37 +1,26 @@
 # app/auth/entitlements.py
 from __future__ import annotations
-
-import os
-import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Set, Literal, Dict, Any
-
+import os
+import asyncpg
 import aiohttp
 from fastapi import Request, HTTPException
 
-Feature = Literal[
-    "smart_buy",
-    "watchlist",
-    "trade_finder",
-    "deal_confidence",
-    "backtest",
-    "smart_trending",
-]
+Feature = Literal["smart_buy", "watchlist", "trade_finder", "deal_confidence", "backtest", "smart_trending"]
 
-# ---------- Env / Config ----------
+# ---- Env / config ----
 FREE_WATCHLIST_MAX = int(os.getenv("WATCHLIST_FREE_MAX", "3"))
 PREMIUM_WATCHLIST_MAX = int(os.getenv("WATCHLIST_PREMIUM_MAX", "500"))
 
-FREE_TRENDING = {
-    "timeframes": {"24h"},     # free: only 24h
-    "limit": 5,                # free: top 5
-    "smart": False,            # free: no Smart tab
-}
-PREMIUM_TRENDING = {
-    "timeframes": {"6h", "12h", "24h"},  # keep aligned with backend support
-    "limit": 20,
-    "smart": True,
-}
+FREE_TRENDING = {"timeframes": {"24h"}, "limit": 5, "smart": False}
+PREMIUM_TRENDING = {"timeframes": {"4h", "6h", "24h"}, "limit": 20, "smart": True}
+
+# Discord
+DISCORD_SERVER_ID = os.getenv("DISCORD_SERVER_ID")          # guild id (required to read roles)
+DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")          # bot token
+DISCORD_PREMIUM_ROLE_ID = os.getenv("DISCORD_PREMIUM_ROLE_ID")  # optional: prefer an ID match
+PREMIUM_ROLE_NAME = os.getenv("DISCORD_PREMIUM_ROLE_NAME", "Premium")
 
 FEATURE_MATRIX: Dict[Feature, Dict[str, Any]] = {
     "smart_buy":       {"roles": {"Premium"}, "plans": {"pro", "premium"}},
@@ -39,120 +28,155 @@ FEATURE_MATRIX: Dict[Feature, Dict[str, Any]] = {
     "deal_confidence": {"roles": {"Premium"}, "plans": {"pro", "premium"}},
     "backtest":        {"roles": {"Premium"}, "plans": {"pro", "premium"}},
     "smart_trending":  {"roles": {"Premium"}, "plans": {"pro", "premium"}},
-    # "watchlist" is governed by limits instead of a hard block
+    # "watchlist" is handled via limits
 }
 
-# ---------- Discord role check (cached) ----------
-DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-DISCORD_SERVER_ID = os.getenv("DISCORD_SERVER_ID")
-DISCORD_PREMIUM_ROLE_ID = os.getenv("DISCORD_PREMIUM_ROLE_ID")
+def _now(): return datetime.now(timezone.utc)
 
-_ROLE_CACHE: Dict[str, Dict[str, Any]] = {}
-ROLE_CACHE_TTL = int(os.getenv("ROLE_CACHE_TTL", "300"))  # seconds
+def _is_premium(plan: Optional[str], premium_until: Optional[datetime], roles: Set[str]) -> bool:
+    if plan and plan.lower() in {"pro", "premium"}:
+        return True
+    if premium_until and premium_until > _now():
+        return True
+    if "Premium" in roles:
+        return True
+    return False
 
-async def _has_discord_premium_role(user_id: str) -> bool:
-    """
-    True if the Discord user has the configured Premium role in the configured guild.
-    Caches results briefly to avoid hammering Discord.
-    """
-    if not (DISCORD_BOT_TOKEN and DISCORD_SERVER_ID and DISCORD_PREMIUM_ROLE_ID and user_id):
-        return False
+async def _load_user_row(pool: asyncpg.Pool, user_id: str) -> Optional[asyncpg.Record]:
+    # optional table with plan/premium_until/roles (JSON/text[])
+    return await pool.fetchrow("SELECT plan, premium_until, roles FROM users WHERE id=$1", user_id)
 
+# ---- light caches to avoid Discord rate limits ----
+_ROLES_MAP_CACHE: Dict[str, Any] = {"at": 0.0, "ttl": 300.0, "data": {}}   # id -> name
+_MEMBER_ROLES_CACHE: Dict[str, Any] = {"at": 0.0, "ttl": 60.0, "data": {}} # user_id -> set(role_ids)
+
+async def _guild_roles_map() -> Dict[str, str]:
+    if not (DISCORD_SERVER_ID and DISCORD_BOT_TOKEN):
+        return {}
+    import time
     now = time.time()
-    hit = _ROLE_CACHE.get(user_id)
-    if hit and (now - hit["at"] < ROLE_CACHE_TTL):
-        return bool(hit["ok"])
-
-    ok = False
+    if now - _ROLES_MAP_CACHE["at"] < _ROLES_MAP_CACHE["ttl"]:
+        return _ROLES_MAP_CACHE["data"]
+    url = f"https://discord.com/api/v10/guilds/{DISCORD_SERVER_ID}/roles"
     try:
-        async with aiohttp.ClientSession(
-            headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"}
-        ) as sess:
-            async with sess.get(
-                f"https://discord.com/api/v10/guilds/{DISCORD_SERVER_ID}/members/{user_id}"
-            ) as resp:
-                if resp.status == 200:
-                    js = await resp.json()
-                    roles = js.get("roles") or []
-                    ok = DISCORD_PREMIUM_ROLE_ID in roles
+        async with aiohttp.ClientSession(headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"}) as sess:
+            async with sess.get(url, timeout=10) as r:
+                if r.status != 200:
+                    return {}
+                js = await r.json()
+        mp = {str(role["id"]): role.get("name") for role in js if isinstance(role, dict)}
+        _ROLES_MAP_CACHE.update({"at": now, "data": mp})
+        return mp
     except Exception:
-        ok = False
+        return {}
 
-    _ROLE_CACHE[user_id] = {"ok": ok, "at": now}
-    return ok
+async def _member_role_ids(user_id: str) -> Set[str]:
+    if not (DISCORD_SERVER_ID and DISCORD_BOT_TOKEN):
+        return set()
+    import time
+    now = time.time()
+    cache = _MEMBER_ROLES_CACHE
+    data = cache["data"].get(user_id)
+    if data and (now - cache["at"] < cache["ttl"]):
+        return data
+    url = f"https://discord.com/api/v10/guilds/{DISCORD_SERVER_ID}/members/{user_id}"
+    try:
+        async with aiohttp.ClientSession(headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"}) as sess:
+            async with sess.get(url, timeout=10) as r:
+                if r.status != 200:
+                    return set()
+                js = await r.json()
+        role_ids = {str(rid) for rid in js.get("roles", [])}
+        cache["at"] = now
+        cache["data"][user_id] = role_ids
+        return role_ids
+    except Exception:
+        return set()
 
-# ---------- Helpers ----------
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
+async def _discord_has_premium(user_id: str) -> tuple[bool, Set[str]]:
+    """
+    Returns (has_premium_role, role_names_set)
+    """
+    ids = await _member_role_ids(user_id)
+    names: Set[str] = set()
+    if not ids:
+        return (False, names)
 
-def _is_premium_by_discord(roles_has_premium: bool) -> bool:
-    return bool(roles_has_premium)
+    # Map ids -> names if we can
+    mp = await _guild_roles_map()
+    names = {mp.get(i, i) for i in ids}  # fall back to id strings if names not known
 
-# ---------- Public API ----------
+    # Prefer explicit ID match when provided
+    if DISCORD_PREMIUM_ROLE_ID and DISCORD_PREMIUM_ROLE_ID in ids:
+        names.add("Premium")
+        return (True, names)
+
+    # Otherwise accept by name
+    has_by_name = PREMIUM_ROLE_NAME in names
+    if has_by_name:
+        names.add("Premium")
+    return (has_by_name, names)
+
 async def compute_entitlements(req: Request) -> Dict[str, Any]:
-    """
-    Determines the user's entitlements. Premium is granted if the user has the Discord
-    role whose ID is DISCORD_PREMIUM_ROLE_ID in DISCORD_SERVER_ID.
-    """
-    # Your auth sets these in session during /api/callback
-    user_id = (req.session or {}).get("user_id")
+    # ---- get user id from session (your login stores "user_id") ----
+    sess = getattr(req, "session", {}) or {}
+    user_id = sess.get("user_id") or (sess.get("user") or {}).get("id")
+    pool: asyncpg.Pool = req.app.state.pool
 
-    # Default (no DB dependency)
-    plan: Optional[str] = None
-    premium_until: Optional[datetime] = None
+    plan = None
+    premium_until = None
+    roles_from_db: Set[str] = set()
 
-    # Check Discord role
-    has_premium_role = await _has_discord_premium_role(user_id) if user_id else False
-    is_premium = _is_premium_by_discord(has_premium_role)
+    if user_id:
+        row = await _load_user_row(pool, user_id)
+        if row:
+            plan = row["plan"]
+            premium_until = row["premium_until"]
+            roles_from_db = set(row["roles"] or [])
 
-    # Surface a friendly role name so FEATURE_MATRIX role checks still work
-    roles: Set[str] = {"Premium"} if has_premium_role else set()
+    # ---- pull Discord roles and see if Premium is present ----
+    has_premium_discord = False
+    discord_role_names: Set[str] = set()
+    if user_id:
+        has_premium_discord, discord_role_names = await _discord_has_premium(user_id)
+
+    roles_union: Set[str] = roles_from_db | discord_role_names
+    if has_premium_discord:
+        roles_union.add("Premium")
+
+    premium = _is_premium(plan, premium_until, roles_union)
 
     limits = {
-        "watchlist_max": PREMIUM_WATCHLIST_MAX if is_premium else FREE_WATCHLIST_MAX,
-        "trending": PREMIUM_TRENDING if is_premium else FREE_TRENDING,
+        "watchlist_max": PREMIUM_WATCHLIST_MAX if premium else FREE_WATCHLIST_MAX,
+        "trending": PREMIUM_TRENDING if premium else FREE_TRENDING,
     }
 
-    features = {
-        "smart_buy",
-        "trade_finder",
-        "deal_confidence",
-        "backtest",
-        "smart_trending",
-    } if is_premium else set()
+    features = set()
+    if premium:
+        features = {"smart_buy", "trade_finder", "deal_confidence", "backtest", "smart_trending"}
 
     return {
         "user_id": user_id,
         "plan": plan,
         "premium_until": premium_until,
-        "roles": list(roles),
-        "is_premium": is_premium,
-        "features": list(features),
+        "roles": sorted(roles_union),
+        "is_premium": premium,
+        "features": sorted(features),
         "limits": limits,
     }
 
 def require_feature(feature: Feature):
-    """
-    FastAPI dependency to guard routes:
-      app.include_router(
-          smart_buy_router,
-          dependencies=[Depends(require_feature("smart_buy"))],
-      )
-    """
     async def _dep(req: Request):
         ent = await compute_entitlements(req)
         if ent["is_premium"]:
             return True
-
         conf = FEATURE_MATRIX.get(feature, {})
         allowed = False
         if conf:
-            # role name "Premium" is injected when Discord role is present
             if set(ent["roles"]) & set(conf.get("roles", set())):
                 allowed = True
             if ent.get("plan") and str(ent["plan"]).lower() in conf.get("plans", set()):
                 allowed = True
-
         if not allowed:
             raise HTTPException(
                 status_code=402,
