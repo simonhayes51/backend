@@ -36,11 +36,13 @@ from app.services.price_history import get_price_history
 from app.services.prices import get_player_price  # still imported (not strictly required after unification)
 from app.routers.smart_buy import router as smart_buy_router
 from app.routers.trade_finder import router as trade_finder_router
+from discord_manager import discord_manager
 
 
 
 # ----------------- BOOTSTRAP -----------------
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("app")
 load_dotenv()
 
 # --------- ENV ---------
@@ -72,6 +74,9 @@ DISCORD_OAUTH_TOKEN = "https://discord.com/api/oauth2/token"
 DISCORD_USERS_ME = "https://discord.com/api/users/@me"
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 DISCORD_SERVER_ID = os.getenv("DISCORD_SERVER_ID")
+
+# Stripe
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 
 # Watchlist alert env
 WATCHLIST_FALLBACK_CHANNEL_ID = os.getenv("WATCHLIST_FALLBACK_CHANNEL_ID")
@@ -453,6 +458,14 @@ async def lifespan(app: FastAPI):
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )""")
 
+        # Add premium status to user_profiles
+        await conn.execute("""
+        ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS is_premium BOOLEAN DEFAULT FALSE
+        """)
+        await conn.execute("""
+        ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS premium_until TIMESTAMP WITH TIME ZONE
+        """)
+
         # Billing tables
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS subscriptions (
@@ -488,13 +501,6 @@ async def lifespan(app: FastAPI):
             assigned_at TIMESTAMP DEFAULT NOW(),
             expires_at TIMESTAMP
         ) """)
-        # Add premium status to user_profiles
-        await conn.execute("""
-        ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS is_premium BOOLEAN DEFAULT FALSE
-        """)
-        await conn.execute("""
-        ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS premium_until TIMESTAMP WITH TIME ZONE
-        """)
 
         # trading_goals
         await conn.execute("""
@@ -1895,19 +1901,30 @@ async def test_alert_endpoint(
     return {"sent": n}
 
 
+
 @app.get("/api/me")
-async def get_current_user_info(request: Request):
+async def get_current_user_info(request: Request, conn=Depends(get_db)):
     uid = request.session.get("user_id")
     if not uid:
         return {"authenticated": False}
+    # Get premium status from database
+    profile = await conn.fetchrow(
+        "SELECT username, avatar_url, global_name, is_premium, premium_until FROM user_profiles WHERE user_id = $1",
+        uid
+    )
+    is_premium = False
+    if profile and profile["is_premium"] and profile["premium_until"]:
+        is_premium = profile["premium_until"] > datetime.now(timezone.utc)
     return {
         "authenticated": True,
         "user_id": uid,
-        "username": request.session.get("username"),
-        "avatar_url": request.session.get("avatar_url"),
-        "global_name": request.session.get("global_name"),
+        "username": profile["username"] if profile else request.session.get("username"),
+        "avatar_url": profile["avatar_url"] if profile else request.session.get("avatar_url"),
+        "global_name": profile["global_name"] if profile else request.session.get("global_name"),
+        "is_premium": is_premium,
+        "premium_until": profile["premium_until"].isoformat() if profile and profile["premium_until"] else None,
+        "discord_id": uid
     }
-
 
 @app.get("/api/settings")
 async def get_user_settings(
@@ -2824,20 +2841,9 @@ async def backtest(payload: Dict[str, Any]):
     }
     return {"equity": equity, "summary": summary, "trades": all_trades}
     
-try:
-    from app.routers.squad import router as squad_router
-from discord_manager import discord_manager
-  # type: ignore
-    app.include_router(squad_router, prefix="/api")
-    logging.info("â Squad router loaded")
-except Exception as e:
-    logging.warning("â ï¸ Squad router not loaded: %s", e)
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=PORT)
 
 # -------------- Billing & Account Endpoints --------------
+
 @app.get("/api/billing/subscription")
 async def get_subscription_status(user_id: str = Depends(get_current_user), conn=Depends(get_db)):
     """Get current subscription status"""
@@ -3145,28 +3151,13 @@ async def get_discord_status(user_id: str = Depends(get_current_user), conn=Depe
     """Check if user's Discord account is connected"""
     profile = await conn.fetchrow("SELECT username FROM user_profiles WHERE user_id = $1", user_id)
     return {"connected": bool(profile and profile["username"])}
+try:
+    from app.routers.squad import router as squad_router  # type: ignore
+    app.include_router(squad_router, prefix="/api")
+    logging.info("â Squad router loaded")
+except Exception as e:
+    logging.warning("â ï¸ Squad router not loaded: %s", e)
 
-# Update the existing /api/me endpoint to include premium status
-@app.get("/api/me")
-async def get_current_user_info(request: Request, conn=Depends(get_db)):
-    uid = request.session.get("user_id")
-    if not uid:
-        return {"authenticated": False}
-    # Get premium status from database
-    profile = await conn.fetchrow(
-        "SELECT username, avatar_url, global_name, is_premium, premium_until FROM user_profiles WHERE user_id = $1",
-        uid
-    )
-    is_premium = False
-    if profile and profile["is_premium"] and profile["premium_until"]:
-        is_premium = profile["premium_until"] > datetime.now(timezone.utc)
-    return {
-        "authenticated": True,
-        "user_id": uid,
-        "username": profile["username"] if profile else request.session.get("username"),
-        "avatar_url": profile["avatar_url"] if profile else request.session.get("avatar_url"),
-        "global_name": profile["global_name"] if profile else request.session.get("global_name"),
-        "is_premium": is_premium,
-        "premium_until": profile["premium_until"].isoformat() if profile and profile["premium_until"] else None,
-        "discord_id": uid
-    }
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=PORT)
