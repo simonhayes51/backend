@@ -1907,23 +1907,132 @@ async def get_current_user_info(request: Request, conn=Depends(get_db)):
     uid = request.session.get("user_id")
     if not uid:
         return {"authenticated": False}
-    # Get premium status from database
+    
+    # Get user profile
     profile = await conn.fetchrow(
-        "SELECT username, avatar_url, global_name, is_premium, premium_until FROM user_profiles WHERE user_id = $1",
+        "SELECT username, avatar_url, global_name, is_premium, premium_until FROM user_profiles WHERE user_id = $1", 
         uid
     )
+    
+    if not profile:
+        return {"authenticated": False}
+    
+    # REAL-TIME PREMIUM VALIDATION
     is_premium = False
-    if profile and profile["is_premium"] and profile["premium_until"]:
-        is_premium = profile["premium_until"] > datetime.now(timezone.utc)
+    premium_until = None
+    
+    # Check active subscription in real-time
+    active_subscription = await conn.fetchrow(
+        """
+        SELECT current_period_end, status, cancel_at_period_end
+        FROM subscriptions 
+        WHERE user_id = $1 
+        AND status IN ('active', 'trialing')
+        ORDER BY created_at DESC 
+        LIMIT 1
+        """,
+        uid
+    )
+    
+    if active_subscription:
+        current_period_end = active_subscription["current_period_end"]
+        now = datetime.now(timezone.utc)
+        
+        # Check if subscription is still valid
+        if current_period_end and current_period_end > now:
+            is_premium = True
+            premium_until = current_period_end
+        else:
+            # Subscription expired - update database immediately
+            await conn.execute(
+                """
+                UPDATE user_profiles 
+                SET is_premium = FALSE, premium_until = NULL, updated_at = NOW()
+                WHERE user_id = $1
+                """,
+                uid
+            )
+            
+            # Also mark subscription as expired if needed
+            await conn.execute(
+                """
+                UPDATE subscriptions 
+                SET status = 'past_due' 
+                WHERE user_id = $1 AND current_period_end <= $2 AND status = 'active'
+                """,
+                uid, now
+            )
+            
+            # Remove Discord role immediately
+            try:
+                from discord_manager import discord_manager
+                await discord_manager.remove_premium_role(uid)
+            except Exception as e:
+                logger.warning(f"Failed to remove Discord role for expired user {uid}: {e}")
+    
+    # If database shows premium but no active subscription, fix it
+    elif profile["is_premium"]:
+        is_premium = False
+        await conn.execute(
+            """
+            UPDATE user_profiles 
+            SET is_premium = FALSE, premium_until = NULL, updated_at = NOW()
+            WHERE user_id = $1
+            """,
+            uid
+        )
+
     return {
         "authenticated": True,
         "user_id": uid,
-        "username": profile["username"] if profile else request.session.get("username"),
-        "avatar_url": profile["avatar_url"] if profile else request.session.get("avatar_url"),
-        "global_name": profile["global_name"] if profile else request.session.get("global_name"),
+        "username": profile["username"],
+        "avatar_url": profile["avatar_url"],
+        "global_name": profile["global_name"],
         "is_premium": is_premium,
-        "premium_until": profile["premium_until"].isoformat() if profile and profile["premium_until"] else None,
-        "discord_id": uid
+        "premium_until": premium_until.isoformat() if premium_until else None,
+        "discord_id": uid,
+        "last_validated": datetime.now(timezone.utc).isoformat(),
+        "features": ["smart_buy", "trade_finder", "advanced_analytics"] if is_premium else [],
+        "limits": {
+            "watchlist_max": 500 if is_premium else 3,
+            "trending": {"timeframes": ["4h", "6h", "24h"] if is_premium else ["24h"]}
+        }
+    }
+
+@app.get("/api/validate-premium")
+async def validate_premium(user_id: str = Depends(get_current_user), conn=Depends(get_db)):
+    """Fast endpoint to validate premium status without full user data"""
+    
+    # Check if user has active subscription right now
+    active_subscription = await conn.fetchrow(
+        """
+        SELECT current_period_end, status
+        FROM subscriptions 
+        WHERE user_id = $1 
+        AND status IN ('active', 'trialing')
+        AND current_period_end > NOW()
+        ORDER BY created_at DESC 
+        LIMIT 1
+        """,
+        user_id
+    )
+    
+    is_premium = bool(active_subscription)
+    
+    # If no active subscription but user marked as premium, fix it
+    if not is_premium:
+        await conn.execute(
+            """
+            UPDATE user_profiles 
+            SET is_premium = FALSE, premium_until = NULL, updated_at = NOW()
+            WHERE user_id = $1 AND is_premium = TRUE
+            """,
+            user_id
+        )
+    
+    return {
+        "is_premium": is_premium,
+        "validated_at": datetime.now(timezone.utc).isoformat()
     }
 
 @app.get("/api/settings")
