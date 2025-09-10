@@ -947,11 +947,14 @@ async def login():
     OAUTH_STATE[state] = {"flow": "dashboard", "ts": time.time()}
     params = {
         "client_id": DISCORD_CLIENT_ID,
-        "redirect_uri": DISCORD_REDIRECT_URI,   # must match portal exactly
+        "redirect_uri": DISCORD_REDIRECT_URI,
         "response_type": "code",
         "scope": "identify",
         "state": state,
-        # "prompt": "consent",  # either use this or omit entirely
+        # change this:
+        # "prompt": "none",
+        # to either remove it or:
+        "prompt": "consent",
     }
     return RedirectResponse(f"{DISCORD_OAUTH_AUTHORIZE}?{urlencode(params)}")
 
@@ -965,13 +968,13 @@ async def price_history(playerId: int, platform: str = "ps", tf: str = "today"):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Upstream error: {e}")
 
+# REPLACE your existing callback function with this
 @app.get("/api/callback")
 async def callback(request: Request):
-    # Surface provider errors
     err = request.query_params.get("error")
     err_desc = request.query_params.get("error_description")
     if err:
-        raise HTTPException(status_code=400, detail=f"OAuth error from Discord: {err}: {err_desc or ''}".strip())
+        raise HTTPException(400, detail=f"OAuth error from Discord: {err}: {err_desc or ''}".strip())
 
     code = request.query_params.get("code")
     state = request.query_params.get("state")
@@ -990,81 +993,59 @@ async def callback(request: Request):
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(DISCORD_OAUTH_TOKEN, data=data, headers=headers) as resp:
+                txt = await resp.text()
                 if resp.status != 200:
-                    txt = await resp.text()
-                    raise HTTPException(status_code=400, detail=f"OAuth token exchange failed: {txt}")
-                token_data = await resp.json()
-                access_token = token_data.get("access_token")
-                if not access_token:
-                    raise HTTPException(status_code=400, detail="OAuth failed")
+                    logging.error("Discord token exchange failed (%s): %s", resp.status, txt[:500])
+                    raise HTTPException(400, detail=f"OAuth token exchange failed: {txt}")
+                token_data = json.loads(txt)
+
+        access_token = token_data.get("access_token")
+        if not access_token:
+            logging.error("No access_token in token_data: %s", token_data)
+            raise HTTPException(400, detail="OAuth failed (no access_token)")
 
         user_data = await get_discord_user_info(access_token)
-        if not user_data:
-            raise HTTPException(status_code=400, detail="Failed to fetch user data")
-
+        if not user_data or "id" not in user_data:
+            logging.error("Failed to fetch user data: %s", user_data)
+            raise HTTPException(400, detail="Failed to fetch user data")
         user_id = user_data["id"]
 
         if state and state in OAUTH_STATE and OAUTH_STATE.get(state, {}).get("flow") != "dashboard":
-            meta = OAUTH_STATE.pop(state, None)
+            meta = OAUTH_STATE.pop(state, None) or {}
             jwt_token = issue_extension_token(user_id)
-            ext_redirect = meta["ext_redirect"]
+            ext_redirect = meta.get("ext_redirect")
+            if not ext_redirect:
+                raise HTTPException(400, detail="Invalid extension state")
             return RedirectResponse(f"{ext_redirect}#token={jwt_token}&state={state}")
 
-        if state and state in OAUTH_STATE:
+        if state:
             OAUTH_STATE.pop(state, None)
 
         is_member = await check_server_membership(user_id)
         if not is_member:
             return RedirectResponse(f"{FRONTEND_URL}/access-denied")
 
-        username = f"{user_data['username']}#{user_data.get('discriminator', '0000')}"
+        username = f"{user_data.get('username','user')}#{user_data.get('discriminator', '0000')}"
         avatar_url = (
             f"https://cdn.discordapp.com/avatars/{user_id}/{user_data['avatar']}.png"
             if user_data.get('avatar')
-            else f"https://cdn.discordapp.com/embed/avatars/{int(user_data.get('discriminator', '0')) % 5}.png"
+            else f"https://cdn.discordapp.com/embed/avatars/{int(user_data.get('discriminator','0') or 0) % 5}.png"
         )
-        global_name = user_data.get('global_name') or user_data['username']
+        global_name = user_data.get('global_name') or user_data.get('username') or "User"
 
-        # Pull Discord roles for this member and store them
-        roles = await get_member_role_names(user_id)  # returns ["Premium", ...] if present
-
-        # Persist roles & profile, seed portfolio
-        async with pool.acquire() as conn:
-            await conn.execute("""
-              INSERT INTO users (id, plan, premium_until, roles)
-              VALUES ($1,
-                      COALESCE((SELECT plan FROM users WHERE id=$1), 'free'),
-                      COALESCE((SELECT premium_until FROM users WHERE id=$1), NULL),
-                      $2)
-              ON CONFLICT (id) DO UPDATE SET roles = EXCLUDED.roles
-            """, user_id, roles)
-
-            await conn.execute(
-                "INSERT INTO portfolio (user_id, starting_balance) VALUES ($1, $2) "
-                "ON CONFLICT (user_id) DO NOTHING",
-                user_id, 0
-            )
-
-            await conn.execute("""
-                INSERT INTO user_profiles (user_id, username, avatar_url, global_name, updated_at)
-                VALUES ($1, $2, $3, $4, NOW())
-                ON CONFLICT (user_id)
-                DO UPDATE SET username=$2, avatar_url=$3, global_name=$4, updated_at=NOW()
-            """, user_id, username, avatar_url, global_name)
-
-        # Session
         request.session["user_id"] = user_id
         request.session["username"] = username
         request.session["avatar_url"] = avatar_url
         request.session["global_name"] = global_name
-        request.session["roles"] = roles
-        
+        request.session["roles"] = await get_member_role_names(user_id)
+
         return RedirectResponse(f"{FRONTEND_URL}/auth/done")
+
     except HTTPException:
         raise
     except Exception as e:
-        logging.error(f"OAuth error: {e}")
-        raise HTTPException(status_code=500, detail="Authentication failed")
+        logging.exception("OAuth unexpected error: %s", e)
+        raise HTTPException(500, detail="Authentication failed")
 
 @app.get("/api/logout")
 async def logout_get(request: Request):
