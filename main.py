@@ -698,7 +698,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 @app.get("/api/entitlements")
-async def get_entitlements(request: Request, conn=Depends(get_db)):
+async def get_entitlements(request: Request):
     """Get user's current entitlements with real-time validation"""
     
     # Get user ID from session (same as your /api/me endpoint)
@@ -715,65 +715,67 @@ async def get_entitlements(request: Request, conn=Depends(get_db)):
             "roles": []
         }
     
-    # REAL-TIME PREMIUM VALIDATION
-    is_premium = False
-    premium_until = None
-    
-    # Check active subscription in real-time
-    active_subscription = await conn.fetchrow(
-        """
-        SELECT current_period_end, status, cancel_at_period_end
-        FROM subscriptions 
-        WHERE user_id = $1 
-        AND status IN ('active', 'trialing')
-        ORDER BY created_at DESC 
-        LIMIT 1
-        """,
-        uid
-    )
-    
-    if active_subscription:
-        current_period_end = active_subscription["current_period_end"]
-        now = datetime.now(timezone.utc)
+    # Use the same database connection pattern as your other endpoints
+    async with pool.acquire() as conn:
+        # REAL-TIME PREMIUM VALIDATION
+        is_premium = False
+        premium_until = None
         
-        # Check if subscription is still valid
-        if current_period_end and current_period_end > now:
-            is_premium = True
-            premium_until = current_period_end
-        else:
-            # Subscription expired - update database immediately
-            await conn.execute(
-                """
-                UPDATE user_profiles 
-                SET is_premium = FALSE, premium_until = NULL, updated_at = NOW()
-                WHERE user_id = $1
-                """,
-                uid
-            )
+        # Check active subscription in real-time
+        active_subscription = await conn.fetchrow(
+            """
+            SELECT current_period_end, status, cancel_at_period_end
+            FROM subscriptions 
+            WHERE user_id = $1 
+            AND status IN ('active', 'trialing')
+            ORDER BY created_at DESC 
+            LIMIT 1
+            """,
+            uid
+        )
+        
+        if active_subscription:
+            current_period_end = active_subscription["current_period_end"]
+            now = datetime.now(timezone.utc)
             
-            # Remove Discord role immediately
-            try:
-                from discord_manager import discord_manager
-                await discord_manager.remove_premium_role(uid)
-            except Exception as e:
-                logger.warning(f"Failed to remove Discord role for expired user {uid}: {e}")
-    
-    return {
-        "user_id": uid,
-        "is_premium": is_premium,
-        "premium_until": premium_until.isoformat() if premium_until else None,
-        "features": ["smart_buy", "trade_finder", "deal_confidence", "backtest", "smart_trending"] if is_premium else [],
-        "limits": {
-            "watchlist_max": 500 if is_premium else 3,
-            "trending": {
-                "timeframes": ["4h", "6h", "24h"] if is_premium else ["24h"],
-                "limit": 20 if is_premium else 5,
-                "smart": is_premium
-            }
-        },
-        "roles": ["Premium"] if is_premium else [],
-        "last_validated": datetime.now(timezone.utc).isoformat()
-    }
+            # Check if subscription is still valid
+            if current_period_end and current_period_end > now:
+                is_premium = True
+                premium_until = current_period_end
+            else:
+                # Subscription expired - update database immediately
+                await conn.execute(
+                    """
+                    UPDATE user_profiles 
+                    SET is_premium = FALSE, premium_until = NULL, updated_at = NOW()
+                    WHERE user_id = $1
+                    """,
+                    uid
+                )
+                
+                # Remove Discord role immediately
+                try:
+                    from discord_manager import discord_manager
+                    await discord_manager.remove_premium_role(uid)
+                except Exception as e:
+                    logging.warning(f"Failed to remove Discord role for expired user {uid}: {e}")
+        
+        return {
+            "user_id": uid,
+            "is_premium": is_premium,
+            "premium_until": premium_until.isoformat() if premium_until else None,
+            "features": ["smart_buy", "trade_finder", "deal_confidence", "backtest", "smart_trending"] if is_premium else [],
+            "limits": {
+                "watchlist_max": 500 if is_premium else 3,
+                "trending": {
+                    "timeframes": ["4h", "6h", "24h"] if is_premium else ["24h"],
+                    "limit": 20 if is_premium else 5,
+                    "smart": is_premium
+                }
+            },
+            "roles": ["Premium"] if is_premium else [],
+            "last_validated": datetime.now(timezone.utc).isoformat()
+        }
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
