@@ -386,6 +386,16 @@ async def lifespan(app: FastAPI):
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_tag ON trades(user_id, tag)")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_platform ON trades(user_id, platform)")
 
+        # users (plan/premium/roles read by compute_entitlements)
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+          id TEXT PRIMARY KEY,
+          plan TEXT,
+          premium_until TIMESTAMPTZ,
+          roles JSONB DEFAULT '[]'
+        )""")
+
+
         # portfolio
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS portfolio (
@@ -676,6 +686,30 @@ async def get_discord_user_info(access_token: str):
                 return None
             return await resp.json()
 
+async def get_member_role_names(discord_user_id: str) -> list[str]:
+    if not (DISCORD_BOT_TOKEN and DISCORD_SERVER_ID):
+        return []
+    try:
+        async with aiohttp.ClientSession(headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"}) as s:
+            # Member -> role ids
+            async with s.get(f"https://discord.com/api/guilds/{DISCORD_SERVER_ID}/members/{discord_user_id}") as r:
+                if r.status != 200:
+                    return []
+                member = await r.json()
+                role_ids = set(str(x) for x in (member.get("roles") or []))
+
+            # Guild roles -> map id->name
+            async with s.get(f"https://discord.com/api/guilds/{DISCORD_SERVER_ID}/roles") as r2:
+                if r2.status != 200:
+                    return []
+                roles_meta = await r2.json()
+                id_to_name = {str(rr["id"]): rr["name"] for rr in roles_meta}
+
+        return [id_to_name.get(rid, rid) for rid in role_ids]
+    except Exception:
+        return []
+
+
 # --- Premium by Discord Role ---
 DISCORD_PREMIUM_ROLE_ID = os.getenv("DISCORD_PREMIUM_ROLE_ID")
 
@@ -951,6 +985,32 @@ async def callback(request: Request):
         request.session["username"] = username
         request.session["avatar_url"] = avatar_url
         request.session["global_name"] = global_name
+
+        # Pull Discord roles for this member and store them
+        roles = await get_member_role_names(user_id)  # returns ["Premium", ...] if present
+        request.session["roles"] = roles
+        
+        async with pool.acquire() as conn:
+            # keep your existing portfolio/user_profiles upserts...
+            await conn.execute(
+                "INSERT INTO portfolio (user_id, starting_balance) VALUES ($1, $2) "
+                "ON CONFLICT (user_id) DO NOTHING",
+                user_id, 0,
+            )
+            await conn.execute("""
+                INSERT INTO user_profiles (user_id, username, avatar_url, global_name, updated_at)
+                VALUES ($1, $2, $3, $4, NOW())
+                ON CONFLICT (user_id)
+                DO UPDATE SET username=$2, avatar_url=$3, global_name=$4, updated_at=NOW()
+            """, user_id, username, avatar_url, global_name)
+        
+            # NEW: persist roles so compute_entitlements can read them
+            await conn.execute("""
+                INSERT INTO users (id, plan, premium_until, roles)
+                VALUES ($1, 'free', NULL, $2)
+                ON CONFLICT (id) DO UPDATE SET roles = EXCLUDED.roles
+            """, user_id, roles)
+
 
         async with pool.acquire() as conn:
             await conn.execute(
