@@ -2891,7 +2891,7 @@ async def create_checkout_session(
         # Map frontend price IDs to Stripe price IDs
         price_mapping = {
             "price_monthly_premium": os.getenv("STRIPE_MONTHLY_PRICE_ID"),
-            "price_yearly_premium": os.getenv("STRIPE_YEARLY_PRICE_ID")
+            "price_season_premium": os.getenv("STRIPE_SEASON_PRICE_ID")
         }
         stripe_price_id = price_mapping.get(price_id)
         if not stripe_price_id:
