@@ -28,7 +28,7 @@ from app.routers.auth_me import router as auth_me_router
 from fastapi.responses import RedirectResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from app.auth.entitlements import compute_entitlements, require_feature
 from app.services.price_history import get_price_history
 from app.services.prices import get_player_price  # still imported (not strictly required after unification)
@@ -78,6 +78,12 @@ WATCHLIST_POLL_INTERVAL = int(os.getenv("WATCHLIST_POLL_INTERVAL", "60"))  # sec
 # ephemeral state store
 OAUTH_STATE: Dict[str, Dict[str, Any]] = {}
 
+def _prune_oauth_state(ttl: int = 600) -> None:
+    now = time.time()
+    stale = [k for k, v in OAUTH_STATE.items() if now - v.get("ts", 0) > ttl]
+    for k in stale:
+        OAUTH_STATE.pop(k, None)
+
 # --------- FUT.GG / Watchlist config ---------
 FUTGG_BASE = "https://www.fut.gg/api/fut/player-prices/25"
 PRICE_CACHE_TTL = 5  # seconds
@@ -105,6 +111,9 @@ def _norm_tf(tf: Optional[str]) -> str:
 _MOMENTUM_CACHE: dict[tuple[str, int], dict] = {}
 MOMENTUM_TTL = 120  # seconds
 
+# Shared HTTP session
+HTTP_SESSION: Optional[aiohttp.ClientSession] = None
+
 async def _fetch_momentum_page(tf: str, page: int) -> str:
     now = time.time()
     key = (tf, page)
@@ -114,11 +123,16 @@ async def _fetch_momentum_page(tf: str, page: int) -> str:
 
     url = f"{MOMENTUM_BASE}/{tf}/?page={page}"
     timeout = aiohttp.ClientTimeout(total=12)
-    async with aiohttp.ClientSession(timeout=timeout, headers=MOMENTUM_HEADERS) as sess:
-        async with sess.get(url) as r:
+    sess = HTTP_SESSION or aiohttp.ClientSession(timeout=timeout, headers=MOMENTUM_HEADERS)
+    must_close = sess is not HTTP_SESSION
+    try:
+        async with sess.get(url, headers=MOMENTUM_HEADERS, timeout=timeout) as r:
             if r.status != 200:
                 raise HTTPException(status_code=502, detail=f"MOMENTUM {r.status}")
             html = await r.text()
+    finally:
+        if must_close:
+            await sess.close()
 
     _MOMENTUM_CACHE[key] = {"html": html, "at": now}
     return html
@@ -287,15 +301,15 @@ def is_within_quiet_hours(dt: datetime, quiet_start: Optional[dt_time], quiet_en
     return t >= quiet_start or t < quiet_end
     
 class UserSettings(BaseModel):
-    default_platform: Optional[str] = "Console"
-    custom_tags: Optional[List[str]] = []
-    currency_format: Optional[str] = "coins"
-    theme: Optional[str] = "dark"
-    timezone: Optional[str] = "UTC"
-    date_format: Optional[str] = "US"
-    include_tax_in_profit: Optional[bool] = True
-    default_chart_range: Optional[str] = "30d"
-    visible_widgets: Optional[List[str]] = ["profit", "tax", "balance", "trades"]
+    default_platform: str = "Console"
+    custom_tags: List[str] = Field(default_factory=list)
+    currency_format: str = "coins"
+    theme: str = "dark"
+    timezone: str = "UTC"
+    date_format: str = "US"
+    include_tax_in_profit: bool = True
+    default_chart_range: str = "30d"
+    visible_widgets: List[str] = Field(default_factory=lambda: ["profit", "tax", "balance", "trades"])
 
 class TradingGoal(BaseModel):
     title: str
@@ -350,11 +364,14 @@ _watchlist_task: Optional[asyncio.Task] = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global pool, player_pool, watchlist_pool, _watchlist_task
+    global pool, player_pool, watchlist_pool, _watchlist_task, HTTP_SESSION
 
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
     player_pool = pool if PLAYER_DATABASE_URL == DATABASE_URL else await asyncpg.create_pool(PLAYER_DATABASE_URL, min_size=1, max_size=10)
     watchlist_pool = pool if WATCHLIST_DATABASE_URL == DATABASE_URL else await asyncpg.create_pool(WATCHLIST_DATABASE_URL, min_size=1, max_size=10)
+
+    # Shared HTTP session
+    HTTP_SESSION = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
 
     # Expose pools
     app.state.pool = pool
@@ -394,6 +411,7 @@ async def lifespan(app: FastAPI):
           premium_until TIMESTAMPTZ,
           roles JSONB DEFAULT '[]'
         )""")
+        
 
 
         # portfolio
@@ -622,12 +640,11 @@ async def lifespan(app: FastAPI):
         for p in {pool, player_pool, watchlist_pool}:
             if p is not None:
                 await p.close()
+        if HTTP_SESSION:
+            await HTTP_SESSION.close()
                 
 # --- FastAPI app ---
 app = FastAPI(lifespan=lifespan)
-
-# in main.py (or a small router), add:
-from app.auth.entitlements import compute_entitlements
 
 @app.get("/api/entitlements")
 async def entitlements(request: Request):
@@ -772,9 +789,12 @@ def require_extension_jwt(request: Request):
         payload = jwt.decode(token, JWT_PRIVATE_KEY, algorithms=["HS256"], issuer=JWT_ISSUER)
     except Exception as e:
         raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
+    scope = payload.get("scope")
+    if scope != "trade:ingest":
+        raise HTTPException(status_code=403, detail="Insufficient scope")
     return SimpleNamespace(discord_id=payload.get("sub"))
 
-# Unified FUT.GG price fetch with lightweight cache + timeout + tiny retry
+# Unified FUT.GG price fetch with lightweight cache + timeout + tiny retry (platform-aware)
 async def fetch_price(card_id: int, platform: str) -> Dict[str, Any]:
     platform = (platform or "").lower()
     key = f"{card_id}|{platform}"
@@ -795,25 +815,42 @@ async def fetch_price(card_id: int, platform: str) -> Dict[str, Any]:
     }
     timeout = aiohttp.ClientTimeout(total=12)
 
+    def pick_platform_node(current: Dict[str, Any]) -> Dict[str, Any]:
+        # supports both flat and per-platform shapes
+        if any(k in current for k in ("ps", "xbox", "pc", "playstation")):
+            key_map = {"ps": "ps", "xbox": "xbox", "pc": "pc", "console": "ps"}
+            k = key_map.get(platform, "ps")
+            node = current.get(k)
+            if not node and k == "ps":
+                node = current.get("playstation")
+            return node or {}
+        return current
+
     last_err = None
-    for attempt in (0, 1, 2):  # tiny retry with backoff
-        try:
-            async with aiohttp.ClientSession(timeout=timeout) as sess:
-                async with sess.get(url, headers=headers) as r:
+    sess = HTTP_SESSION or aiohttp.ClientSession(timeout=timeout)
+    must_close = sess is not HTTP_SESSION
+    try:
+        for attempt in (0, 1, 2):  # tiny retry with backoff
+            try:
+                async with sess.get(url, headers=headers, timeout=timeout) as r:
                     if r.status == 200:
                         data = await r.json()
                         current = (data.get("data") or {}).get("currentPrice") or {}
-                        price = current.get("price")
-                        is_extinct = current.get("isExtinct", False)
-                        updated_at = current.get("priceUpdatedAt")
+                        node = pick_platform_node(current)
+                        price = node.get("price")
+                        is_extinct = node.get("isExtinct", False)
+                        updated_at = node.get("priceUpdatedAt") or current.get("priceUpdatedAt")
                         _price_cache[key] = {"at": now, "price": price, "isExtinct": is_extinct, "updatedAt": updated_at}
                         return {"price": price, "isExtinct": is_extinct, "updatedAt": updated_at}
                     last_err = f"HTTP {r.status}"
-        except Exception as e:
-            last_err = str(e)
+            except Exception as e:
+                last_err = str(e)
 
-        # backoff: 0.2s, 0.6s, 1.4s
-        await asyncio.sleep(0.2 * (3 ** attempt))
+            # backoff: 0.2s, 0.6s, 1.4s
+            await asyncio.sleep(0.2 * (3 ** attempt))
+    finally:
+        if must_close:
+            await sess.close()
 
     # fall back to stale cache if available
     cached = _price_cache.get(key)
@@ -906,6 +943,7 @@ async def health_check():
 
 @app.get("/api/login")
 async def login():
+    _prune_oauth_state()
     state = secrets.token_urlsafe(24)
     OAUTH_STATE[state] = {"flow": "dashboard", "ts": time.time()}
     params = {
@@ -929,6 +967,7 @@ async def price_history(playerId: int, platform: str = "ps", tf: str = "today"):
 
 @app.get("/api/callback")
 async def callback(request: Request):
+    _prune_oauth_state()
     code = request.query_params.get("code")
     state = request.query_params.get("state")
     if not code:
@@ -961,7 +1000,7 @@ async def callback(request: Request):
         user_id = user_data["id"]
 
         if state and state in OAUTH_STATE and OAUTH_STATE.get(state, {}).get("flow") != "dashboard":
-            meta = OAUTH_STATE.pop(state)
+            meta = OAUTH_STATE.pop(state, None)
             jwt_token = issue_extension_token(user_id)
             ext_redirect = meta["ext_redirect"]
             return RedirectResponse(f"{ext_redirect}#token={jwt_token}&state={state}")
@@ -981,50 +1020,40 @@ async def callback(request: Request):
         )
         global_name = user_data.get('global_name') or user_data['username']
 
-        request.session["user_id"] = user_id
-        request.session["username"] = username
-        request.session["avatar_url"] = avatar_url
-        request.session["global_name"] = global_name
-
         # Pull Discord roles for this member and store them
         roles = await get_member_role_names(user_id)  # returns ["Premium", ...] if present
-        request.session["roles"] = roles
-        
+
+        # Persist roles & profile, seed portfolio
         async with pool.acquire() as conn:
-            # keep your existing portfolio/user_profiles upserts...
+            await conn.execute("""
+              INSERT INTO users (id, plan, premium_until, roles)
+              VALUES ($1,
+                      COALESCE((SELECT plan FROM users WHERE id=$1), 'free'),
+                      COALESCE((SELECT premium_until FROM users WHERE id=$1), NULL),
+                      $2)
+              ON CONFLICT (id) DO UPDATE SET roles = EXCLUDED.roles
+            """, user_id, roles)
+
             await conn.execute(
                 "INSERT INTO portfolio (user_id, starting_balance) VALUES ($1, $2) "
                 "ON CONFLICT (user_id) DO NOTHING",
-                user_id, 0,
+                user_id, 0
             )
+
             await conn.execute("""
                 INSERT INTO user_profiles (user_id, username, avatar_url, global_name, updated_at)
                 VALUES ($1, $2, $3, $4, NOW())
                 ON CONFLICT (user_id)
                 DO UPDATE SET username=$2, avatar_url=$3, global_name=$4, updated_at=NOW()
             """, user_id, username, avatar_url, global_name)
+
+        # Session
+        request.session["user_id"] = user_id
+        request.session["username"] = username
+        request.session["avatar_url"] = avatar_url
+        request.session["global_name"] = global_name
+        request.session["roles"] = roles
         
-            # NEW: persist roles so compute_entitlements can read them
-            await conn.execute("""
-                INSERT INTO users (id, plan, premium_until, roles)
-                VALUES ($1, 'free', NULL, $2)
-                ON CONFLICT (id) DO UPDATE SET roles = EXCLUDED.roles
-            """, user_id, roles)
-
-
-        async with pool.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO portfolio (user_id, starting_balance) VALUES ($1, $2) "
-                "ON CONFLICT (user_id) DO NOTHING",
-                user_id, 0,
-            )
-            await conn.execute("""
-                INSERT INTO user_profiles (user_id, username, avatar_url, global_name, updated_at)
-                VALUES ($1, $2, $3, $4, NOW())
-                ON CONFLICT (user_id)
-                DO UPDATE SET username = $2, avatar_url = $3, global_name = $4, updated_at = NOW()
-            """, user_id, username, avatar_url, global_name)
-
         return RedirectResponse(f"{FRONTEND_URL}/auth/done")
     except HTTPException:
         raise
@@ -1044,6 +1073,7 @@ async def logout_post(request: Request):
 
 @app.get("/oauth/start")
 async def oauth_start(redirect_uri: str):
+    _prune_oauth_state()
     if not redirect_uri.startswith("https://") or "chromiumapp.org" not in redirect_uri:
         raise HTTPException(400, "Invalid redirect_uri")
     state = secrets.token_urlsafe(24)
@@ -2095,10 +2125,11 @@ async def import_trades(
     conn=Depends(get_db),
 ):
     contents = await file.read()
-    if file.filename.endswith(".json"):
+    fname = (file.filename or "").lower()
+    if fname.endswith(".json"):
         payload = json.loads(contents.decode("utf-8"))
         trades_to_import = payload if isinstance(payload, list) else [payload]
-    elif file.filename.endswith(".csv"):
+    elif fname.endswith(".csv"):
         reader = csv.DictReader(io.StringIO(contents.decode("utf-8")))
         trades_to_import = list(reader)
     else:
