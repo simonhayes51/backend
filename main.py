@@ -922,9 +922,10 @@ app.include_router(market_router)           # /api/market/...
 app.include_router(trade_finder_router)     # /api/trade-finder...
 app.include_router(ext_router)              # /ext/...
 
-# Premium-only (hard gate)
+# Premium-only (hard gate) — mount at /api/smart-buy
 app.include_router(
-    smart_buy_router,                       # /api/smart-buy
+    smart_buy_router,
+    prefix="/api/smart-buy",
     dependencies=[Depends(require_feature("smart_buy"))],
 )
 
