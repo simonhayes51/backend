@@ -698,8 +698,68 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 @app.get("/api/entitlements")
-async def entitlements(request: Request):
-    return await compute_entitlements(request)
+async def get_entitlements(user_id: str = Depends(get_current_user), conn=Depends(get_db)):
+    """Get user's current entitlements with real-time validation"""
+    
+    # REAL-TIME PREMIUM VALIDATION (same logic as /api/me)
+    is_premium = False
+    premium_until = None
+    
+    # Check active subscription in real-time
+    active_subscription = await conn.fetchrow(
+        """
+        SELECT current_period_end, status, cancel_at_period_end
+        FROM subscriptions 
+        WHERE user_id = $1 
+        AND status IN ('active', 'trialing')
+        ORDER BY created_at DESC 
+        LIMIT 1
+        """,
+        user_id
+    )
+    
+    if active_subscription:
+        current_period_end = active_subscription["current_period_end"]
+        now = datetime.now(timezone.utc)
+        
+        # Check if subscription is still valid
+        if current_period_end and current_period_end > now:
+            is_premium = True
+            premium_until = current_period_end
+        else:
+            # Subscription expired - update database immediately
+            await conn.execute(
+                """
+                UPDATE user_profiles 
+                SET is_premium = FALSE, premium_until = NULL, updated_at = NOW()
+                WHERE user_id = $1
+                """,
+                user_id
+            )
+            
+            # Remove Discord role immediately
+            try:
+                from discord_manager import discord_manager
+                await discord_manager.remove_premium_role(user_id)
+            except Exception as e:
+                logger.warning(f"Failed to remove Discord role for expired user {user_id}: {e}")
+    
+    return {
+        "user_id": user_id,
+        "is_premium": is_premium,
+        "premium_until": premium_until.isoformat() if premium_until else None,
+        "features": ["smart_buy", "trade_finder", "deal_confidence", "backtest", "smart_trending"] if is_premium else [],
+        "limits": {
+            "watchlist_max": 500 if is_premium else 3,
+            "trending": {
+                "timeframes": ["4h", "6h", "24h"] if is_premium else ["24h"],
+                "limit": 20 if is_premium else 5,
+                "smart": is_premium
+            }
+        },
+        "roles": ["Premium"] if is_premium else [],
+        "last_validated": datetime.now(timezone.utc).isoformat()
+    }
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
