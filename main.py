@@ -10,6 +10,8 @@ import logging
 import secrets
 import aiohttp
 import asyncpg
+import stripe
+
 
 from bs4 import BeautifulSoup
 from types import SimpleNamespace
@@ -451,6 +453,49 @@ async def lifespan(app: FastAPI):
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )""")
 
+        # Billing tables
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS subscriptions (
+            id SERIAL PRIMARY KEY,
+            user_id VARCHAR(255) NOT NULL REFERENCES user_profiles(user_id),
+            stripe_subscription_id VARCHAR(255) UNIQUE,
+            stripe_customer_id VARCHAR(255),
+            status VARCHAR(50) NOT NULL DEFAULT 'active',
+            plan_id VARCHAR(255) NOT NULL,
+            current_period_start TIMESTAMP WITH TIME ZONE,
+            current_period_end TIMESTAMP WITH TIME ZONE,
+            cancel_at_period_end BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
+        ) """)
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS payments (
+            id SERIAL PRIMARY KEY,
+            user_id VARCHAR(255) NOT NULL,
+            subscription_id INTEGER REFERENCES subscriptions(id),
+            stripe_payment_intent_id VARCHAR(255),
+            amount INTEGER NOT NULL,
+            currency VARCHAR(3) DEFAULT 'GBP',
+            status VARCHAR(50) NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW()
+        ) """)
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS discord_roles (
+            id SERIAL PRIMARY KEY,
+            user_id VARCHAR(255) NOT NULL,
+            discord_user_id VARCHAR(255) NOT NULL,
+            role_id VARCHAR(255) NOT NULL,
+            assigned_at TIMESTAMP DEFAULT NOW(),
+            expires_at TIMESTAMP
+        ) """)
+        # Add premium status to user_profiles
+        await conn.execute("""
+        ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS is_premium BOOLEAN DEFAULT FALSE
+        """)
+        await conn.execute("""
+        ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS premium_until TIMESTAMP WITH TIME ZONE
+        """)
+
         # trading_goals
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS trading_goals (
@@ -628,7 +673,7 @@ async def lifespan(app: FastAPI):
 
     # Start alerts loop
     _watchlist_task = asyncio.create_task(_alerts_poll_loop())
-    logging.info("✅ Watchlist alerts loop started (%ss)", WATCHLIST_POLL_INTERVAL)
+    logging.info("â Watchlist alerts loop started (%ss)", WATCHLIST_POLL_INTERVAL)
 
     try:
         yield
@@ -922,7 +967,7 @@ app.include_router(market_router)           # /api/market/...
 app.include_router(trade_finder_router)     # /api/trade-finder...
 app.include_router(ext_router)              # /ext/...
 
-# Premium-only (hard gate) — mount at /api/smart-buy
+# Premium-only (hard gate) â mount at /api/smart-buy
 app.include_router(
     smart_buy_router,
     prefix="/api/smart-buy",
@@ -1612,11 +1657,11 @@ def _fmt_alert(
     ref_mode: str,
     ref_price: Optional[float],
 ) -> str:
-    arrow = "📈" if direction == "rise" else "📉"
-    rp = f"{int(ref_price):,}c" if isinstance(ref_price, (int, float)) else "—"
+    arrow = "ð" if direction == "rise" else "ð"
+    rp = f"{int(ref_price):,}c" if isinstance(ref_price, (int, float)) else "â"
     return (
-        f"{arrow} Watchlist Alert • {name} ({platform.upper()})\n"
-        f"Current: {int(price):,}c • Change: {pct:+.2f}%\n"
+        f"{arrow} Watchlist Alert â¢ {name} ({platform.upper()})\n"
+        f"Current: {int(price):,}c â¢ Change: {pct:+.2f}%\n"
         f"Ref: {rp} ({ref_mode})"
     )
 
@@ -2391,12 +2436,12 @@ async def api_trending(
         fallers: dict[int, float] = {}
         risers:  dict[int, float] = {}
     
-        # First pages ≈ fallers
+        # First pages â fallers
         for p in range(1, min(last, pages_each_side) + 1):
             for it in _extract_items(await _fetch_momentum_page(tf_str, p)):
                 fallers[int(it["card_id"])] = float(it["percent"])
     
-        # Last pages ≈ risers
+        # Last pages â risers
         for p in range(max(1, last - pages_each_side + 1), last + 1):
             for it in _extract_items(await _fetch_momentum_page(tf_str, p)):
                 risers[int(it["card_id"])] = float(it["percent"])
@@ -2429,7 +2474,7 @@ async def api_trending(
             smart.append((cid, v6, v24))
             seen.add(cid)
     
-    # 2) Fallback: biggest divergences (|6h − 24h|)
+    # 2) Fallback: biggest divergences (|6h â 24h|)
     if len(smart) < 10:
         diffs = []
         for cid, v6 in p6.items():
@@ -2780,12 +2825,348 @@ async def backtest(payload: Dict[str, Any]):
     return {"equity": equity, "summary": summary, "trades": all_trades}
     
 try:
-    from app.routers.squad import router as squad_router  # type: ignore
+    from app.routers.squad import router as squad_router
+from discord_manager import discord_manager
+  # type: ignore
     app.include_router(squad_router, prefix="/api")
-    logging.info("✅ Squad router loaded")
+    logging.info("â Squad router loaded")
 except Exception as e:
-    logging.warning("⚠️ Squad router not loaded: %s", e)
+    logging.warning("â ï¸ Squad router not loaded: %s", e)
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=PORT)
+
+# -------------- Billing & Account Endpoints --------------
+@app.get("/api/billing/subscription")
+async def get_subscription_status(user_id: str = Depends(get_current_user), conn=Depends(get_db)):
+    """Get current subscription status"""
+    try:
+        subscription = await conn.fetchrow(
+            """
+            SELECT s.*, up.is_premium, up.premium_until
+            FROM subscriptions s
+            LEFT JOIN user_profiles up ON s.user_id = up.user_id
+            WHERE s.user_id = $1 AND s.status = 'active'
+            ORDER BY s.created_at DESC
+            LIMIT 1
+            """,
+            user_id
+        )
+        if not subscription:
+            return {"subscription": None}
+
+        plan_id = subscription["plan_id"] or ""
+        is_yearly = "year" in plan_id.lower()
+        return {
+            "subscription": {
+                "plan_name": "Annual Premium" if is_yearly else "Monthly Premium",
+                "next_billing_date": subscription["current_period_end"].isoformat() if subscription["current_period_end"] else None,
+                "amount_display": "Â£99.99/year" if is_yearly else "Â£9.99/month",
+                "status": subscription["status"],
+                "cancel_at_period_end": subscription["cancel_at_period_end"]
+            }
+        }
+    except Exception as e:
+        logger.error(f"Get subscription error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get subscription")
+
+@app.post("/api/billing/create-checkout-session")
+async def create_checkout_session(
+    request: Request,
+    user_id: str = Depends(get_current_user),
+    conn=Depends(get_db)
+):
+    """Create Stripe checkout session"""
+    try:
+        data = await request.json()
+        price_id = data.get("priceId")
+        billing_cycle = data.get("billingCycle")
+        # Map frontend price IDs to Stripe price IDs
+        price_mapping = {
+            "price_monthly_premium": os.getenv("STRIPE_MONTHLY_PRICE_ID"),
+            "price_yearly_premium": os.getenv("STRIPE_YEARLY_PRICE_ID")
+        }
+        stripe_price_id = price_mapping.get(price_id)
+        if not stripe_price_id:
+            raise HTTPException(status_code=400, detail="Invalid price ID")
+        # Get user profile for email
+        profile = await conn.fetchrow("SELECT * FROM user_profiles WHERE user_id = $1", user_id)
+        if not profile:
+            raise HTTPException(status_code=404, detail="User profile not found")
+        # Create Stripe checkout session
+        session = stripe.checkout.Session.create(
+            customer_email=f"{profile['username']}@discord.local",  # Placeholder email
+            payment_method_types=['card'],
+            line_items=[{
+                'price': stripe_price_id,
+                'quantity': 1,
+            }],
+            mode='subscription',
+            success_url=data.get("successUrl", os.getenv("BILLING_SUCCESS_URL")),
+            cancel_url=data.get("cancelUrl", os.getenv("BILLING_CANCEL_URL")),
+            metadata={
+                'user_id': user_id,
+                'billing_cycle': billing_cycle
+            },
+            subscription_data={
+                'metadata': {
+                    'user_id': user_id,
+                    'discord_id': user_id
+                }
+            }
+        )
+        return {"sessionId": session.id, "checkoutUrl": session.url}
+    except Exception as e:
+        logger.error(f"Create checkout error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to create checkout session")
+
+@app.post("/api/billing/cancel-subscription")
+async def cancel_subscription(user_id: str = Depends(get_current_user), conn=Depends(get_db)):
+    """Cancel user's subscription"""
+    try:
+        subscription = await conn.fetchrow(
+            "SELECT * FROM subscriptions WHERE user_id = $1 AND status = 'active'",
+            user_id
+        )
+        if not subscription:
+            raise HTTPException(status_code=404, detail="No active subscription found")
+        # Cancel in Stripe
+        if subscription["stripe_subscription_id"]:
+            stripe.Subscription.modify(
+                subscription["stripe_subscription_id"],
+                cancel_at_period_end=True
+            )
+        # Update database
+        await conn.execute(
+            "UPDATE subscriptions SET cancel_at_period_end = TRUE WHERE id = $1",
+            subscription["id"]
+        )
+        return {"success": True}
+    except Exception as e:
+        logger.error(f"Cancel subscription error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to cancel subscription")
+
+@app.post("/api/billing/update-payment-method")
+async def update_payment_method(user_id: str = Depends(get_current_user), conn=Depends(get_db)):
+    """Create customer portal session for payment method updates"""
+    try:
+        subscription = await conn.fetchrow(
+            "SELECT * FROM subscriptions WHERE user_id = $1 AND status = 'active'",
+            user_id
+        )
+        if not subscription or not subscription["stripe_customer_id"]:
+            raise HTTPException(status_code=404, detail="No active subscription found")
+        portal_session = stripe.billing_portal.Session.create(
+            customer=subscription["stripe_customer_id"],
+            return_url=f"{FRONTEND_URL}/billing"
+        )
+        return {"portalUrl": portal_session.url}
+    except Exception as e:
+        logger.error(f"Update payment method error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to update payment method")
+
+# Webhook endpoint for Stripe events
+@app.post("/api/webhooks/stripe")
+async def stripe_webhook(request: Request, conn=Depends(get_db)):
+    """Handle Stripe webhook events"""
+    payload = await request.body()
+    sig_header = request.headers.get('stripe-signature')
+    webhook_secret = os.getenv("STRIPE_WEBHOOK_SECRET")
+    try:
+        event = stripe.Webhook.construct_event(
+            payload, sig_header, webhook_secret
+        )
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid payload")
+    except stripe.error.SignatureVerificationError:
+        raise HTTPException(status_code=400, detail="Invalid signature")
+    try:
+        if event['type'] == 'checkout.session.completed':
+            await handle_checkout_completed(event['data']['object'], conn)
+        elif event['type'] == 'customer.subscription.created':
+            await handle_subscription_created(event['data']['object'], conn)
+        elif event['type'] == 'customer.subscription.updated':
+            await handle_subscription_updated(event['data']['object'], conn)
+        elif event['type'] == 'customer.subscription.deleted':
+            await handle_subscription_deleted(event['data']['object'], conn)
+        elif event['type'] == 'invoice.payment_succeeded':
+            await handle_payment_succeeded(event['data']['object'], conn)
+        elif event['type'] == 'invoice.payment_failed':
+            await handle_payment_failed(event['data']['object'], conn)
+        return {"received": True}
+    except Exception as e:
+        logger.error(f"Webhook processing error: {e}")
+        raise HTTPException(status_code=500, detail="Webhook processing failed")
+
+# Webhook handler functions
+async def handle_checkout_completed(session, conn):
+    """Handle successful checkout"""
+    user_id = session.get('metadata', {}).get('user_id')
+    if user_id:
+        # Assign Discord role immediately
+        await discord_manager.assign_premium_role(user_id)
+
+async def handle_subscription_created(subscription, conn):
+    """Handle new subscription creation"""
+    user_id = (subscription.get('metadata') or {}).get('user_id')
+    if not user_id:
+        return
+    # Save subscription to database
+    await conn.execute(
+        """
+        INSERT INTO subscriptions (
+            user_id, stripe_subscription_id, stripe_customer_id, status, plan_id,
+            current_period_start, current_period_end
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+        """,
+        user_id,
+        subscription.get('id'),
+        subscription.get('customer'),
+        subscription.get('status'),
+        (((subscription.get('items') or {}).get('data') or [{}])[0]).get('price', {}).get('id'),
+        datetime.fromtimestamp(subscription.get('current_period_start'), tz=timezone.utc) if subscription.get('current_period_start') else None,
+        datetime.fromtimestamp(subscription.get('current_period_end'), tz=timezone.utc) if subscription.get('current_period_end') else None
+    )
+    # Update user profile
+    await conn.execute(
+        """
+        UPDATE user_profiles SET is_premium = TRUE, premium_until = $2, updated_at = NOW()
+        WHERE user_id = $1
+        """,
+        user_id,
+        datetime.fromtimestamp(subscription.get('current_period_end'), tz=timezone.utc) if subscription.get('current_period_end') else None
+    )
+    # Assign Discord role and log
+    await discord_manager.assign_premium_role(user_id)
+    await conn.execute(
+        """
+        INSERT INTO discord_roles (user_id, discord_user_id, role_id, expires_at)
+        VALUES ($1, $2, $3, $4)
+        """,
+        user_id,
+        user_id,
+        os.getenv("DISCORD_PREMIUM_ROLE_ID"),
+        datetime.fromtimestamp(subscription.get('current_period_end'), tz=timezone.utc) if subscription.get('current_period_end') else None
+    )
+
+async def handle_subscription_updated(subscription, conn):
+    """Handle subscription updates"""
+    user_id = (subscription.get('metadata') or {}).get('user_id')
+    if not user_id:
+        return
+    await conn.execute(
+        """
+        UPDATE subscriptions
+           SET status = $2, current_period_end = $3, cancel_at_period_end = $4
+         WHERE stripe_subscription_id = $1
+        """,
+        subscription.get('id'),
+        subscription.get('status'),
+        datetime.fromtimestamp(subscription.get('current_period_end'), tz=timezone.utc) if subscription.get('current_period_end') else None,
+        subscription.get('cancel_at_period_end', False)
+    )
+    is_active = subscription.get('status') == 'active'
+    await conn.execute(
+        """
+        UPDATE user_profiles
+           SET is_premium = $2, premium_until = $3, updated_at = NOW()
+         WHERE user_id = $1
+        """,
+        user_id,
+        is_active,
+        datetime.fromtimestamp(subscription.get('current_period_end'), tz=timezone.utc) if is_active and subscription.get('current_period_end') else None
+    )
+
+async def handle_subscription_deleted(subscription, conn):
+    """Handle subscription cancellation"""
+    user_id = (subscription.get('metadata') or {}).get('user_id')
+    if not user_id:
+        return
+    await conn.execute(
+        "UPDATE subscriptions SET status = 'canceled' WHERE stripe_subscription_id = $1",
+        subscription.get('id')
+    )
+    await conn.execute(
+        """
+        UPDATE user_profiles
+           SET is_premium = FALSE, premium_until = NULL, updated_at = NOW()
+         WHERE user_id = $1
+        """,
+        user_id
+    )
+    await discord_manager.remove_premium_role(user_id)
+
+async def handle_payment_succeeded(invoice, conn):
+    """Handle successful payment"""
+    subscription_id = invoice.get('subscription')
+    if subscription_id:
+        subscription = await conn.fetchrow(
+            "SELECT user_id FROM subscriptions WHERE stripe_subscription_id = $1",
+            subscription_id
+        )
+        if subscription:
+            await conn.execute(
+                """
+                INSERT INTO payments (user_id, stripe_payment_intent_id, amount, currency, status)
+                VALUES ($1, $2, $3, $4, $5)
+                """,
+                subscription['user_id'],
+                invoice.get('payment_intent'),
+                invoice.get('amount_paid'),
+                (invoice.get('currency') or 'gbp').upper(),
+                'succeeded'
+            )
+
+async def handle_payment_failed(invoice, conn):
+    """Handle failed payment"""
+    subscription_id = invoice.get('subscription')
+    if subscription_id:
+        subscription = await conn.fetchrow(
+            "SELECT user_id FROM subscriptions WHERE stripe_subscription_id = $1",
+            subscription_id
+        )
+        if subscription:
+            await conn.execute(
+                """
+                INSERT INTO payments (user_id, stripe_payment_intent_id, amount, currency, status)
+                VALUES ($1, $2, $3, $4, $5)
+                """,
+                subscription['user_id'],
+                invoice.get('payment_intent'),
+                invoice.get('amount_due'),
+                (invoice.get('currency') or 'gbp').upper(),
+                'failed'
+            )
+
+# Add endpoint to check Discord connection status
+@app.get("/api/user/discord-status")
+async def get_discord_status(user_id: str = Depends(get_current_user), conn=Depends(get_db)):
+    """Check if user's Discord account is connected"""
+    profile = await conn.fetchrow("SELECT username FROM user_profiles WHERE user_id = $1", user_id)
+    return {"connected": bool(profile and profile["username"])}
+
+# Update the existing /api/me endpoint to include premium status
+@app.get("/api/me")
+async def get_current_user_info(request: Request, conn=Depends(get_db)):
+    uid = request.session.get("user_id")
+    if not uid:
+        return {"authenticated": False}
+    # Get premium status from database
+    profile = await conn.fetchrow(
+        "SELECT username, avatar_url, global_name, is_premium, premium_until FROM user_profiles WHERE user_id = $1",
+        uid
+    )
+    is_premium = False
+    if profile and profile["is_premium"] and profile["premium_until"]:
+        is_premium = profile["premium_until"] > datetime.now(timezone.utc)
+    return {
+        "authenticated": True,
+        "user_id": uid,
+        "username": profile["username"] if profile else request.session.get("username"),
+        "avatar_url": profile["avatar_url"] if profile else request.session.get("avatar_url"),
+        "global_name": profile["global_name"] if profile else request.session.get("global_name"),
+        "is_premium": is_premium,
+        "premium_until": profile["premium_until"].isoformat() if profile and profile["premium_until"] else None,
+        "discord_id": uid
+    }
