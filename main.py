@@ -92,7 +92,7 @@ def _prune_oauth_state(ttl: int = 600) -> None:
         OAUTH_STATE.pop(k, None)
 
 # --------- FUT.GG / Watchlist config ---------
-FUTGG_BASE = "https://www.fut.gg/api/fut/player-prices/25"
+FUTGG_BASE = "https://www.fut.gg/api/fut/player-prices/26"
 PRICE_CACHE_TTL = 5  # seconds
 _price_cache: Dict[str, Dict[str, Any]] = {}
 
@@ -104,7 +104,7 @@ MOMENTUM_HEADERS = {
     "Accept-Language": "en-GB,en;q=0.9",
     "Referer": "https://www.fut.gg/",
 }
-_CARD_HREF_RE = re.compile(r"/players/(\d+)-[a-z0-9-]+/25-(\d+)/?", re.IGNORECASE)
+_CARD_HREF_RE = re.compile(r"/players/(\d+)-[a-z0-9-]+/26-(\d+)/?", re.IGNORECASE)
 
 def _norm_tf(tf: Optional[str]) -> str:
     if not tf:
@@ -1366,7 +1366,7 @@ async def get_player_definition(card_id: str):
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
-                f"https://www.fut.gg/api/fut/player-item-definitions/25/{card_id}/",
+                f"https://www.fut.gg/api/fut/player-item-definitions/26/{card_id}/",
                 headers={
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                     "Accept": "application/json, text/plain, */*",
@@ -1387,7 +1387,7 @@ async def get_player_price_proxy(card_id: str):
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
-                f"https://www.fut.gg/api/fut/player-prices/25/{card_id}",
+                f"https://www.fut.gg/api/fut/player-prices/26/{card_id}",
                 headers={
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                     "Accept": "application/json, text/plain, */*",
@@ -2765,7 +2765,7 @@ def _cmp_platform(p: str) -> str:
     return "ps"
 
 async def _cmp_price_range_via_futgg(card_id: str) -> Dict[str, Optional[int]]:
-    url = f"https://www.fut.gg/api/fut/player-item-definitions/25/{card_id}/"
+    url = f"https://www.fut.gg/api/fut/player-item-definitions/26/{card_id}/"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         "Accept": "application/json, text/plain, */*",
@@ -2794,7 +2794,7 @@ async def _cmp_price_range_via_futgg(card_id: str) -> Dict[str, Optional[int]]:
 
 async def _cmp_recent_sales_futbin(card_id: str, platform: str) -> List[Dict[str, Any]]:
     plat = platform if platform in ("ps", "xbox", "pc") else "ps"
-    url = f"https://www.futbin.com/25/sales/{card_id}?platform={plat}"
+    url = f"https://www.futbin.com/26/sales/{card_id}?platform={plat}"
     out: List[Dict[str, Any]] = []
     try:
         async with aiohttp.ClientSession() as sess:
