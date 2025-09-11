@@ -25,7 +25,7 @@ CONCURRENCY = int(os.getenv("REFRESH_CONCURRENCY", "16"))
 BATCH_SIZE  = int(os.getenv("REFRESH_BATCH_SIZE", "500"))
 SLEEP_SECS  = int(os.getenv("REFRESH_INTERVAL_SEC", "1800"))  # 30 minutes
 
-FUTGG_PRICE_URL = "https://www.fut.gg/api/fut/player-prices/25/{card_id}"
+FUTGG_PRICE_URL = "https://www.fut.gg/api/fut/player-prices/26/{card_id}"
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
     "Accept": "application/json, text/plain, */*",
