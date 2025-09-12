@@ -13,7 +13,6 @@ import asyncpg
 import stripe
 
 
-
 from bs4 import BeautifulSoup
 from types import SimpleNamespace
 from urllib.parse import urlencode
@@ -22,17 +21,12 @@ from typing import Any, Dict, List, Literal, Optional, Tuple
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
 from datetime import datetime, timedelta, timezone, time as dt_time
-import mimetypes
-import csv
-import json
-import tempfile
 
 from fastapi import (
     FastAPI, APIRouter, Request, HTTPException, Depends,
     UploadFile, File, Query
 )
-from app.routers.auth_me import router as auth_me_router
-from fastapi.responses import RedirectResponse, JSONResponse, StreamingResponse
+from fastapi.responses import RedirectResponse, JSONResponse, StreamingResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 from pydantic import BaseModel, Field
@@ -41,8 +35,8 @@ from app.services.price_history import get_price_history
 from app.services.prices import get_player_price  # still imported (not strictly required after unification)
 from app.routers.smart_buy import router as smart_buy_router
 from app.routers.trade_finder import router as trade_finder_router
+from app.routers.auth_me import router as auth_me_router
 from discord_manager import discord_manager
-
 
 
 # ----------------- BOOTSTRAP -----------------
@@ -2120,6 +2114,7 @@ async def validate_premium(user_id: str = Depends(get_current_user), conn=Depend
 async def get_user_settings(
     user_id: str = Depends(get_current_user), conn=Depends(get_db)
 ):
+    """Get user settings with proper defaults and validation"""
     try:
         settings_row = await conn.fetchrow(
             """
@@ -2132,7 +2127,9 @@ async def get_user_settings(
                 date_format, 
                 include_tax_in_profit, 
                 default_chart_range, 
-                visible_widgets
+                visible_widgets,
+                created_at,
+                updated_at
             FROM usersettings 
             WHERE user_id = $1
         """,
@@ -2141,37 +2138,94 @@ async def get_user_settings(
 
         if settings_row:
             return {
-                "default_platform": settings_row["default_platform"],
+                "default_platform": settings_row["default_platform"] or "Console",
                 "custom_tags": settings_row["custom_tags"] or [],
-                "currency_format": settings_row["currency_format"],
-                "theme": settings_row["theme"],
-                "timezone": settings_row["timezone"],
-                "date_format": settings_row["date_format"],
-                "include_tax_in_profit": settings_row["include_tax_in_profit"],
-                "default_chart_range": settings_row["default_chart_range"],
-                "visible_widgets": settings_row["visible_widgets"]
-                or ["profit", "tax", "balance", "trades"],
+                "currency_format": settings_row["currency_format"] or "coins",
+                "theme": settings_row["theme"] or "dark",
+                "timezone": settings_row["timezone"] or "UTC",
+                "date_format": settings_row["date_format"] or "US",
+                "include_tax_in_profit": settings_row["include_tax_in_profit"] if settings_row["include_tax_in_profit"] is not None else True,
+                "default_chart_range": settings_row["default_chart_range"] or "30d",
+                "visible_widgets": settings_row["visible_widgets"] or ["profit", "tax", "balance", "trades"],
+                "created_at": settings_row["created_at"].isoformat() if settings_row["created_at"] else None,
+                "updated_at": settings_row["updated_at"].isoformat() if settings_row["updated_at"] else None,
             }
         else:
-            return UserSettings().model_dump()
+            # Return defaults for new users
+            default_settings = {
+                "default_platform": "Console",
+                "custom_tags": [],
+                "currency_format": "coins",
+                "theme": "dark",
+                "timezone": "UTC",
+                "date_format": "US",
+                "include_tax_in_profit": True,
+                "default_chart_range": "30d",
+                "visible_widgets": ["profit", "tax", "balance", "trades"],
+                "created_at": None,
+                "updated_at": None,
+            }
+            
+            # Create default settings in database
+            await conn.execute(
+                """
+                INSERT INTO usersettings (
+                    user_id, default_platform, custom_tags, currency_format, theme, 
+                    timezone, date_format, include_tax_in_profit, default_chart_range, 
+                    visible_widgets, created_at, updated_at
+                ) 
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
+            """,
+                user_id,
+                default_settings["default_platform"],
+                json.dumps(default_settings["custom_tags"]),
+                default_settings["currency_format"],
+                default_settings["theme"],
+                default_settings["timezone"],
+                default_settings["date_format"],
+                default_settings["include_tax_in_profit"],
+                default_settings["default_chart_range"],
+                json.dumps(default_settings["visible_widgets"]),
+            )
+            
+            return default_settings
+            
     except Exception as e:
         logging.error(f"Error fetching user settings: {e}")
-        return UserSettings().model_dump()
+        raise HTTPException(status_code=500, detail="Failed to fetch settings")
 
 
 @app.post("/api/settings")
 async def update_user_settings(
     settings: UserSettings, user_id: str = Depends(get_current_user), conn=Depends(get_db)
 ):
+    """Update user settings with validation and proper error handling"""
     try:
-        await conn.execute(
+        # Validate settings
+        if settings.default_platform not in ["Console", "Xbox", "PC"]:
+            raise HTTPException(status_code=400, detail="Invalid platform")
+            
+        if settings.currency_format not in ["coins", "abbreviated", "decimal"]:
+            raise HTTPException(status_code=400, detail="Invalid currency format")
+            
+        if settings.theme not in ["dark", "light", "system"]:
+            raise HTTPException(status_code=400, detail="Invalid theme")
+            
+        if settings.date_format not in ["US", "EU", "ISO"]:
+            raise HTTPException(status_code=400, detail="Invalid date format")
+            
+        if settings.default_chart_range not in ["7d", "30d", "90d", "1y"]:
+            raise HTTPException(status_code=400, detail="Invalid chart range")
+
+        # Update or insert settings
+        result = await conn.execute(
             """
             INSERT INTO usersettings (
                 user_id, default_platform, custom_tags, currency_format, theme, 
                 timezone, date_format, include_tax_in_profit, default_chart_range, 
-                visible_widgets, updated_at
+                visible_widgets, created_at, updated_at
             ) 
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
             ON CONFLICT (user_id) 
             DO UPDATE SET 
                 default_platform     = EXCLUDED.default_platform,
@@ -2187,20 +2241,23 @@ async def update_user_settings(
         """,
             user_id,
             settings.default_platform,
-            settings.custom_tags,
+            json.dumps(settings.custom_tags),
             settings.currency_format,
             settings.theme,
             settings.timezone,
             settings.date_format,
             settings.include_tax_in_profit,
             settings.default_chart_range,
-            settings.visible_widgets,
+            json.dumps(settings.visible_widgets),
         )
-        return {"message": "Settings updated successfully"}
+        
+        return {"message": "Settings updated successfully", "timestamp": datetime.now().isoformat()}
+        
+    except HTTPException:
+        raise
     except Exception as e:
         logging.error(f"Error updating user settings: {e}")
         raise HTTPException(status_code=500, detail="Failed to update settings")
-
 
 @app.post("/api/portfolio/balance")
 async def update_starting_balance(
@@ -2330,88 +2387,16 @@ async def bulk_edit_trades(
 
 @app.get("/api/export/trades")
 async def export_trades(
-    format: str = "csv", user_id: str = Depends(get_current_user), conn=Depends(get_db)
+    format: str = Query("csv", regex="^(csv|json)$"),
+    user_id: str = Depends(get_current_user), 
+    conn=Depends(get_db)
 ):
-    rows = await conn.fetch(
-        "SELECT * FROM trades WHERE user_id=$1 ORDER BY timestamp DESC", user_id
-    )
-    data = [dict(r) for r in rows]
-    if format.lower() == "json":
-        blob = json.dumps(data, indent=2, default=str).encode()
-        return StreamingResponse(
-            io.BytesIO(blob),
-            media_type="application/json",
-            headers={"Content-Disposition": "attachment; filename=trades_export.json"},
-        )
-
-    output = io.StringIO()
-    if data:
-        writer = csv.DictWriter(output, fieldnames=data[0].keys())
-        writer.writeheader()
-        writer.writerows(data)
-
-    return StreamingResponse(
-        io.StringIO(output.getvalue()),
-        media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=trades_export.csv"},
-    )
-
-
-@app.post("/api/import/trades")
-async def import_trades(
-    file: UploadFile = File(...),
-    user_id: str = Depends(get_current_user),
-    conn=Depends(get_db),
-):
-    contents = await file.read()
-    fname = (file.filename or "").lower()
-    if fname.endswith(".json"):
-        payload = json.loads(contents.decode("utf-8"))
-        trades_to_import = payload if isinstance(payload, list) else [payload]
-    elif fname.endswith(".csv"):
-        reader = csv.DictReader(io.StringIO(contents.decode("utf-8")))
-        trades_to_import = list(reader)
-    else:
-        raise HTTPException(status_code=400, detail="Unsupported file format")
-
-    imported_count = 0
-    errors: list[str] = []
-
-    for t in trades_to_import:
-        try:
-            player = (t.get("player", "") or "").strip()
-            version = (t.get("version", "") or "").strip()
-            buy = parse_coin_amount(t.get("buy", 0))
-            sell = parse_coin_amount(t.get("sell", 0))
-            quantity = int(t.get("quantity", 1))
-            platform = (t.get("platform", "Console") or "").strip()
-            tag = (t.get("tag", "") or "").strip()
-
-            if not player or not version or buy <= 0 or sell <= 0:
-                errors.append(f"Invalid trade data: {t}")
-                continue
-
-            profit = (sell - buy) * quantity
-            ea_tax = int(round(sell * quantity * 0.05))
-
-            # Ensure trade_id exists for future update/delete operations
-            raw_tid = t.get("trade_id")
-            trade_id = None
-            if isinstance(raw_tid, (int, str)) and str(raw_tid).isdigit():
-                trade_id = int(raw_tid)
-            if trade_id is None:
-                base = int(time.time() * 1000)
-                trade_id = base + secrets.randbelow(1_000_000)
-
-            await conn.execute(
-                """
-                INSERT INTO trades (
-                    user_id, player, version, buy, sell, quantity, platform,
-                    profit, ea_tax, tag, timestamp, trade_id
-                )
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW(),$11)
-                """,
-                user_id,
+    """Export user trades with proper content-type headers"""
+    try:
+        rows = await conn.fetch(
+            """
+            SELECT 
+                trade_id,
                 player,
                 version,
                 buy,
@@ -2421,31 +2406,307 @@ async def import_trades(
                 profit,
                 ea_tax,
                 tag,
-                trade_id,
+                notes,
+                timestamp
+            FROM trades 
+            WHERE user_id=$1 
+            ORDER BY timestamp DESC
+            """, 
+            user_id
+        )
+        
+        if not rows:
+            # Return empty file for no data
+            if format.lower() == "json":
+                content = json.dumps([])
+                media_type = "application/json"
+                filename = "fut-trades-export.json"
+            else:
+                content = "No trades found"
+                media_type = "text/csv"
+                filename = "fut-trades-export.csv"
+                
+            return Response(
+                content=content,
+                media_type=media_type,
+                headers={"Content-Disposition": f"attachment; filename={filename}"}
             )
-            imported_count += 1
+
+        # Convert to list of dicts
+        data = []
+        for row in rows:
+            trade_dict = dict(row)
+            # Format timestamp for better readability
+            if trade_dict['timestamp']:
+                trade_dict['timestamp'] = trade_dict['timestamp'].isoformat()
+            data.append(trade_dict)
+
+        if format.lower() == "json":
+            content = json.dumps(data, indent=2, default=str)
+            return Response(
+                content=content,
+                media_type="application/json",
+                headers={"Content-Disposition": "attachment; filename=fut-trades-export.json"}
+            )
+        else:
+            # CSV export
+            output = io.StringIO()
+            if data:
+                fieldnames = [
+                    'trade_id', 'player', 'version', 'buy', 'sell', 'quantity',
+                    'platform', 'profit', 'ea_tax', 'tag', 'notes', 'timestamp'
+                ]
+                writer = csv.DictWriter(output, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(data)
+
+            return Response(
+                content=output.getvalue(),
+                media_type="text/csv",
+                headers={"Content-Disposition": "attachment; filename=fut-trades-export.csv"}
+            )
+            
+    except Exception as e:
+        logging.error(f"Export error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to export data")
+
+
+@app.post("/api/import/trades")
+async def import_trades(
+    file: UploadFile = File(...),
+    user_id: str = Depends(get_current_user),
+    conn=Depends(get_db),
+):
+    """Import trades with better error handling and validation"""
+    try:
+        if not file.filename:
+            raise HTTPException(status_code=400, detail="No file provided")
+            
+        contents = await file.read()
+        if not contents:
+            raise HTTPException(status_code=400, detail="File is empty")
+            
+        fname = file.filename.lower()
+        
+        # Parse file based on extension
+        try:
+            if fname.endswith(".json"):
+                payload = json.loads(contents.decode("utf-8"))
+                trades_to_import = payload if isinstance(payload, list) else [payload]
+            elif fname.endswith(".csv"):
+                csv_content = contents.decode("utf-8")
+                reader = csv.DictReader(io.StringIO(csv_content))
+                trades_to_import = list(reader)
+            else:
+                raise HTTPException(status_code=400, detail="Unsupported file format. Use JSON or CSV.")
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="Invalid JSON format")
+        except UnicodeDecodeError:
+            raise HTTPException(status_code=400, detail="File encoding not supported. Use UTF-8.")
         except Exception as e:
-            errors.append(f"Error importing trade {t}: {str(e)}")
+            raise HTTPException(status_code=400, detail=f"Failed to parse file: {str(e)}")
 
-    return {
-        "message": f"Successfully imported {imported_count} trades",
-        "imported_count": imported_count,
-        "errors": errors[:10],
-    }
+        if not trades_to_import:
+            raise HTTPException(status_code=400, detail="No trades found in file")
 
+        imported_count = 0
+        errors = []
+        skipped_count = 0
+
+        for i, trade_data in enumerate(trades_to_import):
+            try:
+                # Validate required fields
+                player = (trade_data.get("player", "") or "").strip()
+                version = (trade_data.get("version", "") or "Standard").strip()
+                
+                if not player:
+                    errors.append(f"Row {i+1}: Missing player name")
+                    continue
+                
+                # Parse numeric values
+                try:
+                    buy = parse_coin_amount(trade_data.get("buy", 0))
+                    sell = parse_coin_amount(trade_data.get("sell", 0))
+                    quantity = int(trade_data.get("quantity", 1))
+                except (ValueError, TypeError):
+                    errors.append(f"Row {i+1}: Invalid numeric values")
+                    continue
+
+                if buy <= 0 or sell <= 0 or quantity <= 0:
+                    errors.append(f"Row {i+1}: Buy, sell, and quantity must be positive")
+                    continue
+
+                platform = (trade_data.get("platform", "Console") or "Console").strip()
+                tag = (trade_data.get("tag", "") or "").strip()
+                notes = (trade_data.get("notes", "") or "").strip()
+
+                # Calculate profit and tax
+                profit = (sell - buy) * quantity
+                ea_tax = int(round(sell * quantity * 0.05))
+
+                # Handle trade_id
+                trade_id = None
+                raw_tid = trade_data.get("trade_id")
+                if raw_tid and str(raw_tid).isdigit():
+                    trade_id = int(raw_tid)
+                    
+                    # Check if trade_id already exists
+                    existing = await conn.fetchval(
+                        "SELECT 1 FROM trades WHERE user_id=$1 AND trade_id=$2", 
+                        user_id, trade_id
+                    )
+                    if existing:
+                        skipped_count += 1
+                        continue  # Skip duplicates
+                        
+                if trade_id is None:
+                    # Generate unique trade_id
+                    base = int(time.time() * 1000)
+                    trade_id = base + secrets.randbelow(1_000_000)
+                    
+                    # Ensure uniqueness
+                    while await conn.fetchval("SELECT 1 FROM trades WHERE user_id=$1 AND trade_id=$2", user_id, trade_id):
+                        trade_id = base + secrets.randbelow(1_000_000)
+
+                # Parse timestamp if provided
+                timestamp = None
+                if trade_data.get("timestamp"):
+                    try:
+                        timestamp = datetime.fromisoformat(trade_data["timestamp"].replace("Z", "+00:00"))
+                    except:
+                        timestamp = None
+                
+                if not timestamp:
+                    timestamp = datetime.now(timezone.utc)
+
+                # Insert trade
+                await conn.execute(
+                    """
+                    INSERT INTO trades (
+                        user_id, player, version, buy, sell, quantity, platform,
+                        profit, ea_tax, tag, notes, timestamp, trade_id
+                    )
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+                    """,
+                    user_id, player, version, buy, sell, quantity, platform,
+                    profit, ea_tax, tag, notes, timestamp, trade_id
+                )
+                imported_count += 1
+                
+            except Exception as e:
+                errors.append(f"Row {i+1}: {str(e)}")
+                continue
+
+        # Prepare response
+        response = {
+            "message": f"Import completed: {imported_count} trades imported",
+            "imported_count": imported_count,
+            "skipped_count": skipped_count,
+            "error_count": len(errors),
+            "total_processed": len(trades_to_import)
+        }
+        
+        if errors:
+            response["errors"] = errors[:20]  # Limit error list
+            response["message"] += f", {len(errors)} errors"
+            
+        if skipped_count:
+            response["message"] += f", {skipped_count} duplicates skipped"
+
+        return response
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Import trades error: {e}")
+        raise HTTPException(status_code=500, detail="Import failed")
 
 @app.delete("/api/data/delete-all")
 async def delete_all_user_data(
-    confirm: bool = False, user_id: str = Depends(get_current_user), conn=Depends(get_db)
+    confirm: bool = Query(False),
+    user_id: str = Depends(get_current_user), 
+    conn=Depends(get_db)
 ):
+    """Delete all user data with confirmation"""
     if not confirm:
-        raise HTTPException(status_code=400, detail="Confirmation required")
-    res = await conn.execute("DELETE FROM trades WHERE user_id=$1", user_id)
-    deleted = int(res.split()[-1]) if res.startswith("DELETE ") else 0
-    await conn.execute(
-        "UPDATE portfolio SET starting_balance = 0 WHERE user_id=$1", user_id
-    )
-    return {"message": "All data deleted successfully", "trades_deleted": deleted}
+        raise HTTPException(status_code=400, detail="Confirmation required. Add ?confirm=true")
+
+    try:
+        # Start a transaction to ensure atomicity
+        async with conn.transaction():
+            # Delete trades
+            trades_result = await conn.execute("DELETE FROM trades WHERE user_id=$1", user_id)
+            trades_deleted = int(trades_result.split()[-1]) if trades_result.startswith("DELETE ") else 0
+            
+            # Delete goals
+            goals_result = await conn.execute("DELETE FROM trading_goals WHERE user_id=$1", user_id)
+            goals_deleted = int(goals_result.split()[-1]) if goals_result.startswith("DELETE ") else 0
+            
+            # Reset portfolio
+            await conn.execute(
+                "UPDATE portfolio SET starting_balance = 0 WHERE user_id=$1", user_id
+            )
+            
+            # Delete settings (optional - user might want to keep preferences)
+            settings_result = await conn.execute("DELETE FROM usersettings WHERE user_id=$1", user_id)
+            settings_deleted = int(settings_result.split()[-1]) if settings_result.startswith("DELETE ") else 0
+
+        return {
+            "message": "All data deleted successfully",
+            "details": {
+                "trades_deleted": trades_deleted,
+                "goals_deleted": goals_deleted,
+                "settings_reset": settings_deleted > 0,
+                "portfolio_reset": True
+            },
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        logging.error(f"Delete all data error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to delete data")
+
+@app.get("/api/data/summary")
+async def get_data_summary(
+    user_id: str = Depends(get_current_user), 
+    conn=Depends(get_db)
+):
+    """Get summary of user's data for the settings page"""
+    try:
+        # Count trades
+        trades_count = await conn.fetchval("SELECT COUNT(*) FROM trades WHERE user_id=$1", user_id)
+        
+        # Count goals
+        goals_count = await conn.fetchval("SELECT COUNT(*) FROM trading_goals WHERE user_id=$1", user_id)
+        
+        # Get portfolio info
+        portfolio = await conn.fetchrow("SELECT starting_balance FROM portfolio WHERE user_id=$1", user_id)
+        
+        # Get date range of trades
+        date_range = await conn.fetchrow(
+            "SELECT MIN(timestamp) as earliest, MAX(timestamp) as latest FROM trades WHERE user_id=$1", 
+            user_id
+        )
+        
+        # Get total profit
+        profit_info = await conn.fetchrow(
+            "SELECT COALESCE(SUM(profit), 0) as total_profit, COALESCE(SUM(ea_tax), 0) as total_tax FROM trades WHERE user_id=$1", 
+            user_id
+        )
+
+        return {
+            "trades_count": int(trades_count or 0),
+            "goals_count": int(goals_count or 0),
+            "starting_balance": int(portfolio["starting_balance"]) if portfolio else 0,
+            "total_profit": int(profit_info["total_profit"]) if profit_info else 0,
+            "total_tax": int(profit_info["total_tax"]) if profit_info else 0,
+            "earliest_trade": date_range["earliest"].isoformat() if date_range and date_range["earliest"] else None,
+            "latest_trade": date_range["latest"].isoformat() if date_range and date_range["latest"] else None,
+        }
+        
+    except Exception as e:
+        logging.error(f"Data summary error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get data summary")
 
 
 @app.get("/api/search-players")
