@@ -146,12 +146,9 @@ async def _fetch_momentum_page(tf: str, page: int) -> str:
     return html
 
 # ---- Market summary (cached) -----------------------------------------------
-market_router = APIRouter()
+market_summary_router = APIRouter()
 
-_MARKET_SUMMARY_CACHE: dict[tuple[str, float, float], dict] = {}
-MARKET_SUMMARY_TTL = 90  # seconds
-
-@market_router.get("/api/market/summary")
+@market_summary_router.get("/api/market/summary")
 async def market_summary(tf: str = "24", rise: float = 5.0, fall: float = 5.0):
     """
     Quick snapshot of the market using FUT.GG momentum pages.
@@ -1047,13 +1044,20 @@ async def ext_add_trade(
     return {"ok": True}
 
 # ---- Router wiring (single, final) ----
-app.include_router(ai_router, prefix="/api/ai")
 app.include_router(auth_me_router)          # /api/auth/me
-app.include_router(market_router)           # /api/market/...
 app.include_router(trade_finder_router)     # /api/trade-finder...
 app.include_router(ext_router)              # /ext/...
 
-# Premium-only (hard gate) â mount at /api/smart-buy
+# Import-based market router (candles/indicators) from app/routers/market.py
+app.include_router(market_router)           # exposes /api/market/* FROM THE IMPORT
+
+# Local summary router (rename to avoid shadowing)
+app.include_router(market_summary_router)   # exposes /api/market/summary (defined in this file)
+
+# AI Engine — include ONCE with NO extra prefix (ai_engine.py already has prefix="/api/ai")
+app.include_router(ai_router)               # exposes /api/ai/*
+
+# Premium-only — mount at /api/smart-buy
 app.include_router(
     smart_buy_router,
     prefix="/api",
