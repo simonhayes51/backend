@@ -37,6 +37,8 @@ from app.routers.smart_buy import router as smart_buy_router
 from app.routers.trade_finder import router as trade_finder_router
 from app.routers.auth_me import router as auth_me_router
 from discord_manager import discord_manager
+from app.routers.market import router as market_router
+from app.routers.ai_engine import router as ai_router
 
 
 # ----------------- BOOTSTRAP -----------------
@@ -696,6 +698,8 @@ async def lifespan(app: FastAPI):
 # --- FastAPI app ---
 app = FastAPI(lifespan=lifespan)
 
+
+
 @app.get("/api/entitlements")
 async def get_entitlements(request: Request):
     """Get user's current entitlements with real-time validation"""
@@ -1043,6 +1047,7 @@ async def ext_add_trade(
     return {"ok": True}
 
 # ---- Router wiring (single, final) ----
+app.include_router(ai_router, prefix="/api/ai")
 app.include_router(auth_me_router)          # /api/auth/me
 app.include_router(market_router)           # /api/market/...
 app.include_router(trade_finder_router)     # /api/trade-finder...
@@ -1054,6 +1059,9 @@ app.include_router(
     prefix="/api",
     dependencies=[Depends(require_feature("smart_buy"))],
 )
+
+# AI Engine (new routes like /api/ai/suggestions, /api/ai/comments, etc.)
+app.include_router(ai_router, prefix="/api/ai")
 
 @app.get("/")
 async def root():
