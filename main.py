@@ -432,9 +432,11 @@ async def _solve_challenge(
 
     ok, reasons = _validate(picks, ch)
 
-    # ---------- 2) Minimal-cost upgrade to just clear min average ----------
     target_avg = ch.get("min_squad_rating")
-    if not ok and target_avg:
+    avg_rating = sum(p["rating"] for p in picks) / 11.0
+    
+    # Trigger upgrade if validation failed OR rating < required
+    if (not ok or (target_avg and avg_rating < target_avg)):
         target_total = int(target_avg) * 11
         current_total = sum(p["rating"] for p in picks)
         deficit = max(0, target_total - current_total)
