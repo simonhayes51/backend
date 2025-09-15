@@ -42,7 +42,7 @@ from app.routers.market import router as market_router
 from app.routers.ai_engine import router as ai_router
 
 
-# ----------------- BOOTSTRAP -----------------
+# ----------------- BOOTSTRAP ----------------- 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("app")
 load_dotenv()
