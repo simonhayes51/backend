@@ -37,6 +37,7 @@ from app.routers.smart_buy import router as smart_buy_router
 from app.routers.trade_finder import router as trade_finder_router
 from app.routers.auth_me import router as auth_me_router
 from discord_manager import discord_manager
+from app.db import get_db, get_pool
 from app.routers.market import router as market_router
 from app.routers.ai_engine import router as ai_router
 
@@ -1591,6 +1592,7 @@ async def list_watch_items(user_id: str = Depends(get_current_user)):
     except Exception as e:
         logging.exception("Watchlist GET error")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 
 @app.delete("/api/watchlist/{watch_id}")
@@ -3691,6 +3693,59 @@ try:
     logging.info("â Squad router loaded")
 except Exception as e:
     logging.warning("â ï¸ Squad router not loaded: %s", e)
+
+# ---------- Candle aggregation loop ----------
+ADVISORY_LOCK_KEY = 7741001  # prevents duplicate loops if you scale
+
+@app.on_event("startup")
+async def _bg_aggregator():
+    async def loop():
+        pool = await get_pool()
+        await asyncio.sleep(5)
+        while True:
+            try:
+                async with pool.acquire() as db:
+                    got = await db.fetchval("SELECT pg_try_advisory_lock($1)", ADVISORY_LOCK_KEY)
+                    if got:
+                        try:
+                            await aggregate_all_timeframes(db, since_hours=48)
+                        finally:
+                            await db.execute("SELECT pg_advisory_unlock($1)", ADVISORY_LOCK_KEY)
+            except Exception as e:
+                print("aggregate error:", e)
+            await asyncio.sleep(60)
+    asyncio.create_task(loop())
+
+# ---------- Global error handler (nicer 500s) ----------
+@app.exception_handler(Exception)
+async def _any_error(request: Request, exc: Exception):
+    import traceback; traceback.print_exc()
+    return JSONResponse(status_code=500, content={"path": str(request.url), "error": str(exc)})
+
+# ---------- Tiny probes (remove later) ----------
+_probe = APIRouter()
+
+@_probe.get("/__whichdb")
+async def whichdb(db=Depends(get_db)):
+    return {
+        "current_database": await db.fetchval("SELECT current_database()"),
+        "current_schema": await db.fetchval("SELECT current_schema()"),
+        "search_path": await db.fetchval("SHOW search_path"),
+    }
+
+@_probe.get("/__has_candles")
+async def has_candles(player_card_id: str, platform: str = "ps", db=Depends(get_db)):
+    cnt = await db.fetchval(
+        "SELECT COUNT(*) FROM public.fut_candles WHERE player_card_id=$1 AND platform=$2",
+        player_card_id, platform
+    )
+    return {"player_card_id": player_card_id, "platform": platform, "rows": cnt}
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
+
+app.include_router(_probe)
 
 if __name__ == "__main__":
     import uvicorn
