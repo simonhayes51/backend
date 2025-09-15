@@ -16,14 +16,14 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is required")
 
-# Platforms to record in history. FUT.GG endpoint isn't per-platform,
-# but we store the same snapshot under each for convenience.
+# Platforms to log (even though FUT.GG isn't per-platform,
+# we still store one tick per platform so the rest of the app is uniform)
 PLATFORMS = [p.strip().lower() for p in os.getenv("PLATFORMS", "ps").split(",") if p.strip()]
 
 # Tuning knobs
 CONCURRENCY = int(os.getenv("REFRESH_CONCURRENCY", "16"))
 BATCH_SIZE  = int(os.getenv("REFRESH_BATCH_SIZE", "500"))
-SLEEP_SECS  = int(os.getenv("REFRESH_INTERVAL_SEC", "1800"))  # 30 minutes
+SLEEP_SECS  = int(os.getenv("REFRESH_INTERVAL_SEC", "1800"))  # default 30m; try 300 (5m) for “livelier”
 
 FUTGG_PRICE_URL = "https://www.fut.gg/api/fut/player-prices/26/{card_id}"
 HEADERS = {
@@ -34,35 +34,24 @@ HEADERS = {
     "Origin": "https://www.fut.gg",
 }
 
-# ----------------------- migrations (TEXT ids, TEXT price, TEXT platform) -----------------------
+# ----------------------- migrations (adds ticks+candles) -----------------------
 DDL_STMTS = [
-    # Ensure fut_players exists (minimal) — harmless if already present.
+    # minimal fut_players (keeps your existing columns; we won't drop anything)
     """
-    CREATE TABLE IF NOT EXISTS fut_players (
+    CREATE TABLE IF NOT EXISTS public.fut_players (
         card_id TEXT PRIMARY KEY
     );
     """,
-    # Ensure snapshot columns (TEXT price, TIMESTAMPTZ price_updated_at).
+    # ensure snapshot columns exist; keep TEXT price for backward-compat
     """
-    ALTER TABLE fut_players
+    ALTER TABLE public.fut_players
         ADD COLUMN IF NOT EXISTS price TEXT,
+        ADD COLUMN IF NOT EXISTS price_num BIGINT,
         ADD COLUMN IF NOT EXISTS price_updated_at TIMESTAMPTZ;
     """,
-    # Coerce fut_players.price to TEXT if created differently earlier.
+    # history table (your existing one; TEXT columns are fine)
     """
-    DO $$
-    BEGIN
-      IF EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_name='fut_players' AND column_name='price' AND data_type <> 'text'
-      ) THEN
-        EXECUTE 'ALTER TABLE fut_players ALTER COLUMN price TYPE TEXT USING price::text';
-      END IF;
-    END$$;
-    """,
-    # History table: everything TEXT except timestamp.
-    """
-    CREATE TABLE IF NOT EXISTS fut_prices_history (
+    CREATE TABLE IF NOT EXISTS public.fut_prices_history (
         id BIGSERIAL PRIMARY KEY,
         card_id  TEXT NOT NULL,
         platform TEXT NOT NULL,
@@ -70,35 +59,38 @@ DDL_STMTS = [
         captured_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     """,
+    "CREATE INDEX IF NOT EXISTS idx_prices_history_card_time ON public.fut_prices_history(card_id, platform, captured_at DESC);",
+
+    # --- NEW: ticks (what charts/AI want as the raw feed) ---
     """
-    CREATE INDEX IF NOT EXISTS idx_prices_history_card_time
-      ON fut_prices_history(card_id, platform, captured_at DESC);
+    CREATE TABLE IF NOT EXISTS public.fut_ticks (
+        id BIGSERIAL PRIMARY KEY,
+        player_card_id TEXT NOT NULL REFERENCES public.fut_players(card_id) ON DELETE CASCADE,
+        platform TEXT NOT NULL CHECK (platform IN ('ps','xbox')),
+        ts TIMESTAMPTZ NOT NULL,
+        price INT NOT NULL
+    );
     """,
-    # Coerce history columns if they were created with other types.
+    "CREATE INDEX IF NOT EXISTS fut_ticks_player_idx ON public.fut_ticks (player_card_id, platform, ts);",
+
+    # --- NEW: candles (OHLC) ---
     """
-    DO $$
-    BEGIN
-      IF EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_name='fut_prices_history' AND column_name='card_id' AND data_type <> 'text'
-      ) THEN
-        EXECUTE 'ALTER TABLE fut_prices_history ALTER COLUMN card_id TYPE TEXT USING card_id::text';
-      END IF;
-
-      IF EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_name='fut_prices_history' AND column_name='platform' AND data_type <> 'text'
-      ) THEN
-        EXECUTE 'ALTER TABLE fut_prices_history ALTER COLUMN platform TYPE TEXT USING platform::text';
-      END IF;
-
-      IF EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_name='fut_prices_history' AND column_name='price' AND data_type <> 'text'
-      ) THEN
-        EXECUTE 'ALTER TABLE fut_prices_history ALTER COLUMN price TYPE TEXT USING price::text';
-      END IF;
-    END$$;
+    CREATE TABLE IF NOT EXISTS public.fut_candles (
+        id BIGSERIAL PRIMARY KEY,
+        player_card_id TEXT NOT NULL REFERENCES public.fut_players(card_id) ON DELETE CASCADE,
+        platform TEXT NOT NULL CHECK (platform IN ('ps','xbox')),
+        timeframe TEXT NOT NULL,
+        open_time TIMESTAMPTZ NOT NULL,
+        open  INT NOT NULL,
+        high  INT NOT NULL,
+        low   INT NOT NULL,
+        close INT NOT NULL,
+        volume INT NOT NULL DEFAULT 0
+    );
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS fut_candles_unq
+      ON public.fut_candles (player_card_id, platform, timeframe, open_time);
     """,
 ]
 
@@ -106,25 +98,21 @@ async def run_migrations(pool: asyncpg.Pool):
     async with pool.acquire() as conn:
         for stmt in DDL_STMTS:
             await conn.execute(stmt)
-    logging.info("Migrations applied (idempotent; TEXT ids/prices/platform).")
+    logging.info("Migrations applied (players, history, ticks, candles).")
 
 # ----------------------- fetching -----------------------
 async def _fetch_one(session: aiohttp.ClientSession, card_id: str) -> Optional[str]:
-    """
-    Returns the price as STRING (for TEXT storage), or None.
-    """
     url = FUTGG_PRICE_URL.format(card_id=card_id)
     try:
         async with session.get(url, timeout=15) as r:
             if r.status != 200:
                 return None
             data = await r.json()
-            current = (data.get("data") or {}).get("currentPrice") or {}
-            price = current.get("price")
+            cur = (data.get("data") or {}).get("currentPrice") or {}
+            price = cur.get("price")
             if price is None:
                 return None
-            # Normalise to string regardless of type
-            return str(price)
+            return str(price)  # always return TEXT
     except Exception:
         return None
 
@@ -134,48 +122,94 @@ async def _fetch_prices_for_ids(card_ids: List[str]) -> Dict[str, str]:
     async with aiohttp.ClientSession(headers=HEADERS) as sess:
         async def worker(cid: str):
             async with sem:
-                price_s = await _fetch_one(sess, cid)
-                if isinstance(price_s, str) and price_s.strip():
-                    out[cid] = price_s.strip()
+                p = await _fetch_one(sess, cid)
+                if isinstance(p, str) and p.strip():
+                    out[cid] = p.strip()
         tasks = [asyncio.create_task(worker(cid)) for cid in card_ids]
         await asyncio.gather(*tasks, return_exceptions=True)
     return out
 
 # ----------------------- db helpers -----------------------
 async def _load_card_ids(conn: asyncpg.Connection) -> List[str]:
-    rows = await conn.fetch("SELECT card_id FROM fut_players")
+    rows = await conn.fetch("SELECT card_id FROM public.fut_players")
     return [str(r["card_id"]) for r in rows if r["card_id"] is not None]
 
-async def _update_snapshot(conn: asyncpg.Connection, prices: List[Tuple[str, str]]):
-    """
-    prices: List of (price_text, card_id_text)
-    """
+async def _update_snapshot(conn: asyncpg.Connection, pairs: List[Tuple[str, str]]):
+    # pairs: (price_text, card_id)
     sql = """
-        UPDATE fut_players
+        UPDATE public.fut_players
         SET price = $1::text,
+            price_num = NULLIF($1, '')::bigint,
             price_updated_at = NOW()
         WHERE card_id = $2::text
     """
-    await conn.executemany(sql, prices)
+    await conn.executemany(sql, pairs)
 
 async def _insert_history(conn: asyncpg.Connection, rows: List[Tuple[str, str, str]]):
-    """
-    rows: List of (card_id_text, platform_text, price_text)
-    """
+    # rows: (card_id, platform, price_text)
     sql = """
-        INSERT INTO fut_prices_history (card_id, platform, price, captured_at)
+        INSERT INTO public.fut_prices_history (card_id, platform, price, captured_at)
         VALUES ($1::text, $2::text, $3::text, NOW())
     """
     await conn.executemany(sql, rows)
+
+async def _insert_ticks(conn: asyncpg.Connection, rows: List[Tuple[str, str, int]]):
+    # rows: (player_card_id, platform, price_int)
+    sql = """
+        INSERT INTO public.fut_ticks (player_card_id, platform, ts, price)
+        VALUES ($1::text, $2::text, NOW(), $3::int)
+    """
+    await conn.executemany(sql, rows)
+
+async def _rollup_15m(conn: asyncpg.Connection, since_hours: int = 8):
+    """
+    Rebuild/refresh 15m candles for the recent window from ticks.
+    Idempotent via ON CONFLICT.
+    """
+    await conn.execute(
+        """
+        WITH t AS (
+          SELECT
+            player_card_id,
+            platform,
+            to_timestamp(floor(extract(epoch FROM ts) / 900) * 900) AT TIME ZONE 'UTC' AS bucket,
+            ts, price
+          FROM public.fut_ticks
+          WHERE ts >= NOW() - ($1 || ' hours')::interval
+        ),
+        agg AS (
+          SELECT
+            player_card_id,
+            platform,
+            bucket AS open_time,
+            (array_agg(price ORDER BY ts ASC))[1]  AS open,
+            max(price)                             AS high,
+            min(price)                             AS low,
+            (array_agg(price ORDER BY ts ASC))[array_length(array_agg(price),1)] AS close,
+            count(*)                               AS volume
+          FROM t
+          GROUP BY player_card_id, platform, bucket
+        )
+        INSERT INTO public.fut_candles (player_card_id, platform, timeframe, open_time, open, high, low, close, volume)
+        SELECT player_card_id, platform, '15m', open_time, open, high, low, close, volume
+        FROM agg
+        ON CONFLICT (player_card_id, platform, timeframe, open_time)
+        DO UPDATE SET open=EXCLUDED.open, high=EXCLUDED.high, low=EXCLUDED.low,
+                      close=EXCLUDED.close, volume=EXCLUDED.volume;
+        """,
+        since_hours,
+    )
 
 # ----------------------- refresh pass -----------------------
 async def _refresh_once(pool: asyncpg.Pool):
     async with pool.acquire() as conn:
         card_ids = await _load_card_ids(conn)
+
     total = len(card_ids)
     if total == 0:
         logging.warning("No card_ids found in fut_players.")
         return
+
     logging.info("Starting refresh for %s cards on platforms=%s ...", total, ",".join(PLATFORMS))
 
     prices_map: Dict[str, str] = {}
@@ -189,24 +223,38 @@ async def _refresh_once(pool: asyncpg.Pool):
         logging.warning("No prices fetched this pass.")
         return
 
-    # Update fut_players snapshot (TEXT price + TEXT id)
-    pairs_snapshot: List[Tuple[str, str]] = [(str(price_text), str(cid)) for cid, price_text in prices_map.items()]
+    # 1) Update fut_players snapshot (TEXT + price_num BIGINT)
+    pairs_snapshot: List[Tuple[str, str]] = [(p, cid) for cid, p in prices_map.items()]
     async with pool.acquire() as conn:
         await _update_snapshot(conn, pairs_snapshot)
 
-    # Append history for each platform (all TEXT)
-    history_rows: List[Tuple[str, str, str]] = []
-    for cid, price_text in prices_map.items():
+    # 2) Append history (TEXT) and 3) Append ticks (INT) for each platform
+    hist_rows: List[Tuple[str, str, str]] = []
+    tick_rows: List[Tuple[str, str, int]] = []
+
+    for cid, ptxt in prices_map.items():
+        # safe integer cast; skip bad values
+        try:
+            pint = int(ptxt.replace(",", "").strip())
+        except Exception:
+            continue
         for plat in PLATFORMS:
-            history_rows.append((str(cid), str(plat).lower(), str(price_text)))
+            hist_rows.append((cid, plat, ptxt))
+            tick_rows.append((cid, plat, pint))
 
     async with pool.acquire() as conn:
-        for j in range(0, len(history_rows), 5000):
-            await _insert_history(conn, history_rows[j:j+5000])
+        # history in chunks
+        for j in range(0, len(hist_rows), 5000):
+            await _insert_history(conn, hist_rows[j:j+5000])
+        # ticks in chunks
+        for j in range(0, len(tick_rows), 5000):
+            await _insert_ticks(conn, tick_rows[j:j+5000])
+        # roll up last N hours into 15m candles (tune the window if you like)
+        await _rollup_15m(conn, since_hours=48)
 
     logging.info(
-        "Updated fut_players (%s) and appended %s history rows.",
-        len(pairs_snapshot), len(history_rows)
+        "Updated fut_players (%s), wrote %s history rows and %s ticks, rolled 15m candles.",
+        len(pairs_snapshot), len(hist_rows), len(tick_rows),
     )
 
 # ----------------------- main loop -----------------------
