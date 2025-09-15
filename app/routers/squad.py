@@ -26,7 +26,7 @@ async def _fallback_price_futgg(card_id: int, platform: str = "ps") -> int | Non
                 data = await r.json()
                 # data format seen previously: {"data":{"currentPrice":{"price": 40000, ...}, ...}}
                 price = data.get("data", {}).get("currentPrice", {}).get("price")
-"
+
                 if isinstance(price, int):
                     return price
     except Exception:
