@@ -18,6 +18,11 @@ from types import SimpleNamespace
 from urllib.parse import urlencode
 from contextlib import asynccontextmanager, suppress
 from typing import Any, Dict, List, Optional, Tuple
+try:
+    from typing import Literal
+except ImportError:
+    from typing_extensions import Literal
+
 import datetime as dt
 from collections import Counter
 from dotenv import load_dotenv
