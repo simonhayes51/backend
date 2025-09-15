@@ -1,5 +1,4 @@
 # app/services/indicators.py
-
 from statistics import mean, pstdev
 
 def ema(series, period):
