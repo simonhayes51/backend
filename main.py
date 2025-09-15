@@ -406,12 +406,11 @@ async def _solve_challenge(
     if len(slots) != 11:
         return {"ok": False, "error": "invalid_positions"}
 
-    # ---------- 1) Cheapest baseline XI (primary position only) ----------
+    # ---------- 1) Cheapest baseline XI ----------
     picks: List[Dict[str, Any]] = []
-    used_ids: set = set()
+    used_ids: set[int] = set()
 
     for req_pos in slots:
-        # cheap-first for baseline
         cands = await _fetch_candidates_for_slot(
             con, req_pos, ch,
             account_id, use_club_only, prefer_untradeable,
@@ -430,50 +429,48 @@ async def _solve_challenge(
         used_ids.add(chosen["card_id"])
         picks.append(chosen)
 
+    # ---------- 2) Upgrade to meet min average (cheapest, closest above) ----------
     ok, reasons = _validate(picks, ch)
-
     target_avg = ch.get("min_squad_rating")
-    avg_rating = sum(p["rating"] for p in picks) / 11.0
-    
-    # Trigger upgrade if validation failed OR rating < required
-    if (not ok or (target_avg and avg_rating < target_avg)):
-        target_total = int(target_avg) * 11
-        current_total = sum(p["rating"] for p in picks)
-        deficit = max(0, target_total - current_total)
+    curr_total_rating = sum(p["rating"] for p in picks)
+    curr_avg = curr_total_rating / 11.0
+
+    # Trigger upgrade if validation failed OR average below target.
+    if (not ok) or (target_avg and curr_avg < target_avg):
+        target_total = (int(target_avg) * 11) if target_avg else curr_total_rating
+        deficit = max(0, target_total - curr_total_rating)
 
         if deficit > 0:
-            # Build upgrade choices per slot
+            # Build upgrade option sets per slot
             per_slot_choices: List[List[Dict[str, Any]]] = []
-
             for i in range(11):
                 req_pos = picks[i]["used_pos"]
                 curr_rating = picks[i]["rating"]
                 curr_price  = picks[i]["price"]
 
-                # rating-first pool for upgrades (kept modest for perf)
+                # rating-first pool for upgrades
                 upgrade_pool = await _fetch_candidates_for_slot(
                     con, req_pos, ch,
                     account_id, use_club_only, prefer_untradeable,
-                    limit=max(80, max_candidates_per_slot),  # tune if needed
+                    limit=max(80, max_candidates_per_slot),
                     mode="upgrade",  # rating DESC, then price
                 )
 
-                opts = [{"delta": 0, "extra": 0, "cand": None}]  # option: keep current
-
+                opts = [{"delta": 0, "extra": 0, "cand": None}]  # keep current
                 for c in upgrade_pool:
                     if c["card_id"] == picks[i]["card_id"]:
                         continue
                     delta = max(0, c["rating"] - curr_rating)
                     extra = (c["price"] - curr_price)
-                    # Skip strictly worse (no gain and not cheaper)
+                    # skip strictly worse (no rating gain and not cheaper)
                     if delta == 0 and extra >= 0:
                         continue
-                    # Light prune of absurdly pricey swaps
+                    # soft prune absurd outliers
                     if extra is not None and extra > 2_000_000:
                         continue
                     opts.append({"delta": delta, "extra": extra, "cand": c})
 
-                # Keep the best few by cost efficiency to shrink DP state
+                # keep best few options by efficiency to keep DP tiny
                 def key_fn(o):
                     return (
                         (o["extra"] / o["delta"]) if o["delta"] > 0 else (o["extra"] if o["extra"] >= 0 else -1e9),
@@ -483,18 +480,19 @@ async def _solve_challenge(
                 opts = sorted(opts, key=key_fn)[:30]
                 per_slot_choices.append(opts)
 
-            # DP: min extra cost to reach >= deficit; tie-break on smallest surplus
+            # DP over rating gain to reach >= deficit with min extra cost,
+            # then choose the smallest surplus above the target.
             INF = 10**15
-            SURPLUS_CAP = 30                 # how far above target we consider
+            SURPLUS_CAP = 30
             MAX_R = deficit + SURPLUS_CAP
 
-            dp_cost = [INF] * (MAX_R + 1)    # min extra cost to get exactly r rating-gain
-            dp_prev = [None] * (MAX_R + 1)   # backpointer: (slot_idx, choice_idx, prev_r)
+            dp_cost = [INF] * (MAX_R + 1)      # min extra cost for exact gain r
+            dp_prev: List[Optional[tuple]] = [None] * (MAX_R + 1)
             dp_cost[0] = 0
 
             for slot_idx in range(11):
                 next_cost = [INF] * (MAX_R + 1)
-                next_prev = [None] * (MAX_R + 1)
+                next_prev: List[Optional[tuple]] = [None] * (MAX_R + 1)
                 for r in range(MAX_R + 1):
                     base = dp_cost[r]
                     if base == INF:
@@ -509,7 +507,7 @@ async def _solve_challenge(
                             next_prev[nr] = (slot_idx, choice_idx, r)
                 dp_cost, dp_prev = next_cost, next_prev
 
-            # pick cheapest r >= deficit; if tie, choose the closest above (smallest r)
+            # pick cheapest r ≥ deficit; tie-breaker: smallest r (closest above target)
             best_r, best_cost = None, INF
             for r in range(deficit, MAX_R + 1):
                 if dp_cost[r] < best_cost:
@@ -517,6 +515,7 @@ async def _solve_challenge(
                 elif dp_cost[r] == best_cost and best_r is not None and r < best_r:
                     best_r = r
 
+            # Reconstruct and apply upgrades
             if best_r is not None and best_cost < INF:
                 r = best_r
                 chosen_idx = [0] * 11
@@ -528,7 +527,6 @@ async def _solve_challenge(
                     chosen_idx[slot_idx] = choice_idx
                     r = prev_r
 
-                # Apply the chosen upgrades
                 for i in range(11):
                     opt = per_slot_choices[i][chosen_idx[i]]
                     if opt["cand"] is not None:
@@ -569,6 +567,7 @@ async def _solve_challenge(
         ],
         "price_snapshot": dt.datetime.utcnow(),
     }
+
 
 
 # Time helpers
