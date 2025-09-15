@@ -40,6 +40,7 @@ from discord_manager import discord_manager
 from app.db import get_db, get_pool
 from app.routers.market import router as market_router
 from app.routers.ai_engine import router as ai_router
+from app.routers.players import router as players_router
 
 
 # ----------------- BOOTSTRAP ----------------- 
@@ -1057,6 +1058,7 @@ app.include_router(market_summary_router)   # exposes /api/market/summary (defin
 
 # AI Engine — include ONCE with NO extra prefix (ai_engine.py already has prefix="/api/ai")
 app.include_router(ai_router)               # exposes /api/ai/*
+app.include_router(players_router)
 
 # Premium-only — mount at /api/smart-buy
 app.include_router(
