@@ -359,60 +359,43 @@ async def _fetch_candidates_for_slot(
     prefer_untradeable: bool,
     limit: int,
 ) -> List[Dict[str, Any]]:
-    band_sql = _band_filter_sql(ch.get("exact_bronze"), ch.get("exact_silver"), ch.get("exact_gold"))
+    # Bronze/Silver/Gold filters (optional)
+    band = []
+    if ch.get("exact_bronze"):
+        band.append("p.rating <= 64")
+    if ch.get("exact_silver"):
+        band.append("p.rating BETWEEN 65 AND 74")
+    if ch.get("exact_gold"):
+        band.append("p.rating >= 75")
+    band_sql = (" AND " + " AND ".join(band)) if band else ""
 
-    pos_match = """
-      (p.position = $1)
-      OR ($1 = ANY(p.alt_positions))
-      OR (p.altposition IS NOT NULL AND p.altposition = $1)
-    """ if ch.get("allow_alt_pos", True) else " (p.position = $1) "
-
+    # NOTE: No alt_positions/altposition in this MVP — add later once columns are confirmed
     sql = f"""
       SELECT
-        p.card_id, p.name, p.rating, p.position, p.alt_positions, p.altposition,
-        p.nation_id, p.league_id, p.club_id, p.nation, p.league, p.club,
-        p.rarity,
-        p.price_num,
-        ci.card_id IS NOT NULL AS in_club,
-        COALESCE(ci.tradeable, TRUE) AS tradeable
+        p.card_id, p.name, p.rating, p.position,
+        p.price_num
       FROM fut_players p
-      LEFT JOIN club_inventory ci
-        ON ci.card_id = p.card_id
-       AND ($2::bigint IS NOT NULL AND ci.account_id = $2)
-      WHERE ({pos_match})
+      WHERE p.position = $1
         {band_sql}
-        AND (p.price_num IS NOT NULL OR $3 = TRUE)
-        {"AND ci.card_id IS NOT NULL" if use_club_only else ""}
-      ORDER BY
-        CASE
-          WHEN ci.card_id IS NOT NULL AND (NOT COALESCE(ci.tradeable, TRUE) OR $4 = TRUE) THEN 0
-          WHEN p.price_num IS NULL THEN 999999999
-          ELSE p.price_num
-        END,
-        p.rating ASC
-      LIMIT $5
+        AND p.price_num IS NOT NULL
+      ORDER BY p.price_num ASC, p.rating ASC
+      LIMIT $2
     """
-    rows = await con.fetch(sql, req_pos, account_id, use_club_only, prefer_untradeable, limit)
+    rows = await con.fetch(sql, req_pos, limit)
 
     out = []
     for r in rows:
-        source = "club" if r["in_club"] else "market"
-        eff_price = 0 if (r["in_club"] and (prefer_untradeable or not r["tradeable"])) else (r["price_num"] or 999999999)
         out.append({
             "card_id": r["card_id"],
             "name": r["name"],
             "rating": r["rating"],
             "primary_pos": r["position"],
-            "alt_positions": r["alt_positions"],
-            "altposition": r["altposition"],
-            "nation_id": r["nation_id"], "league_id": r["league_id"], "club_id": r["club_id"],
-            "nation": r["nation"], "league": r["league"], "club": r["club"],
-            "rarity": r["rarity"],
-            "price": eff_price,
+            "price": r["price_num"] or 999999999,
             "raw_price": r["price_num"],
-            "source": source,
+            "source": "market",
         })
     return out
+
 
 async def _solve_challenge(
     con,
@@ -444,7 +427,7 @@ async def _solve_challenge(
                     ok_alt = (req_pos in c["alt_positions"])
                 if not ok_alt and c.get("altposition"):
                     ok_alt = (req_pos == c["altposition"])
-            if c["primary_pos"] == req_pos or ok_alt:
+            if c["primary_pos"] == req_pos:
                 chosen = {**c, "used_pos": req_pos}
                 break
         if not chosen:
