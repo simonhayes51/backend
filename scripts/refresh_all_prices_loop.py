@@ -16,15 +16,14 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is required")
 
-# Platforms to log (even though FUT.GG isn't per-platform,
-# we still store one tick per platform so the rest of the app is uniform)
+# Platforms to log
 PLATFORMS = [p.strip().lower() for p in os.getenv("PLATFORMS", "ps").split(",") if p.strip()]
 
-# Tuning knobs
-# Tuning knobs
-CONCURRENCY = int(os.getenv("REFRESH_CONCURRENCY", "32"))   # double concurrency
-BATCH_SIZE  = int(os.getenv("REFRESH_BATCH_SIZE", "1000"))  # double batch
-SLEEP_SECS  = int(os.getenv("REFRESH_INTERVAL_SEC", "300")) # run every 5 min
+# Tuning knobs (you set these higher)
+CONCURRENCY = int(os.getenv("REFRESH_CONCURRENCY", "32"))     # requests in parallel
+BATCH_SIZE  = int(os.getenv("REFRESH_BATCH_SIZE", "1000"))    # players per fetch chunk
+SLEEP_SECS  = int(os.getenv("REFRESH_INTERVAL_SEC", "300"))   # 5 minutes
+
 FUTGG_PRICE_URL = "https://www.fut.gg/api/fut/player-prices/26/{card_id}"
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
@@ -34,22 +33,19 @@ HEADERS = {
     "Origin": "https://www.fut.gg",
 }
 
-# ----------------------- migrations (adds ticks+candles) -----------------------
+# ----------------------- migrations -----------------------
 DDL_STMTS = [
-    # minimal fut_players (keeps your existing columns; we won't drop anything)
     """
     CREATE TABLE IF NOT EXISTS public.fut_players (
         card_id TEXT PRIMARY KEY
     );
     """,
-    # ensure snapshot columns exist; keep TEXT price for backward-compat
     """
     ALTER TABLE public.fut_players
         ADD COLUMN IF NOT EXISTS price TEXT,
         ADD COLUMN IF NOT EXISTS price_num BIGINT,
         ADD COLUMN IF NOT EXISTS price_updated_at TIMESTAMPTZ;
     """,
-    # history table (your existing one; TEXT columns are fine)
     """
     CREATE TABLE IF NOT EXISTS public.fut_prices_history (
         id BIGSERIAL PRIMARY KEY,
@@ -61,7 +57,7 @@ DDL_STMTS = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_prices_history_card_time ON public.fut_prices_history(card_id, platform, captured_at DESC);",
 
-    # --- NEW: ticks (what charts/AI want as the raw feed) ---
+    # ticks (raw feed)
     """
     CREATE TABLE IF NOT EXISTS public.fut_ticks (
         id BIGSERIAL PRIMARY KEY,
@@ -73,7 +69,7 @@ DDL_STMTS = [
     """,
     "CREATE INDEX IF NOT EXISTS fut_ticks_player_idx ON public.fut_ticks (player_card_id, platform, ts);",
 
-    # --- NEW: candles (OHLC) ---
+    # candles (OHLC)
     """
     CREATE TABLE IF NOT EXISTS public.fut_candles (
         id BIGSERIAL PRIMARY KEY,
@@ -102,7 +98,7 @@ async def run_migrations(pool: asyncpg.Pool):
 
 # ----------------------- fetching -----------------------
 async def _fetch_one(session: aiohttp.ClientSession, card_id: str) -> Optional[str]:
-    url = FUTGG_PRICE_URL.format(card_id=card_id)
+    url = FUTGG_PRICE_URL.format(card_id=str(card_id))
     try:
         async with session.get(url, timeout=15) as r:
             if r.status != 200:
@@ -112,7 +108,7 @@ async def _fetch_one(session: aiohttp.ClientSession, card_id: str) -> Optional[s
             price = cur.get("price")
             if price is None:
                 return None
-            return str(price)  # always return TEXT
+            return str(price)  # always TEXT
     except Exception:
         return None
 
@@ -122,20 +118,26 @@ async def _fetch_prices_for_ids(card_ids: List[str]) -> Dict[str, str]:
     async with aiohttp.ClientSession(headers=HEADERS) as sess:
         async def worker(cid: str):
             async with sem:
-                p = await _fetch_one(sess, cid)
+                p = await _fetch_one(sess, str(cid))
                 if isinstance(p, str) and p.strip():
-                    out[cid] = p.strip()
-        tasks = [asyncio.create_task(worker(cid)) for cid in card_ids]
+                    out[str(cid)] = p.strip()
+        tasks = [asyncio.create_task(worker(str(cid))) for cid in card_ids]
         await asyncio.gather(*tasks, return_exceptions=True)
     return out
 
 # ----------------------- db helpers -----------------------
 async def _load_card_ids(conn: asyncpg.Connection) -> List[str]:
     rows = await conn.fetch("SELECT card_id FROM public.fut_players")
+    # force TEXT everywhere (some rows could be numeric in DB)
     return [str(r["card_id"]) for r in rows if r["card_id"] is not None]
 
-async def _update_snapshot(conn: asyncpg.Connection, pairs: List[Tuple[str, str]]):
-    # pairs: (price_text, card_id)
+async def _update_snapshot(conn: asyncpg.Connection, prices: List[Tuple[str, str]]):
+    """
+    prices: List of (price_text, card_id_text)
+    """
+    # coerce to strings before binding (avoids "expected str, got int")
+    prices = [(str(price_text), str(card_id)) for price_text, card_id in prices]
+
     sql = """
         UPDATE public.fut_players
         SET price = $1::text,
@@ -143,10 +145,14 @@ async def _update_snapshot(conn: asyncpg.Connection, pairs: List[Tuple[str, str]
             price_updated_at = NOW()
         WHERE card_id = $2::text
     """
-    await conn.executemany(sql, pairs)
+    await conn.executemany(sql, prices)
 
 async def _insert_history(conn: asyncpg.Connection, rows: List[Tuple[str, str, str]]):
-    # rows: (card_id, platform, price_text)
+    """
+    rows: List of (card_id_text, platform_text, price_text)
+    """
+    rows = [(str(cid), str(plat), str(price)) for cid, plat, price in rows]
+
     sql = """
         INSERT INTO public.fut_prices_history (card_id, platform, price, captured_at)
         VALUES ($1::text, $2::text, $3::text, NOW())
@@ -154,14 +160,19 @@ async def _insert_history(conn: asyncpg.Connection, rows: List[Tuple[str, str, s
     await conn.executemany(sql, rows)
 
 async def _insert_ticks(conn: asyncpg.Connection, rows: List[Tuple[str, str, int]]):
-    # rows: (player_card_id, platform, price_int)
+    """
+    rows: List of (player_card_id_text, platform_text, price_int)
+    """
+    # player_card_id/platform must be TEXT; price must be INT
+    rows = [(str(cid), str(plat), int(price)) for cid, plat, price in rows]
+
     sql = """
         INSERT INTO public.fut_ticks (player_card_id, platform, ts, price)
         VALUES ($1::text, $2::text, NOW(), $3::int)
     """
     await conn.executemany(sql, rows)
 
-async def _rollup_15m(conn: asyncpg.Connection, since_hours: int = 8):
+async def _rollup_15m(conn: asyncpg.Connection, since_hours: int = 48):
     """
     Rebuild/refresh 15m candles for the recent window from ticks.
     Idempotent via ON CONFLICT.
@@ -224,7 +235,7 @@ async def _refresh_once(pool: asyncpg.Pool):
         return
 
     # 1) Update fut_players snapshot (TEXT + price_num BIGINT)
-    pairs_snapshot: List[Tuple[str, str]] = [(p, cid) for cid, p in prices_map.items()]
+    pairs_snapshot: List[Tuple[str, str]] = [(str(p), str(cid)) for cid, p in prices_map.items()]
     async with pool.acquire() as conn:
         await _update_snapshot(conn, pairs_snapshot)
 
@@ -233,14 +244,14 @@ async def _refresh_once(pool: asyncpg.Pool):
     tick_rows: List[Tuple[str, str, int]] = []
 
     for cid, ptxt in prices_map.items():
-        # safe integer cast; skip bad values
+        # safe integer cast for ticks; skip if not numeric
         try:
-            pint = int(ptxt.replace(",", "").strip())
+            pint = int(str(ptxt).replace(",", "").strip())
         except Exception:
             continue
         for plat in PLATFORMS:
-            hist_rows.append((cid, plat, ptxt))
-            tick_rows.append((cid, plat, pint))
+            hist_rows.append((str(cid), str(plat), str(ptxt)))
+            tick_rows.append((str(cid), str(plat), int(pint)))
 
     async with pool.acquire() as conn:
         # history in chunks
@@ -249,7 +260,7 @@ async def _refresh_once(pool: asyncpg.Pool):
         # ticks in chunks
         for j in range(0, len(tick_rows), 5000):
             await _insert_ticks(conn, tick_rows[j:j+5000])
-        # roll up last N hours into 15m candles (tune the window if you like)
+        # roll up last N hours into 15m candles
         await _rollup_15m(conn, since_hours=48)
 
     logging.info(
