@@ -1,3 +1,4 @@
+# app/routers/market.py
 from fastapi import APIRouter, Depends, HTTPException
 from typing import List, Dict, Any
 from app.db import get_db
@@ -17,14 +18,13 @@ async def get_candles(
         rows = await db.fetch(
             """
             SELECT open_time, open, high, low, close, volume
-            FROM fut_candles
+            FROM public.fut_candles
             WHERE player_card_id=$1 AND platform=$2 AND timeframe=$3
             ORDER BY open_time DESC
             LIMIT $4
             """,
             player_card_id, platform, timeframe, limit,
         )
-        # return ascending order by time (what chart libs expect)
         return [dict(r) for r in rows][::-1]
     except Exception as e:
         raise HTTPException(500, f"candles query failed: {e}")
@@ -36,11 +36,10 @@ async def get_indicators(
     timeframe: str = "15m",
     db=Depends(get_db),
 ) -> Dict[str, Any]:
-    # fetch candles directly (don’t call the other handler)
     rows = await db.fetch(
         """
         SELECT open_time, open, high, low, close, volume
-        FROM fut_candles
+        FROM public.fut_candles
         WHERE player_card_id=$1 AND platform=$2 AND timeframe=$3
         ORDER BY open_time ASC
         """,
