@@ -353,49 +353,40 @@ def _estimate_chem(assigns: List[Dict[str, Any]]) -> int:
 async def _fetch_candidates_for_slot(
     con,
     req_pos: str,
-    ch: Dict[str, Any],
-    account_id: Optional[int],
+    ch: dict,
+    account_id: int | None,
     use_club_only: bool,
     prefer_untradeable: bool,
     limit: int,
-) -> List[Dict[str, Any]]:
-    # Bronze/Silver/Gold filters (optional)
+    mode: str = "cheap",  # "cheap" -> price asc, "upgrade" -> rating desc then price
+) -> list[dict]:
     band = []
-    if ch.get("exact_bronze"):
-        band.append("p.rating <= 64")
-    if ch.get("exact_silver"):
-        band.append("p.rating BETWEEN 65 AND 74")
-    if ch.get("exact_gold"):
-        band.append("p.rating >= 75")
+    if ch.get("exact_bronze"): band.append("p.rating <= 64")
+    if ch.get("exact_silver"): band.append("p.rating BETWEEN 65 AND 74")
+    if ch.get("exact_gold"):   band.append("p.rating >= 75")
     band_sql = (" AND " + " AND ".join(band)) if band else ""
 
-    # NOTE: No alt_positions/altposition in this MVP — add later once columns are confirmed
+    order_clause = "p.price_num ASC, p.rating ASC" if mode == "cheap" else "p.rating DESC, p.price_num ASC"
+
     sql = f"""
-      SELECT
-        p.card_id, p.name, p.rating, p.position,
-        p.price_num
+      SELECT p.card_id, p.name, p.rating, p.position, p.price_num
       FROM fut_players p
       WHERE p.position = $1
         {band_sql}
         AND p.price_num IS NOT NULL
-      ORDER BY p.price_num ASC, p.rating ASC
+      ORDER BY {order_clause}
       LIMIT $2
     """
     rows = await con.fetch(sql, req_pos, limit)
-
-    out = []
-    for r in rows:
-        out.append({
-            "card_id": r["card_id"],
-            "name": r["name"],
-            "rating": r["rating"],
-            "primary_pos": r["position"],
-            "price": r["price_num"] or 999999999,
-            "raw_price": r["price_num"],
-            "source": "market",
-        })
-    return out
-
+    return [{
+        "card_id": r["card_id"],
+        "name": r["name"],
+        "rating": r["rating"],
+        "primary_pos": r["position"],
+        "price": r["price_num"] or 9_999_999,
+        "raw_price": r["price_num"],
+        "source": "market",
+    } for r in rows]
 
 async def _solve_challenge(
     con,
@@ -415,7 +406,10 @@ async def _solve_challenge(
 
     for req_pos in slots:
         cands = await _fetch_candidates_for_slot(
-            con, req_pos, ch, account_id, use_club_only, prefer_untradeable, max_candidates_per_slot
+            con, req_pos, ch,
+            account_id, use_club_only, prefer_untradeable,
+            max_candidates_per_slot + 1000,   # widen pool so stars are included
+            mode="upgrade"
         )
         chosen = None
         for c in cands:
