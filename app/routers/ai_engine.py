@@ -1,3 +1,4 @@
+# app/routers/ai_engine.py
 from fastapi import APIRouter, Depends
 from typing import Dict, Any
 from app.db import get_db
@@ -17,7 +18,7 @@ async def recommendations(
         rows = await db.fetch(
             """
             SELECT open_time, close
-            FROM fut_candles
+            FROM public.fut_candles
             WHERE player_card_id=$1 AND platform=$2 AND timeframe='15m'
             ORDER BY open_time ASC
             """,
@@ -27,15 +28,15 @@ async def recommendations(
         if len(data) < 20:
             return {"ok": False, "reason": "insufficient candles (need >= 20 x 15m)", "have": len(data)}
 
-        closes = [d["close"] for d in data]
-        curr = float(closes[-1])
+        closes = [float(d["close"]) for d in data]
+        curr = closes[-1]
         srt = sorted(closes)
         n = len(srt)
-        med7 = float(srt[n//2] if n % 2 else (srt[n//2-1] + srt[n//2]) / 2)
+        med7 = (srt[n//2] if n % 2 else (srt[n//2-1] + srt[n//2]) / 2)
 
         dmed = _pct(curr, med7)
         lookback = 12 if len(closes) > 12 else max(len(closes)-1, 1)
-        ch3h = _pct(curr, float(closes[-lookback])) if lookback > 0 else 0.0
+        ch3h = _pct(curr, closes[-lookback]) if lookback > 0 else 0.0
 
         action, tgt, stop, comment = "HOLD", None, None, "No clear edge."
         if dmed <= -0.05:
