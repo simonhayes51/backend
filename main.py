@@ -360,14 +360,17 @@ async def _fetch_candidates_for_slot(
     limit: int,
     mode: str = "cheap",  # "cheap" -> price asc, "upgrade" -> rating desc then price
 ) -> list[dict]:
+    # Optional band filters (keep them if you use them; otherwise they do nothing)
     band = []
     if ch.get("exact_bronze"): band.append("p.rating <= 64")
     if ch.get("exact_silver"): band.append("p.rating BETWEEN 65 AND 74")
     if ch.get("exact_gold"):   band.append("p.rating >= 75")
     band_sql = (" AND " + " AND ".join(band)) if band else ""
 
+    # Order by cheapest for baseline; by rating desc for the upgrade pool
     order_clause = "p.price_num ASC, p.rating ASC" if mode == "cheap" else "p.rating DESC, p.price_num ASC"
 
+    # NOTE: primary position only (safe everywhere). If you later confirm alt columns exist, we can extend.
     sql = f"""
       SELECT p.card_id, p.name, p.rating, p.position, p.price_num
       FROM fut_players p
@@ -378,6 +381,7 @@ async def _fetch_candidates_for_slot(
       LIMIT $2
     """
     rows = await con.fetch(sql, req_pos, limit)
+
     return [{
         "card_id": r["card_id"],
         "name": r["name"],
@@ -387,6 +391,7 @@ async def _fetch_candidates_for_slot(
         "raw_price": r["price_num"],
         "source": "market",
     } for r in rows]
+
 
 async def _solve_challenge(
     con,
@@ -401,26 +406,22 @@ async def _solve_challenge(
     if len(slots) != 11:
         return {"ok": False, "error": "invalid_positions"}
 
+    # ---------- 1) Cheapest baseline XI (primary position only) ----------
     picks: List[Dict[str, Any]] = []
-    used_ids = set()
+    used_ids: set = set()
 
     for req_pos in slots:
+        # cheap-first for baseline
         cands = await _fetch_candidates_for_slot(
             con, req_pos, ch,
             account_id, use_club_only, prefer_untradeable,
-            max_candidates_per_slot + 1000,   # widen pool so stars are included
-            mode="upgrade"
+            limit=max_candidates_per_slot,
+            mode="cheap",  # price ASC
         )
         chosen = None
         for c in cands:
             if c["card_id"] in used_ids:
                 continue
-            ok_alt = False
-            if ch.get("allow_alt_pos", True):
-                if c.get("alt_positions") and isinstance(c["alt_positions"], list):
-                    ok_alt = (req_pos in c["alt_positions"])
-                if not ok_alt and c.get("altposition"):
-                    ok_alt = (req_pos == c["altposition"])
             if c["primary_pos"] == req_pos:
                 chosen = {**c, "used_pos": req_pos}
                 break
@@ -431,11 +432,115 @@ async def _solve_challenge(
 
     ok, reasons = _validate(picks, ch)
 
+    # ---------- 2) Minimal-cost upgrade to just clear min average ----------
+    target_avg = ch.get("min_squad_rating")
+    if not ok and target_avg:
+        target_total = int(target_avg) * 11
+        current_total = sum(p["rating"] for p in picks)
+        deficit = max(0, target_total - current_total)
+
+        if deficit > 0:
+            # Build upgrade choices per slot
+            per_slot_choices: List[List[Dict[str, Any]]] = []
+
+            for i in range(11):
+                req_pos = picks[i]["used_pos"]
+                curr_rating = picks[i]["rating"]
+                curr_price  = picks[i]["price"]
+
+                # rating-first pool for upgrades (kept modest for perf)
+                upgrade_pool = await _fetch_candidates_for_slot(
+                    con, req_pos, ch,
+                    account_id, use_club_only, prefer_untradeable,
+                    limit=max(80, max_candidates_per_slot),  # tune if needed
+                    mode="upgrade",  # rating DESC, then price
+                )
+
+                opts = [{"delta": 0, "extra": 0, "cand": None}]  # option: keep current
+
+                for c in upgrade_pool:
+                    if c["card_id"] == picks[i]["card_id"]:
+                        continue
+                    delta = max(0, c["rating"] - curr_rating)
+                    extra = (c["price"] - curr_price)
+                    # Skip strictly worse (no gain and not cheaper)
+                    if delta == 0 and extra >= 0:
+                        continue
+                    # Light prune of absurdly pricey swaps
+                    if extra is not None and extra > 2_000_000:
+                        continue
+                    opts.append({"delta": delta, "extra": extra, "cand": c})
+
+                # Keep the best few by cost efficiency to shrink DP state
+                def key_fn(o):
+                    return (
+                        (o["extra"] / o["delta"]) if o["delta"] > 0 else (o["extra"] if o["extra"] >= 0 else -1e9),
+                        o["extra"],
+                        -o["delta"],
+                    )
+                opts = sorted(opts, key=key_fn)[:30]
+                per_slot_choices.append(opts)
+
+            # DP: min extra cost to reach >= deficit; tie-break on smallest surplus
+            INF = 10**15
+            SURPLUS_CAP = 30                 # how far above target we consider
+            MAX_R = deficit + SURPLUS_CAP
+
+            dp_cost = [INF] * (MAX_R + 1)    # min extra cost to get exactly r rating-gain
+            dp_prev = [None] * (MAX_R + 1)   # backpointer: (slot_idx, choice_idx, prev_r)
+            dp_cost[0] = 0
+
+            for slot_idx in range(11):
+                next_cost = [INF] * (MAX_R + 1)
+                next_prev = [None] * (MAX_R + 1)
+                for r in range(MAX_R + 1):
+                    base = dp_cost[r]
+                    if base == INF:
+                        continue
+                    for choice_idx, opt in enumerate(per_slot_choices[slot_idx]):
+                        dr = opt["delta"]
+                        ec = opt["extra"]
+                        nr = min(MAX_R, r + dr)
+                        new_cost = base + ec
+                        if new_cost < next_cost[nr]:
+                            next_cost[nr] = new_cost
+                            next_prev[nr] = (slot_idx, choice_idx, r)
+                dp_cost, dp_prev = next_cost, next_prev
+
+            # pick cheapest r >= deficit; if tie, choose the closest above (smallest r)
+            best_r, best_cost = None, INF
+            for r in range(deficit, MAX_R + 1):
+                if dp_cost[r] < best_cost:
+                    best_cost, best_r = dp_cost[r], r
+                elif dp_cost[r] == best_cost and best_r is not None and r < best_r:
+                    best_r = r
+
+            if best_r is not None and best_cost < INF:
+                r = best_r
+                chosen_idx = [0] * 11
+                while r is not None:
+                    prev = dp_prev[r]
+                    if prev is None:
+                        break
+                    slot_idx, choice_idx, prev_r = prev
+                    chosen_idx[slot_idx] = choice_idx
+                    r = prev_r
+
+                # Apply the chosen upgrades
+                for i in range(11):
+                    opt = per_slot_choices[i][chosen_idx[i]]
+                    if opt["cand"] is not None:
+                        picks[i] = {**opt["cand"], "used_pos": picks[i]["used_pos"]}
+
+                ok, reasons = _validate(picks, ch)
+
+    # ---------- 3) Summaries ----------
     chem_est = _estimate_chem(picks)
     total_cost = int(sum(p["price"] for p in picks))
+    avg_rating = round(sum(p["rating"] for p in picks) / 11.0, 2)
 
     summary = {
-        "avg_rating": round(sum(p["rating"] for p in picks) / 11.0, 2),
+        "avg_rating": avg_rating,
         "nations": len(_counts(picks)[0]),
         "leagues": len(_counts(picks)[1]),
         "clubs":   len(_counts(picks)[2]),
@@ -449,7 +554,7 @@ async def _solve_challenge(
         "summary": summary,
         "picks": [
             {
-                "slot": i+1,
+                "slot": i + 1,
                 "req_pos": slots[i],
                 "card_id": p["card_id"],
                 "name": p["name"],
@@ -457,7 +562,8 @@ async def _solve_challenge(
                 "used_pos": p["used_pos"],
                 "price": p["price"],
                 "source": p["source"],
-            } for i, p in enumerate(picks)
+            }
+            for i, p in enumerate(picks)
         ],
         "price_snapshot": dt.datetime.utcnow(),
     }
