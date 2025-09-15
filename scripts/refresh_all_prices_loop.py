@@ -21,10 +21,10 @@ if not DATABASE_URL:
 PLATFORMS = [p.strip().lower() for p in os.getenv("PLATFORMS", "ps").split(",") if p.strip()]
 
 # Tuning knobs
-CONCURRENCY = int(os.getenv("REFRESH_CONCURRENCY", "16"))
-BATCH_SIZE  = int(os.getenv("REFRESH_BATCH_SIZE", "500"))
-SLEEP_SECS  = int(os.getenv("REFRESH_INTERVAL_SEC", "1800"))  # default 30m; try 300 (5m) for “livelier”
-
+# Tuning knobs
+CONCURRENCY = int(os.getenv("REFRESH_CONCURRENCY", "32"))   # double concurrency
+BATCH_SIZE  = int(os.getenv("REFRESH_BATCH_SIZE", "1000"))  # double batch
+SLEEP_SECS  = int(os.getenv("REFRESH_INTERVAL_SEC", "300")) # run every 5 min
 FUTGG_PRICE_URL = "https://www.fut.gg/api/fut/player-prices/26/{card_id}"
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
