@@ -1064,9 +1064,6 @@ app.include_router(
     dependencies=[Depends(require_feature("smart_buy"))],
 )
 
-# AI Engine (new routes like /api/ai/suggestions, /api/ai/comments, etc.)
-app.include_router(ai_router, prefix="/api/ai")
-
 @app.get("/")
 async def root():
     return {"message": "FUT Dashboard API", "status": "healthy"}
