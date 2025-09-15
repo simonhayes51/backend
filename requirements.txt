@@ -12,3 +12,4 @@ beautifulsoup4
 httpx
 PyJWT==2.9.0
 stripe
+lightweight-charts
