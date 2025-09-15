@@ -13,17 +13,21 @@ async def get_candles(
     limit: int = 300,
     db=Depends(get_db),
 ) -> List[Dict[str, Any]]:
-    rows = await db.fetch(
-        """
-        SELECT open_time, open, high, low, close, volume
-        FROM fut_candles
-        WHERE player_card_id=$1 AND platform=$2 AND timeframe=$3
-        ORDER BY open_time DESC
-        LIMIT $4
-        """,
-        player_card_id, platform, timeframe, limit,
-    )
-    return [dict(r) for r in rows][::-1]  # ascending order
+    try:
+        rows = await db.fetch(
+            """
+            SELECT open_time, open, high, low, close, volume
+            FROM fut_candles
+            WHERE player_card_id=$1 AND platform=$2 AND timeframe=$3
+            ORDER BY open_time DESC
+            LIMIT $4
+            """,
+            player_card_id, platform, timeframe, limit,
+        )
+        # return ascending order by time (what chart libs expect)
+        return [dict(r) for r in rows][::-1]
+    except Exception as e:
+        raise HTTPException(500, f"candles query failed: {e}")
 
 @router.get("/indicators")
 async def get_indicators(
@@ -32,26 +36,30 @@ async def get_indicators(
     timeframe: str = "15m",
     db=Depends(get_db),
 ) -> Dict[str, Any]:
-    candles = await get_candles(player_card_id, platform, timeframe, 500, db)
-    if not candles:
-        raise HTTPException(404, "No candles")
+    # fetch candles directly (don’t call the other handler)
+    rows = await db.fetch(
+        """
+        SELECT open_time, open, high, low, close, volume
+        FROM fut_candles
+        WHERE player_card_id=$1 AND platform=$2 AND timeframe=$3
+        ORDER BY open_time ASC
+        """,
+        player_card_id, platform, timeframe,
+    )
+    if not rows:
+        raise HTTPException(404, "No candles for that player/platform/timeframe")
 
-    closes = [c["close"] for c in candles]
-    highs  = [c["high"] for c in candles]
-    lows   = [c["low"]  for c in candles]
+    closes = [r["close"] for r in rows]
+    highs  = [r["high"]  for r in rows]
+    lows   = [r["low"]   for r in rows]
 
-    ema20 = ema(closes, 20)
-    ema50 = ema(closes, 50)
-    mid, up, lo = bollinger(closes, 20, 2)
-    rsi14 = rsi(closes, 14)
-    atr14 = atr(highs, lows, closes, 14)
-
-    return {
-        "ema20": ema20,
-        "ema50": ema50,
-        "bb_upper": up,
-        "bb_lower": lo,
-        "rsi14": rsi14,
-        "atr14": atr14,
-        "count": len(closes),
-    }
+    out: Dict[str, Any] = {}
+    out["ema20"] = ema(closes, 20)
+    out["ema50"] = ema(closes, 50)
+    _, up, lo = bollinger(closes, 20, 2)
+    out["bb_upper"] = up
+    out["bb_lower"] = lo
+    out["rsi14"] = rsi(closes, 14)
+    out["atr14"] = atr(highs, lows, closes, 14)
+    out["count"] = len(closes)
+    return out
