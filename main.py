@@ -17,7 +17,9 @@ from bs4 import BeautifulSoup
 from types import SimpleNamespace
 from urllib.parse import urlencode
 from contextlib import asynccontextmanager, suppress
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+import datetime as dt
+from collections import Counter
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
 from datetime import datetime, timedelta, timezone, time as dt_time
@@ -350,27 +352,31 @@ def _estimate_chem(assigns: List[Dict[str, Any]]) -> int:
     base = 15 + 2*league_cluster + 1*club_cluster
     return max(0, min(33, base))
 
+# ---------- CANDIDATE FETCHER ----------
 async def _fetch_candidates_for_slot(
     con,
     req_pos: str,
-    ch: dict,
-    account_id: int | None,
+    ch: Dict[str, Any],
+    account_id: Optional[int],
     use_club_only: bool,
     prefer_untradeable: bool,
     limit: int,
     mode: str = "cheap",  # "cheap" -> price asc, "upgrade" -> rating desc then price
-) -> list[dict]:
-    # Optional band filters (keep them if you use them; otherwise they do nothing)
-    band = []
-    if ch.get("exact_bronze"): band.append("p.rating <= 64")
-    if ch.get("exact_silver"): band.append("p.rating BETWEEN 65 AND 74")
-    if ch.get("exact_gold"):   band.append("p.rating >= 75")
+) -> List[Dict[str, Any]]:
+    band: List[str] = []
+    if ch.get("exact_bronze"):
+        band.append("p.rating <= 64")
+    if ch.get("exact_silver"):
+        band.append("p.rating BETWEEN 65 AND 74")
+    if ch.get("exact_gold"):
+        band.append("p.rating >= 75")
     band_sql = (" AND " + " AND ".join(band)) if band else ""
 
-    # Order by cheapest for baseline; by rating desc for the upgrade pool
-    order_clause = "p.price_num ASC, p.rating ASC" if mode == "cheap" else "p.rating DESC, p.price_num ASC"
+    order_clause = (
+        "p.price_num ASC, p.rating ASC" if mode == "cheap"
+        else "p.rating DESC, p.price_num ASC"
+    )
 
-    # NOTE: primary position only (safe everywhere). If you later confirm alt columns exist, we can extend.
     sql = f"""
       SELECT p.card_id, p.name, p.rating, p.position, p.price_num
       FROM fut_players p
@@ -382,17 +388,21 @@ async def _fetch_candidates_for_slot(
     """
     rows = await con.fetch(sql, req_pos, limit)
 
-    return [{
-        "card_id": r["card_id"],
-        "name": r["name"],
-        "rating": r["rating"],
-        "primary_pos": r["position"],
-        "price": r["price_num"] or 9_999_999,
-        "raw_price": r["price_num"],
-        "source": "market",
-    } for r in rows]
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        out.append({
+            "card_id": r["card_id"],
+            "name": r["name"],
+            "rating": r["rating"],
+            "primary_pos": r["position"],
+            "price": r["price_num"] or 9_999_999,
+            "raw_price": r["price_num"],
+            "source": "market",
+        })
+    return out
 
 
+# ---------- SOLVER ----------
 async def _solve_challenge(
     con,
     ch_row: Any,
@@ -401,21 +411,21 @@ async def _solve_challenge(
     prefer_untradeable: bool,
     max_candidates_per_slot: int = 100,
 ) -> Dict[str, Any]:
-    ch = dict(ch_row)
+    ch: Dict[str, Any] = dict(ch_row)
     slots = _ensure_slots_array(ch.get("positions"))
     if len(slots) != 11:
         return {"ok": False, "error": "invalid_positions"}
 
-    # ---------- 1) Cheapest baseline XI ----------
+    # 1) Cheapest baseline XI (primary position only)
     picks: List[Dict[str, Any]] = []
-    used_ids: set[int] = set()
+    used_ids: set = set()
 
     for req_pos in slots:
         cands = await _fetch_candidates_for_slot(
             con, req_pos, ch,
             account_id, use_club_only, prefer_untradeable,
             limit=max_candidates_per_slot,
-            mode="cheap",  # price ASC
+            mode="cheap",
         )
         chosen = None
         for c in cands:
@@ -429,77 +439,76 @@ async def _solve_challenge(
         used_ids.add(chosen["card_id"])
         picks.append(chosen)
 
-    # ---------- 2) Upgrade to meet min average (cheapest, closest above) ----------
     ok, reasons = _validate(picks, ch)
-    target_avg = ch.get("min_squad_rating")
+
+    # 2) Upgrade to meet min average (cheapest; closest above target)
+    target_avg = ch.get("min_squad_rating") or 0
     curr_total_rating = sum(p["rating"] for p in picks)
     curr_avg = curr_total_rating / 11.0
 
-    # Trigger upgrade if validation failed OR average below target.
-    if (not ok) or (target_avg and curr_avg < target_avg):
+    if (not ok) or (target_avg > 0 and curr_avg < target_avg):
         target_total = (int(target_avg) * 11) if target_avg else curr_total_rating
         deficit = max(0, target_total - curr_total_rating)
 
         if deficit > 0:
-            # Build upgrade option sets per slot
+            # Build upgrade options per slot
             per_slot_choices: List[List[Dict[str, Any]]] = []
             for i in range(11):
                 req_pos = picks[i]["used_pos"]
                 curr_rating = picks[i]["rating"]
-                curr_price  = picks[i]["price"]
+                curr_price = picks[i]["price"]
 
-                # rating-first pool for upgrades
                 upgrade_pool = await _fetch_candidates_for_slot(
                     con, req_pos, ch,
                     account_id, use_club_only, prefer_untradeable,
-                    limit=max(80, max_candidates_per_slot),
-                    mode="upgrade",  # rating DESC, then price
+                    limit=max(80, max_candidates_per_slot),  # tune as needed
+                    mode="upgrade",  # rating DESC, price ASC
                 )
 
-                opts = [{"delta": 0, "extra": 0, "cand": None}]  # keep current
+                opts: List[Dict[str, Any]] = [{"delta": 0, "extra": 0, "cand": None}]  # keep current
                 for c in upgrade_pool:
                     if c["card_id"] == picks[i]["card_id"]:
                         continue
-                    delta = max(0, c["rating"] - curr_rating)
-                    extra = (c["price"] - curr_price)
-                    # skip strictly worse (no rating gain and not cheaper)
+                    delta = max(0, int(c["rating"]) - int(curr_rating))
+                    extra = int(c["price"]) - int(curr_price)
+                    # skip strictly worse (no gain and not cheaper)
                     if delta == 0 and extra >= 0:
                         continue
-                    # soft prune absurd outliers
-                    if extra is not None and extra > 2_000_000:
+                    # prune absurdly pricey swaps
+                    if extra > 2_000_000:
                         continue
                     opts.append({"delta": delta, "extra": extra, "cand": c})
 
                 # keep best few options by efficiency to keep DP tiny
-                def key_fn(o):
-                    return (
-                        (o["extra"] / o["delta"]) if o["delta"] > 0 else (o["extra"] if o["extra"] >= 0 else -1e9),
-                        o["extra"],
-                        -o["delta"],
-                    )
+                def key_fn(o: Dict[str, Any]) -> Tuple[float, int, int]:
+                    if o["delta"] > 0:
+                        eff = float(o["extra"]) / float(o["delta"])
+                    else:
+                        eff = float(o["extra"]) if o["extra"] >= 0 else -1e9
+                    return (eff, o["extra"], -o["delta"])
+
                 opts = sorted(opts, key=key_fn)[:30]
                 per_slot_choices.append(opts)
 
-            # DP over rating gain to reach >= deficit with min extra cost,
-            # then choose the smallest surplus above the target.
-            INF = 10**15
+            # DP: minimal extra cost to reach >= deficit; tie-break to smallest surplus
+            INF = 10 ** 15
             SURPLUS_CAP = 30
             MAX_R = deficit + SURPLUS_CAP
 
-            dp_cost = [INF] * (MAX_R + 1)      # min extra cost for exact gain r
-            dp_prev: List[Optional[tuple]] = [None] * (MAX_R + 1)
+            dp_cost: List[int] = [INF] * (MAX_R + 1)             # min extra cost for exact gain r
+            dp_prev: List[Optional[Tuple[int, int, int]]] = [None] * (MAX_R + 1)
             dp_cost[0] = 0
 
             for slot_idx in range(11):
-                next_cost = [INF] * (MAX_R + 1)
-                next_prev: List[Optional[tuple]] = [None] * (MAX_R + 1)
+                next_cost: List[int] = [INF] * (MAX_R + 1)
+                next_prev: List[Optional[Tuple[int, int, int]]] = [None] * (MAX_R + 1)
                 for r in range(MAX_R + 1):
                     base = dp_cost[r]
                     if base == INF:
                         continue
                     for choice_idx, opt in enumerate(per_slot_choices[slot_idx]):
-                        dr = opt["delta"]
-                        ec = opt["extra"]
+                        dr = int(opt["delta"])
+                        ec = int(opt["extra"])
                         nr = min(MAX_R, r + dr)
                         new_cost = base + ec
                         if new_cost < next_cost[nr]:
@@ -507,7 +516,7 @@ async def _solve_challenge(
                             next_prev[nr] = (slot_idx, choice_idx, r)
                 dp_cost, dp_prev = next_cost, next_prev
 
-            # pick cheapest r ≥ deficit; tie-breaker: smallest r (closest above target)
+            # choose cheapest r ≥ deficit; tie-breaker: smallest r (closest above)
             best_r, best_cost = None, INF
             for r in range(deficit, MAX_R + 1):
                 if dp_cost[r] < best_cost:
@@ -515,11 +524,10 @@ async def _solve_challenge(
                 elif dp_cost[r] == best_cost and best_r is not None and r < best_r:
                     best_r = r
 
-            # Reconstruct and apply upgrades
             if best_r is not None and best_cost < INF:
                 r = best_r
                 chosen_idx = [0] * 11
-                while r is not None:
+                while True:
                     prev = dp_prev[r]
                     if prev is None:
                         break
@@ -534,10 +542,10 @@ async def _solve_challenge(
 
                 ok, reasons = _validate(picks, ch)
 
-    # ---------- 3) Summaries ----------
+    # 3) Summaries
     chem_est = _estimate_chem(picks)
-    total_cost = int(sum(p["price"] for p in picks))
-    avg_rating = round(sum(p["rating"] for p in picks) / 11.0, 2)
+    total_cost = int(sum(int(p["price"]) for p in picks))
+    avg_rating = round(sum(int(p["rating"]) for p in picks) / 11.0, 2)
 
     summary = {
         "avg_rating": avg_rating,
@@ -567,9 +575,6 @@ async def _solve_challenge(
         ],
         "price_snapshot": dt.datetime.utcnow(),
     }
-
-
-
 # Time helpers
 LONDON = ZoneInfo("Europe/London")
 UTC = timezone.utc
