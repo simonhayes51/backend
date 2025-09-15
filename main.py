@@ -286,8 +286,12 @@ def parse_coin_amount(v) -> int:
     except:
         return 0
 
-# --- SBC Helper ---
-def band_filter_sql(exact_bronze: bool, exact_silver: bool, exact_gold: bool) -> str:
+# ========== SBC HELPERS ==========
+from typing import List, Dict, Any, Tuple, Optional
+from collections import Counter
+import datetime as dt
+
+def _band_filter_sql(exact_bronze: bool, exact_silver: bool, exact_gold: bool) -> str:
     if exact_bronze:
         return " AND p.rating <= 64 "
     if exact_silver:
@@ -295,6 +299,192 @@ def band_filter_sql(exact_bronze: bool, exact_silver: bool, exact_gold: bool) ->
     if exact_gold:
         return " AND p.rating >= 75 "
     return ""
+
+def _ensure_slots_array(raw_positions: Any) -> List[str]:
+    if raw_positions is None:
+        return []
+    if isinstance(raw_positions, list):
+        return [str(x).strip().upper() for x in raw_positions]
+    return [s.strip().upper() for s in str(raw_positions).split(",") if s.strip()]
+
+def _counts(assigns: List[Dict[str, Any]]) -> Tuple[Counter, Counter, Counter, int]:
+    nat = Counter(a.get("nation_id") or a.get("nation") for a in assigns)
+    lg  = Counter(a.get("league_id") or a.get("league") for a in assigns)
+    cl  = Counter(a.get("club_id")   or a.get("club")   for a in assigns)
+    rare = sum(1 for a in assigns if str(a.get("rarity","")).lower().find("rare") >= 0)
+    return nat, lg, cl, rare
+
+def _validate(assigns: List[Dict[str, Any]], ch: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    msgs = []
+    if len(assigns) != 11:
+        msgs.append("squad not complete")
+        return False, msgs
+
+    avg_rating = sum(a["rating"] for a in assigns) / 11.0
+    if ch.get("min_squad_rating") and avg_rating < ch["min_squad_rating"]:
+        msgs.append(f"avg rating {avg_rating:.1f} < {ch['min_squad_rating']}")
+
+    nat, lg, cl, rare = _counts(assigns)
+
+    def _lt(val, req, label):
+        if req and val < req: msgs.append(f"{label} {val} < {req}")
+
+    def _maxlt(counter, req, label):
+        if req and (max(counter.values() or [0]) < req):
+            msgs.append(f"{label} max {max(counter.values() or [0])} < {req}")
+
+    _lt(len(nat), ch.get("min_nations"), "nations")
+    _lt(len(lg),  ch.get("min_leagues"), "leagues")
+    _lt(len(cl),  ch.get("min_clubs"), "clubs")
+    _maxlt(cl, ch.get("min_same_club"), "same club")
+    _maxlt(lg, ch.get("min_same_league"), "same league")
+    _maxlt(nat, ch.get("min_same_nation"), "same nation")
+    _lt(rare, ch.get("rare_players"), "rare")
+
+    return (len(msgs) == 0), msgs
+
+def _estimate_chem(assigns: List[Dict[str, Any]]) -> int:
+    _, lg, cl, _ = _counts(assigns)
+    league_cluster = max(lg.values() or [0])
+    club_cluster   = max(cl.values() or [0])
+    base = 15 + 2*league_cluster + 1*club_cluster
+    return max(0, min(33, base))
+
+async def _fetch_candidates_for_slot(
+    con,
+    req_pos: str,
+    ch: Dict[str, Any],
+    account_id: Optional[int],
+    use_club_only: bool,
+    prefer_untradeable: bool,
+    limit: int,
+) -> List[Dict[str, Any]]:
+    band_sql = _band_filter_sql(ch.get("exact_bronze"), ch.get("exact_silver"), ch.get("exact_gold"))
+
+    pos_match = """
+      (p.position = $1)
+      OR ($1 = ANY(p.alt_positions))
+      OR (p.altposition IS NOT NULL AND p.altposition = $1)
+    """ if ch.get("allow_alt_pos", True) else " (p.position = $1) "
+
+    sql = f"""
+      SELECT
+        p.card_id, p.name, p.rating, p.position, p.alt_positions, p.altposition,
+        p.nation_id, p.league_id, p.club_id, p.nation, p.league, p.club,
+        p.rarity,
+        p.price_num,
+        ci.card_id IS NOT NULL AS in_club,
+        COALESCE(ci.tradeable, TRUE) AS tradeable
+      FROM fut_players p
+      LEFT JOIN club_inventory ci
+        ON ci.card_id = p.card_id
+       AND ($2::bigint IS NOT NULL AND ci.account_id = $2)
+      WHERE ({pos_match})
+        {band_sql}
+        AND (p.price_num IS NOT NULL OR $3 = TRUE)
+        {"AND ci.card_id IS NOT NULL" if use_club_only else ""}
+      ORDER BY
+        CASE
+          WHEN ci.card_id IS NOT NULL AND (NOT COALESCE(ci.tradeable, TRUE) OR $4 = TRUE) THEN 0
+          WHEN p.price_num IS NULL THEN 999999999
+          ELSE p.price_num
+        END,
+        p.rating ASC
+      LIMIT $5
+    """
+    rows = await con.fetch(sql, req_pos, account_id, use_club_only, prefer_untradeable, limit)
+
+    out = []
+    for r in rows:
+        source = "club" if r["in_club"] else "market"
+        eff_price = 0 if (r["in_club"] and (prefer_untradeable or not r["tradeable"])) else (r["price_num"] or 999999999)
+        out.append({
+            "card_id": r["card_id"],
+            "name": r["name"],
+            "rating": r["rating"],
+            "primary_pos": r["position"],
+            "alt_positions": r["alt_positions"],
+            "altposition": r["altposition"],
+            "nation_id": r["nation_id"], "league_id": r["league_id"], "club_id": r["club_id"],
+            "nation": r["nation"], "league": r["league"], "club": r["club"],
+            "rarity": r["rarity"],
+            "price": eff_price,
+            "raw_price": r["price_num"],
+            "source": source,
+        })
+    return out
+
+async def _solve_challenge(
+    con,
+    ch_row: Any,
+    account_id: Optional[int],
+    use_club_only: bool,
+    prefer_untradeable: bool,
+    max_candidates_per_slot: int = 100,
+) -> Dict[str, Any]:
+    ch = dict(ch_row)
+    slots = _ensure_slots_array(ch.get("positions"))
+    if len(slots) != 11:
+        return {"ok": False, "error": "invalid_positions"}
+
+    picks: List[Dict[str, Any]] = []
+    used_ids = set()
+
+    for req_pos in slots:
+        cands = await _fetch_candidates_for_slot(
+            con, req_pos, ch, account_id, use_club_only, prefer_untradeable, max_candidates_per_slot
+        )
+        chosen = None
+        for c in cands:
+            if c["card_id"] in used_ids:
+                continue
+            ok_alt = False
+            if ch.get("allow_alt_pos", True):
+                if c.get("alt_positions") and isinstance(c["alt_positions"], list):
+                    ok_alt = (req_pos in c["alt_positions"])
+                if not ok_alt and c.get("altposition"):
+                    ok_alt = (req_pos == c["altposition"])
+            if c["primary_pos"] == req_pos or ok_alt:
+                chosen = {**c, "used_pos": req_pos}
+                break
+        if not chosen:
+            return {"ok": False, "error": f"no_candidate_for_{req_pos}"}
+        used_ids.add(chosen["card_id"])
+        picks.append(chosen)
+
+    ok, reasons = _validate(picks, ch)
+
+    chem_est = _estimate_chem(picks)
+    total_cost = int(sum(p["price"] for p in picks))
+
+    summary = {
+        "avg_rating": round(sum(p["rating"] for p in picks) / 11.0, 2),
+        "nations": len(_counts(picks)[0]),
+        "leagues": len(_counts(picks)[1]),
+        "clubs":   len(_counts(picks)[2]),
+        "chem_estimate": chem_est,
+    }
+
+    return {
+        "ok": ok,
+        "error": (None if ok else "; ".join(reasons)),
+        "total_cost": total_cost,
+        "summary": summary,
+        "picks": [
+            {
+                "slot": i+1,
+                "req_pos": slots[i],
+                "card_id": p["card_id"],
+                "name": p["name"],
+                "rating": p["rating"],
+                "used_pos": p["used_pos"],
+                "price": p["price"],
+                "source": p["source"],
+            } for i, p in enumerate(picks)
+        ],
+        "price_snapshot": dt.datetime.utcnow(),
+    }
+
 
 # Time helpers
 LONDON = ZoneInfo("Europe/London")
@@ -707,6 +897,32 @@ async def lifespan(app: FastAPI):
 # --- FastAPI app ---
 app = FastAPI(lifespan=lifespan)
 
+from pydantic import BaseModel
+
+class SbcSolveReq(BaseModel):
+    challenge_code: str
+    account_id: Optional[int] = None
+    use_club_only: bool = False
+    prefer_untradeable: bool = True
+    max_candidates_per_slot: int = 100
+
+@app.get("/api/sbc/challenge/{code}")
+async def sbc_get_challenge(code: str, conn=Depends(get_db)):
+    ch = await conn.fetchrow("SELECT * FROM sbc_challenges WHERE challenge_code=$1", code)
+    if not ch:
+        return {"ok": False, "error": "challenge_not_found"}
+    return {"ok": True, "challenge": dict(ch)}
+
+@app.post("/api/sbc/solve")
+async def sbc_solve(req: SbcSolveReq, conn=Depends(get_db)):
+    ch = await conn.fetchrow("SELECT * FROM sbc_challenges WHERE challenge_code=$1", req.challenge_code)
+    if not ch:
+        return {"ok": False, "error": "challenge_not_found"}
+
+    sol = await _solve_challenge(
+        conn, ch, req.account_id, req.use_club_only, req.prefer_untradeable, req.max_candidates_per_slot
+    )
+    return sol
 
 
 @app.get("/api/entitlements")
@@ -1514,7 +1730,7 @@ async def sbc_candidates(
     """
     Return cheapest candidate players for a given SBC slot.
     """
-    band_sql = band_filter_sql(exact_bronze, exact_silver, exact_gold)
+    band_sql = _band_filter_sql(exact_bronze, exact_silver, exact_gold)
     pos_check = "p.position=$1 OR $1 = ANY(p.alt_positions)" if allow_alt_pos else "p.position=$1"
 
     sql = f"""
