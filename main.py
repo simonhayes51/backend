@@ -286,6 +286,16 @@ def parse_coin_amount(v) -> int:
     except:
         return 0
 
+# --- SBC Helper ---
+def band_filter_sql(exact_bronze: bool, exact_silver: bool, exact_gold: bool) -> str:
+    if exact_bronze:
+        return " AND p.rating <= 64 "
+    if exact_silver:
+        return " AND p.rating BETWEEN 65 AND 74 "
+    if exact_gold:
+        return " AND p.rating >= 75 "
+    return ""
+
 # Time helpers
 LONDON = ZoneInfo("Europe/London")
 UTC = timezone.utc
@@ -1490,6 +1500,37 @@ async def add_watch_item(
         logging.exception("Watchlist POST error")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/api/sbc/candidates")
+async def sbc_candidates(
+    req_pos: str,
+    exact_bronze: bool = False,
+    exact_silver: bool = False,
+    exact_gold: bool = False,
+    allow_alt_pos: bool = True,
+    limit: int = 10,
+    user_id: str = Depends(get_current_user),
+    conn=Depends(get_db),
+):
+    """
+    Return cheapest candidate players for a given SBC slot.
+    """
+    band_sql = band_filter_sql(exact_bronze, exact_silver, exact_gold)
+    pos_check = "p.position=$1 OR $1 = ANY(p.alt_positions)" if allow_alt_pos else "p.position=$1"
+
+    sql = f"""
+      SELECT p.card_id, p.name, p.rating, p.position, p.alt_positions,
+             p.nation, p.club, p.league,
+             p.price_num AS price
+        FROM fut_players p
+       WHERE ({pos_check})
+         {band_sql}
+         AND p.price_num IS NOT NULL
+       ORDER BY p.price_num ASC, p.rating ASC
+       LIMIT $2
+    """
+
+    rows = await conn.fetch(sql, req_pos, limit)
+    return [dict(r) for r in rows]
 
 @app.get("/api/watchlist/usage")
 async def watchlist_usage(request: Request, user_id: str = Depends(get_current_user)):
