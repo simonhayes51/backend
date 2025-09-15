@@ -16,13 +16,13 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is required")
 
-# Platforms to log
+# Platforms you want to log (stored as TEXT). Comma-separated in env if you want more.
 PLATFORMS = [p.strip().lower() for p in os.getenv("PLATFORMS", "ps").split(",") if p.strip()]
 
-# Tuning knobs (you set these higher)
-CONCURRENCY = int(os.getenv("REFRESH_CONCURRENCY", "32"))     # requests in parallel
-BATCH_SIZE  = int(os.getenv("REFRESH_BATCH_SIZE", "1000"))    # players per fetch chunk
-SLEEP_SECS  = int(os.getenv("REFRESH_INTERVAL_SEC", "300"))   # 5 minutes
+# ---------- Tuning knobs ----------
+CONCURRENCY = int(os.getenv("REFRESH_CONCURRENCY", "32"))   # parallel requests
+BATCH_SIZE  = int(os.getenv("REFRESH_BATCH_SIZE", "1000"))  # ids per fetch chunk
+SLEEP_SECS  = int(os.getenv("REFRESH_INTERVAL_SEC", "300")) # loop every 5 minutes
 
 FUTGG_PRICE_URL = "https://www.fut.gg/api/fut/player-prices/26/{card_id}"
 HEADERS = {
@@ -33,7 +33,7 @@ HEADERS = {
     "Origin": "https://www.fut.gg",
 }
 
-# ----------------------- migrations -----------------------
+# ---------- Migrations ----------
 DDL_STMTS = [
     """
     CREATE TABLE IF NOT EXISTS public.fut_players (
@@ -57,7 +57,6 @@ DDL_STMTS = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_prices_history_card_time ON public.fut_prices_history(card_id, platform, captured_at DESC);",
 
-    # ticks (raw feed)
     """
     CREATE TABLE IF NOT EXISTS public.fut_ticks (
         id BIGSERIAL PRIMARY KEY,
@@ -69,7 +68,6 @@ DDL_STMTS = [
     """,
     "CREATE INDEX IF NOT EXISTS fut_ticks_player_idx ON public.fut_ticks (player_card_id, platform, ts);",
 
-    # candles (OHLC)
     """
     CREATE TABLE IF NOT EXISTS public.fut_candles (
         id BIGSERIAL PRIMARY KEY,
@@ -96,7 +94,7 @@ async def run_migrations(pool: asyncpg.Pool):
             await conn.execute(stmt)
     logging.info("Migrations applied (players, history, ticks, candles).")
 
-# ----------------------- fetching -----------------------
+# ---------- Fetching ----------
 async def _fetch_one(session: aiohttp.ClientSession, card_id: str) -> Optional[str]:
     url = FUTGG_PRICE_URL.format(card_id=str(card_id))
     try:
@@ -125,19 +123,14 @@ async def _fetch_prices_for_ids(card_ids: List[str]) -> Dict[str, str]:
         await asyncio.gather(*tasks, return_exceptions=True)
     return out
 
-# ----------------------- db helpers -----------------------
+# ---------- DB helpers ----------
 async def _load_card_ids(conn: asyncpg.Connection) -> List[str]:
     rows = await conn.fetch("SELECT card_id FROM public.fut_players")
-    # force TEXT everywhere (some rows could be numeric in DB)
     return [str(r["card_id"]) for r in rows if r["card_id"] is not None]
 
 async def _update_snapshot(conn: asyncpg.Connection, prices: List[Tuple[str, str]]):
-    """
-    prices: List of (price_text, card_id_text)
-    """
-    # coerce to strings before binding (avoids "expected str, got int")
+    # ensure TEXT bindings
     prices = [(str(price_text), str(card_id)) for price_text, card_id in prices]
-
     sql = """
         UPDATE public.fut_players
         SET price = $1::text,
@@ -148,11 +141,7 @@ async def _update_snapshot(conn: asyncpg.Connection, prices: List[Tuple[str, str
     await conn.executemany(sql, prices)
 
 async def _insert_history(conn: asyncpg.Connection, rows: List[Tuple[str, str, str]]):
-    """
-    rows: List of (card_id_text, platform_text, price_text)
-    """
     rows = [(str(cid), str(plat), str(price)) for cid, plat, price in rows]
-
     sql = """
         INSERT INTO public.fut_prices_history (card_id, platform, price, captured_at)
         VALUES ($1::text, $2::text, $3::text, NOW())
@@ -160,12 +149,7 @@ async def _insert_history(conn: asyncpg.Connection, rows: List[Tuple[str, str, s
     await conn.executemany(sql, rows)
 
 async def _insert_ticks(conn: asyncpg.Connection, rows: List[Tuple[str, str, int]]):
-    """
-    rows: List of (player_card_id_text, platform_text, price_int)
-    """
-    # player_card_id/platform must be TEXT; price must be INT
     rows = [(str(cid), str(plat), int(price)) for cid, plat, price in rows]
-
     sql = """
         INSERT INTO public.fut_ticks (player_card_id, platform, ts, price)
         VALUES ($1::text, $2::text, NOW(), $3::int)
@@ -173,10 +157,7 @@ async def _insert_ticks(conn: asyncpg.Connection, rows: List[Tuple[str, str, int
     await conn.executemany(sql, rows)
 
 async def _rollup_15m(conn: asyncpg.Connection, since_hours: int = 48):
-    """
-    Rebuild/refresh 15m candles for the recent window from ticks.
-    Idempotent via ON CONFLICT.
-    """
+    """Rebuild/refresh 15m candles for the recent window from ticks (idempotent)."""
     await conn.execute(
         """
         WITH t AS (
@@ -186,7 +167,7 @@ async def _rollup_15m(conn: asyncpg.Connection, since_hours: int = 48):
             to_timestamp(floor(extract(epoch FROM ts) / 900) * 900) AT TIME ZONE 'UTC' AS bucket,
             ts, price
           FROM public.fut_ticks
-          WHERE ts >= NOW() - ($1 || ' hours')::interval
+          WHERE ts >= NOW() - ($1::int * INTERVAL '1 hour')
         ),
         agg AS (
           SELECT
@@ -208,10 +189,10 @@ async def _rollup_15m(conn: asyncpg.Connection, since_hours: int = 48):
         DO UPDATE SET open=EXCLUDED.open, high=EXCLUDED.high, low=EXCLUDED.low,
                       close=EXCLUDED.close, volume=EXCLUDED.volume;
         """,
-        since_hours,
+        since_hours,  # int is fine with INTERVAL multiply
     )
 
-# ----------------------- refresh pass -----------------------
+# ---------- Refresh pass ----------
 async def _refresh_once(pool: asyncpg.Pool):
     async with pool.acquire() as conn:
         card_ids = await _load_card_ids(conn)
@@ -225,7 +206,7 @@ async def _refresh_once(pool: asyncpg.Pool):
 
     prices_map: Dict[str, str] = {}
     for i in range(0, total, BATCH_SIZE):
-        chunk = card_ids[i:i+BATCH_SIZE]
+        chunk = card_ids[i : i + BATCH_SIZE]
         chunk_prices = await _fetch_prices_for_ids(chunk)
         prices_map.update(chunk_prices)
         logging.info("Fetched %s/%s price points...", len(prices_map), total)
@@ -234,17 +215,16 @@ async def _refresh_once(pool: asyncpg.Pool):
         logging.warning("No prices fetched this pass.")
         return
 
-    # 1) Update fut_players snapshot (TEXT + price_num BIGINT)
+    # 1) Update snapshot
     pairs_snapshot: List[Tuple[str, str]] = [(str(p), str(cid)) for cid, p in prices_map.items()]
     async with pool.acquire() as conn:
         await _update_snapshot(conn, pairs_snapshot)
 
-    # 2) Append history (TEXT) and 3) Append ticks (INT) for each platform
+    # 2) History + 3) Ticks
     hist_rows: List[Tuple[str, str, str]] = []
     tick_rows: List[Tuple[str, str, int]] = []
 
     for cid, ptxt in prices_map.items():
-        # safe integer cast for ticks; skip if not numeric
         try:
             pint = int(str(ptxt).replace(",", "").strip())
         except Exception:
@@ -254,21 +234,20 @@ async def _refresh_once(pool: asyncpg.Pool):
             tick_rows.append((str(cid), str(plat), int(pint)))
 
     async with pool.acquire() as conn:
-        # history in chunks
         for j in range(0, len(hist_rows), 5000):
-            await _insert_history(conn, hist_rows[j:j+5000])
-        # ticks in chunks
+            await _insert_history(conn, hist_rows[j : j + 5000])
         for j in range(0, len(tick_rows), 5000):
-            await _insert_ticks(conn, tick_rows[j:j+5000])
-        # roll up last N hours into 15m candles
+            await _insert_ticks(conn, tick_rows[j : j + 5000])
         await _rollup_15m(conn, since_hours=48)
 
     logging.info(
         "Updated fut_players (%s), wrote %s history rows and %s ticks, rolled 15m candles.",
-        len(pairs_snapshot), len(hist_rows), len(tick_rows),
+        len(pairs_snapshot),
+        len(hist_rows),
+        len(tick_rows),
     )
 
-# ----------------------- main loop -----------------------
+# ---------- Main loop ----------
 async def main_loop():
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
     try:
