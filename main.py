@@ -1013,19 +1013,16 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        FRONTEND_URL,
         "https://app.futhub.co.uk",
         "https://www.futhub.co.uk",
         "https://futhub.co.uk",
+        "https://api.futhub.co.uk",
         "http://localhost:5173",
         "http://localhost:3000",
     ],
-    allow_origin_regex=r"^(https://.*\.railway\.app|chrome-extension://.*)$",
     allow_credentials=True,
-    allow_methods=["GET","POST","PUT","PATCH","DELETE","OPTIONS"],
-    allow_headers=["Authorization","Content-Type","X-Requested-With","Accept"],
-    expose_headers=["Content-Disposition"],
-    max_age=600,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 app.add_middleware(
