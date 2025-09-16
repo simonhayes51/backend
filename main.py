@@ -37,13 +37,6 @@ from fastapi.responses import RedirectResponse, JSONResponse, StreamingResponse,
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 from pydantic import BaseModel, Field
-# ----------------- SBC REQUEST MODEL -----------------
-class SolveRequest(BaseModel):
-    challenge_code: str
-    account_id: Optional[int] = None
-    use_club_only: bool = False
-    prefer_untradeable: bool = True
-    max_candidates_per_slot: int = 100
 from app.auth.entitlements import compute_entitlements, require_feature
 from app.services.price_history import get_price_history
 from app.services.prices import get_player_price  # still imported (not strictly required after unification)
@@ -60,6 +53,7 @@ from app.routers.players import router as players_router
 # ----------------- BOOTSTRAP ----------------- 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("app")
+log = logging.getLogger("sbc")
 load_dotenv()
 
 # --------- ENV ---------
@@ -1066,18 +1060,53 @@ async def sbc_get_challenge(code: str, conn=Depends(get_db)):
 
 @app.post("/api/sbc/solve")
 async def sbc_solve(req: SolveRequest, conn=Depends(get_db)):
-    if not SBC_ENABLED:
-        return JSONResponse({"ok": False, "error": "sbc_disabled"}, status_code=503)
-async def sbc_solve(req: SbcSolveReq, conn=Depends(get_db)):
-    ch = await conn.fetchrow("SELECT * FROM sbc_challenges WHERE challenge_code=$1", req.challenge_code)
-    if not ch:
-        return {"ok": False, "error": "challenge_not_found"}
+    try:
+        # Short per-request statement timeout so PG won't hang
+        await conn.execute("SET LOCAL statement_timeout = '4000ms'")
 
-    sol = await _solve_challenge(
-        conn, ch, req.account_id, req.use_club_only, req.prefer_untradeable, req.max_candidates_per_slot
-    )
-    return sol
+        # Load challenge
+        ch = await conn.fetchrow(
+            "SELECT * FROM sbc_challenges WHERE challenge_code=$1",
+            req.challenge_code,
+        )
+        if not ch:
+            return {"ok": False, "error": "challenge_not_found"}
 
+        # Run solver with a hard wall-clock timeout
+        result = await asyncio.wait_for(
+            _solve_challenge(
+                conn,
+                ch_row=ch,
+                account_id=req.account_id,
+                use_club_only=req.use_club_only,
+                prefer_untradeable=req.prefer_untradeable,
+                max_candidates_per_slot=req.max_candidates_per_slot or 100,
+            ),
+            timeout=8.0,
+        )
+
+        # Defensive: ensure we always return a JSON object with ok
+        if not isinstance(result, dict):
+            log.error("Solver returned non-dict: %r", result)
+            return JSONResponse(
+                {"ok": False, "error": "solver_returned_invalid_payload"},
+                status_code=500,
+            )
+        if "ok" not in result:
+            # Treat success by default if it looks like a solution
+            result.setdefault("ok", True)
+        return result
+
+    except asyncio.TimeoutError:
+        return JSONResponse({"ok": False, "error": "solver_timeout"}, status_code=504)
+
+    except Exception as e:
+        # Never leak stack traces to the browser; always JSON with ok:false
+        log.exception("sbc_solve failed: %s", e)
+        return JSONResponse(
+            {"ok": False, "error": f"server_error:{type(e).__name__}"},
+            status_code=500,
+        )
 
 @app.get("/api/entitlements")
 async def get_entitlements(request: Request):
