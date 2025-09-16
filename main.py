@@ -11,7 +11,7 @@ import secrets
 import aiohttp
 import asyncpg
 import stripe
-
+SBC_ENABLED = os.getenv("SBC_ENABLED", "1") == "1"
 
 from bs4 import BeautifulSoup
 from types import SimpleNamespace
@@ -384,7 +384,7 @@ async def _fetch_candidates_for_slot(
 
     sql = f"""
       SELECT p.card_id, p.name, p.rating, p.position, p.price_num
-      FROM fut_players p
+      FROM fut_players_for_sbc p
       WHERE p.position = $1
         {band_sql}
         AND p.price_num IS NOT NULL
@@ -1058,6 +1058,9 @@ async def sbc_get_challenge(code: str, conn=Depends(get_db)):
     return {"ok": True, "challenge": dict(ch)}
 
 @app.post("/api/sbc/solve")
+async def sbc_solve(req: SolveRequest, conn=Depends(get_db)):
+    if not SBC_ENABLED:
+        return JSONResponse({"ok": False, "error": "sbc_disabled"}, status_code=503)
 async def sbc_solve(req: SbcSolveReq, conn=Depends(get_db)):
     ch = await conn.fetchrow("SELECT * FROM sbc_challenges WHERE challenge_code=$1", req.challenge_code)
     if not ch:
