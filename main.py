@@ -1050,6 +1050,21 @@ async def lifespan(app: FastAPI):
                 
 # --- FastAPI app ---
 app = FastAPI(lifespan=lifespan)
+# ensure all routes use the same pool created in lifespan()
+try:
+    from app.db import get_db as imported_get_db  # the one your routes currently reference
+except Exception:
+    imported_get_db = None
+
+async def _get_db():
+    # use the pool we created in lifespan()
+    async with app.state.pool.acquire() as conn:
+        yield conn
+
+# make EVERY Depends(get_db) in already-defined routes use our _get_db
+if imported_get_db is not None:
+    app.dependency_overrides[imported_get_db] = _get_db
+
 
 from pydantic import BaseModel
 
