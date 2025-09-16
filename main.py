@@ -1001,7 +1001,7 @@ app.add_middleware(
     SessionMiddleware,
     secret_key=SECRET_KEY,
     same_site="none" if IS_PROD else "lax",
-    secure=IS_PROD,  # corrected arg name
+    https_only=IS_PROD,            # ✅ use this
 )
 
 # ---------------- Routers & helpers ----------------
