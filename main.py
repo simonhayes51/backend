@@ -971,6 +971,26 @@ async def lifespan(app: FastAPI):
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )""")
 
+    async def fetch_trending_items(type: str, timeframe: str, limit: int) -> List[dict]:
+    """Fetch trending items - placeholder implementation"""
+    try:
+        if type == "risers":
+            _, html = await _momentum_page_items(timeframe, 1)
+            last = _parse_last_page_number(html)
+            items, _ = await _momentum_page_items(timeframe, last)
+            items.sort(key=lambda x: x["percent"], reverse=True)
+            return items[:limit]
+        elif type == "fallers":
+            items, _ = await _momentum_page_items(timeframe, 1)
+            items.sort(key=lambda x: x["percent"])
+            return items[:limit]
+        else:  # smart
+            # Implement smart trending logic here
+            return []
+    except Exception as e:
+        logging.error(f"Error fetching trending items: {e}")
+        return []
+    
     # watchlist DB objects (on watchlist_pool)
     async with watchlist_pool.acquire() as wconn:
         await wconn.execute("""
@@ -1476,21 +1496,21 @@ async def ext_add_trade(
     return {"ok": True}
 
 # ---- Router wiring (single, final) ----
-app.include_router(auth_me_router)          # /api/auth/me
-app.include_router(trade_finder_router)     # /api/trade-finder...
-app.include_router(ext_router)              # /ext/...
+app.include_router(auth_me_router)          
+app.include_router(trade_finder_router)     
+app.include_router(ext_router)  
 
 # Import-based market router (candles/indicators) from app/routers/market.py
 app.include_router(market_router)           # exposes /api/market/* FROM THE IMPORT
 
 # Local summary router (rename to avoid shadowing)
-app.include_router(market_summary_router)   # exposes /api/market/summary (defined in this file)
+app.include_router(market_summary_router, prefix="/api/market-overview")  # Change this
 
 # AI Engine — include ONCE with NO extra prefix (ai_engine.py already has prefix="/api/ai")
 app.include_router(ai_router)               # exposes /api/ai/*
 app.include_router(players_router)
 
-# Premium-only — mount at /api/smart-buy
+# Premium-only smart buy
 app.include_router(
     smart_buy_router,
     prefix="/api",
@@ -2331,21 +2351,47 @@ async def _eval_alerts_for_pair(card_id: int, platform: str, price_now: float) -
 
 
 async def _alerts_poll_loop():
+    """Improved alerts polling loop"""
     await asyncio.sleep(3)
+    consecutive_errors = 0
+    max_consecutive_errors = 5
+    
     while True:
         try:
+            if not watchlist_pool:
+                await asyncio.sleep(10)
+                continue
+                
             async with watchlist_pool.acquire() as w:
                 pairs = await w.fetch(
                     "SELECT DISTINCT card_id, platform FROM watchlist_alerts"
                 )
-            tasks = [
-                _poll_pair_once(int(rec["card_id"]), rec["platform"])
-                for rec in pairs
-            ]
-            if tasks:
-                await asyncio.gather(*tasks)
+            
+            if pairs:
+                tasks = [
+                    _poll_pair_once(int(rec["card_id"]), rec["platform"])
+                    for rec in pairs
+                ]
+                await asyncio.gather(*tasks, return_exceptions=True)
+            
+            consecutive_errors = 0  # Reset on success
+            
+        except asyncio.CancelledError:
+            logging.info("📢 Alerts loop cancelled")
+            break
         except Exception as e:
-            logging.warning("poll loop error: %s", e)
+            consecutive_errors += 1
+            logging.warning(f"⚠️ Alerts loop error #{consecutive_errors}: {e}")
+            
+            if consecutive_errors >= max_consecutive_errors:
+                logging.error(f"❌ Too many consecutive errors ({consecutive_errors}), stopping alerts loop")
+                break
+            
+            # Exponential backoff on errors
+            error_delay = min(60, 5 * (2 ** consecutive_errors))
+            await asyncio.sleep(error_delay)
+            continue
+            
         await asyncio.sleep(WATCHLIST_POLL_INTERVAL)
 
 
@@ -4163,25 +4209,6 @@ except Exception as e:
 
 # ---------- Candle aggregation loop ----------
 ADVISORY_LOCK_KEY = 7741001  # prevents duplicate loops if you scale
-
-@app.on_event("startup")
-async def _bg_aggregator():
-    async def loop():
-        pool = await get_pool()
-        await asyncio.sleep(5)
-        while True:
-            try:
-                async with pool.acquire() as db:
-                    got = await db.fetchval("SELECT pg_try_advisory_lock($1)", ADVISORY_LOCK_KEY)
-                    if got:
-                        try:
-                            await aggregate_all_timeframes(db, since_hours=48)
-                        finally:
-                            await db.execute("SELECT pg_advisory_unlock($1)", ADVISORY_LOCK_KEY)
-            except Exception as e:
-                print("aggregate error:", e)
-            await asyncio.sleep(60)
-    asyncio.create_task(loop())
 
 # ---------- Global error handler (nicer 500s) ----------
 @app.exception_handler(Exception)
