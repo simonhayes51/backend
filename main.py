@@ -37,24 +37,24 @@ from fastapi.responses import RedirectResponse, JSONResponse, StreamingResponse,
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 from pydantic import BaseModel, Field
+
 class SolveRequest(BaseModel):
     challenge_code: str
     account_id: Optional[int] = None
     use_club_only: bool = False
     prefer_untradeable: bool = True
     max_candidates_per_slot: int = 100
+
 from app.auth.entitlements import compute_entitlements, require_feature
 from app.services.price_history import get_price_history
-from app.services.prices import get_player_price  # still imported (not strictly required after unification)
+from app.services.prices import get_player_price
 from app.routers.smart_buy import router as smart_buy_router
 from app.routers.trade_finder import router as trade_finder_router
 from app.routers.auth_me import router as auth_me_router
 from discord_manager import discord_manager
-from app.db import get_db, get_pool
 from app.routers.market import router as market_router
 from app.routers.ai_engine import router as ai_router
 from app.routers.players import router as players_router
-
 
 # ----------------- BOOTSTRAP ----------------- 
 logging.basicConfig(level=logging.INFO)
@@ -278,8 +278,6 @@ async def _momentum_page_items(tf: str, page: int) -> tuple[list[dict], str]:
     html = await _fetch_momentum_page(tf, page)
     return _extract_items(html), html
 
-
-
 def parse_coin_amount(v) -> int:
     if v is None:
         return 0
@@ -416,8 +414,6 @@ async def _fetch_candidates_for_slot(
         })
     return out
 
-
-# ---------- SOLVER ----------
 # ---------- SOLVER ----------
 async def _solve_challenge(
     con,
@@ -660,431 +656,308 @@ def is_within_quiet_hours(dt: datetime, quiet_start: Optional[dt_time], quiet_en
     if quiet_start <= quiet_end:
         return quiet_start <= t < quiet_end
     return t >= quiet_start or t < quiet_end
-    
-class UserSettings(BaseModel):
-    default_platform: str = "Console"
-    custom_tags: List[str] = Field(default_factory=list)
-    currency_format: str = "coins"
-    theme: str = "dark"
-    timezone: str = "UTC"
-    date_format: str = "US"
-    include_tax_in_profit: bool = True
-    default_chart_range: str = "30d"
-    visible_widgets: List[str] = Field(default_factory=lambda: ["profit", "tax", "balance", "trades"])
 
-class TradingGoal(BaseModel):
-    title: str
-    target_amount: int
-    target_date: Optional[str] = None
-    goal_type: str = "profit"
-    is_completed: bool = False
-
-class ExtSale(BaseModel):
-    trade_id: int
-    player_name: str
-    card_version: Optional[str] = None
-    buy_price: Optional[int] = None
-    sell_price: int
-    timestamp_ms: int
-
-class TradeUpdate(BaseModel):
-    player: Optional[str] = None
-    version: Optional[str] = None
-    quantity: Optional[int] = None
-    buy: Optional[Any] = None
-    sell: Optional[Any] = None
-    platform: Optional[str] = None
-    tag: Optional[str] = None
-    notes: Optional[str] = None
-    timestamp: Optional[str] = None
-
-class WatchlistCreate(BaseModel):
-    card_id: int
-    player_name: str
-    version: Optional[str] = None
-    platform: str  # "ps" | "xbox" | "pc"
-    notes: Optional[str] = None
-
-class WatchlistAlertCreate(BaseModel):
-    card_id: int
-    platform: str  # ps|xbox|pc
-    rise_pct: Optional[float] = 5
-    fall_pct: Optional[float] = 5
-    ref_mode: Optional[str] = "last_close"  # last_close | fixed | started_price
-    ref_price: Optional[float] = None
-    cooloff_minutes: Optional[int] = 30
-    quiet_start: Optional[str] = None  # "22:00"
-    quiet_end: Optional[str] = None    # "07:00"
-    prefer_dm: Optional[bool] = True
-    fallback_channel_id: Optional[str] = None
-    
-pool = None
-player_pool = None
-watchlist_pool = None
-_watchlist_task: Optional[asyncio.Task] = None
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global pool, player_pool, watchlist_pool, _watchlist_task, HTTP_SESSION
-
-    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
-    player_pool = pool if PLAYER_DATABASE_URL == DATABASE_URL else await asyncpg.create_pool(PLAYER_DATABASE_URL, min_size=1, max_size=10)
-    watchlist_pool = pool if WATCHLIST_DATABASE_URL == DATABASE_URL else await asyncpg.create_pool(WATCHLIST_DATABASE_URL, min_size=1, max_size=10)
-
-    # Shared HTTP session
-    HTTP_SESSION = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
-
-    # Expose pools
-    app.state.pool = pool
-    app.state.player_pool = player_pool
-    app.state.watchlist_pool = watchlist_pool
-
-    # ---------- Core tables (create-first so fresh DBs work) ----------
-    async with pool.acquire() as conn:
-        # trades
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS trades (
-            user_id TEXT NOT NULL,
-            player TEXT NOT NULL,
-            version TEXT NOT NULL,
-            buy INTEGER NOT NULL,
-            sell INTEGER NOT NULL,
-            quantity INTEGER NOT NULL DEFAULT 1,
-            platform TEXT NOT NULL,
-            profit INTEGER NOT NULL DEFAULT 0,
-            ea_tax INTEGER NOT NULL DEFAULT 0,
-            tag TEXT,
-            notes TEXT,
-            timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            trade_id BIGINT
-        )""")
-        await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS trades_user_trade_uidx ON trades (user_id, trade_id)")
-        await conn.execute("DROP INDEX IF EXISTS idx_trades_date")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_user_ts ON trades(user_id, timestamp)")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_tag ON trades(user_id, tag)")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_platform ON trades(user_id, platform)")
-
-        # users (plan/premium/roles read by compute_entitlements)
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-          id TEXT PRIMARY KEY,
-          plan TEXT,
-          premium_until TIMESTAMPTZ,
-          roles JSONB DEFAULT '[]'
-        )""")
-        
-
-
-        # portfolio
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS portfolio (
-            user_id TEXT PRIMARY KEY,
-            starting_balance INTEGER NOT NULL DEFAULT 0
-        )""")
-
-        # usersettings
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS usersettings (
-            id SERIAL PRIMARY KEY,
-            user_id VARCHAR(255) UNIQUE NOT NULL,
-            default_platform VARCHAR(50) DEFAULT 'Console',
-            custom_tags JSONB DEFAULT '[]',
-            currency_format VARCHAR(20) DEFAULT 'coins',
-            theme VARCHAR(20) DEFAULT 'dark',
-            timezone VARCHAR(50) DEFAULT 'UTC',
-            date_format VARCHAR(10) DEFAULT 'US',
-            include_tax_in_profit BOOLEAN DEFAULT true,
-            default_chart_range VARCHAR(10) DEFAULT '30d',
-            visible_widgets JSONB DEFAULT '["profit", "tax", "balance", "trades"]',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )""")
-
-        # user_profiles
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS user_profiles (
-            id SERIAL PRIMARY KEY,
-            user_id VARCHAR(255) UNIQUE NOT NULL,
-            username VARCHAR(255),
-            avatar_url TEXT,
-            global_name VARCHAR(255),
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )""")
-
-        # Add premium status to user_profiles
-        await conn.execute("""
-        ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS is_premium BOOLEAN DEFAULT FALSE
-        """)
-        await conn.execute("""
-        ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS premium_until TIMESTAMP WITH TIME ZONE
-        """)
-
-        # Billing tables
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS subscriptions (
-            id SERIAL PRIMARY KEY,
-            user_id VARCHAR(255) NOT NULL REFERENCES user_profiles(user_id),
-            stripe_subscription_id VARCHAR(255) UNIQUE,
-            stripe_customer_id VARCHAR(255),
-            status VARCHAR(50) NOT NULL DEFAULT 'active',
-            plan_id VARCHAR(255) NOT NULL,
-            current_period_start TIMESTAMP WITH TIME ZONE,
-            current_period_end TIMESTAMP WITH TIME ZONE,
-            cancel_at_period_end BOOLEAN DEFAULT FALSE,
-            created_at TIMESTAMP DEFAULT NOW(),
-            updated_at TIMESTAMP DEFAULT NOW()
-        ) """)
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS payments (
-            id SERIAL PRIMARY KEY,
-            user_id VARCHAR(255) NOT NULL,
-            subscription_id INTEGER REFERENCES subscriptions(id),
-            stripe_payment_intent_id VARCHAR(255),
-            amount INTEGER NOT NULL,
-            currency VARCHAR(3) DEFAULT 'GBP',
-            status VARCHAR(50) NOT NULL,
-            created_at TIMESTAMP DEFAULT NOW()
-        ) """)
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS discord_roles (
-            id SERIAL PRIMARY KEY,
-            user_id VARCHAR(255) NOT NULL,
-            discord_user_id VARCHAR(255) NOT NULL,
-            role_id VARCHAR(255) NOT NULL,
-            assigned_at TIMESTAMP DEFAULT NOW(),
-            expires_at TIMESTAMP
-        ) """)
-
-        # trading_goals
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS trading_goals (
-            id SERIAL PRIMARY KEY,
-            user_id VARCHAR(255) NOT NULL,
-            title VARCHAR(255) NOT NULL,
-            target_amount INTEGER NOT NULL,
-            target_date DATE,
-            goal_type VARCHAR(50) DEFAULT 'profit',
-            is_completed BOOLEAN DEFAULT FALSE,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            completed_at TIMESTAMP
-        )""")
-
-        # backfill trade_id if NULL (compat)
-        await conn.execute("""
-        WITH to_fix AS (
-          SELECT ctid, user_id,
-                 ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY timestamp, player) AS rn
-          FROM trades
-          WHERE trade_id IS NULL
-        )
-        UPDATE trades t
-           SET trade_id = ((EXTRACT(EPOCH FROM NOW())*1000)::bigint) + tf.rn
-        FROM to_fix tf
-        WHERE t.ctid = tf.ctid AND t.trade_id IS NULL
-        """)
-
-        # fut_trades raw ingest
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS fut_trades (
-          id           BIGSERIAL PRIMARY KEY,
-          discord_id   TEXT NOT NULL,
-          trade_id     BIGINT NOT NULL,
-          player_name  TEXT NOT NULL,
-          card_version TEXT,
-          buy_price    INTEGER,
-          sell_price   INTEGER NOT NULL,
-          ts           TIMESTAMPTZ NOT NULL,
-          source       TEXT DEFAULT 'webapp'
-        )""")
-        await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS fut_trades_uidx ON fut_trades (discord_id, trade_id)")
-
-        # events (Next Promo)
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS events (
-          id BIGSERIAL PRIMARY KEY,
-          name TEXT NOT NULL,
-          kind TEXT NOT NULL,
-          start_at TIMESTAMPTZ NOT NULL,
-          end_at TIMESTAMPTZ,
-          confidence TEXT NOT NULL DEFAULT 'heuristic',
-          source TEXT NOT NULL DEFAULT 'rule:18:00',
-          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        )""")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_events_start ON events(start_at)")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind)")
-
-        # Smart Buy tables (single, rich schema only)
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS smart_buy_suggestions (
-            id BIGSERIAL PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            card_id TEXT NOT NULL,
-            suggestion_type VARCHAR(50) NOT NULL,
-            current_price INTEGER NOT NULL,
-            target_price INTEGER NOT NULL,
-            expected_profit INTEGER NOT NULL,
-            risk_level VARCHAR(20) NOT NULL,
-            confidence_score INTEGER NOT NULL,
-            priority_score INTEGER NOT NULL,
-            reasoning TEXT NOT NULL,
-            time_to_profit VARCHAR(50),
-            platform VARCHAR(10) NOT NULL,
-            market_state VARCHAR(30) NOT NULL,
-            created_at TIMESTAMPTZ DEFAULT NOW(),
-            expires_at TIMESTAMPTZ
-        )""")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_smart_buy_suggestions_user_created ON smart_buy_suggestions(user_id, created_at DESC)")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_smart_buy_suggestions_card_platform ON smart_buy_suggestions(card_id, platform)")
-
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS smart_buy_feedback (
-            id BIGSERIAL PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            card_id TEXT NOT NULL,
-            action VARCHAR(20) NOT NULL,
-            notes TEXT,
-            actual_buy_price INTEGER,
-            actual_sell_price INTEGER,
-            actual_profit INTEGER,
-            timestamp TIMESTAMPTZ DEFAULT NOW()
-        )""")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_smart_buy_feedback_user_action ON smart_buy_feedback(user_id, action)")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_smart_buy_feedback_card ON smart_buy_feedback(card_id)")
-
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS market_states (
-            id BIGSERIAL PRIMARY KEY,
-            platform VARCHAR(10) NOT NULL,
-            state VARCHAR(30) NOT NULL,
-            confidence_score INTEGER NOT NULL,
-            detected_at TIMESTAMPTZ DEFAULT NOW(),
-            indicators JSONB
-        )""")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_market_states_platform_detected ON market_states(platform, detected_at DESC)")
-
-        # small cache table (if you want to keep it)
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS smart_buy_market_cache (
-            id SMALLINT PRIMARY KEY DEFAULT 1,
-            payload JSONB NOT NULL,
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )""")
-
-    async def fetch_trending_items(type: str, timeframe: str, limit: int) -> List[dict]:
-    """Fetch trending items - placeholder implementation"""
-    try:
-        if type == "risers":
-            _, html = await _momentum_page_items(timeframe, 1)
-            last = _parse_last_page_number(html)
-            items, _ = await _momentum_page_items(timeframe, last)
-            items.sort(key=lambda x: x["percent"], reverse=True)
-            return items[:limit]
-        elif type == "fallers":
-            items, _ = await _momentum_page_items(timeframe, 1)
-            items.sort(key=lambda x: x["percent"])
-            return items[:limit]
-        else:  # smart
-            # Implement smart trending logic here
-            return []
-    except Exception as e:
-        logging.error(f"Error fetching trending items: {e}")
-        return []
-    
-    # watchlist DB objects (on watchlist_pool)
-    async with watchlist_pool.acquire() as wconn:
-        await wconn.execute("""
-        CREATE TABLE IF NOT EXISTS watchlist (
-          id SERIAL PRIMARY KEY,
-          user_id TEXT NOT NULL,
-          card_id BIGINT NOT NULL,
-          player_name TEXT NOT NULL,
-          version TEXT,
-          platform TEXT NOT NULL,
-          started_price INTEGER NOT NULL,
-          started_at TIMESTAMP NOT NULL DEFAULT NOW(),
-          last_price INTEGER,
-          last_checked TIMESTAMP,
-          notes TEXT
-        )""")
-        await wconn.execute("CREATE INDEX IF NOT EXISTS idx_watchlist_user ON watchlist(user_id)")
-        await wconn.execute("""
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_watchlist_unique
-        ON watchlist(user_id, card_id, platform)
-        """)
-
-        await wconn.execute("""
-        CREATE TABLE IF NOT EXISTS watchlist_alerts (
-          id BIGSERIAL PRIMARY KEY,
-          user_id TEXT NOT NULL,
-          user_discord_id TEXT,
-          card_id BIGINT NOT NULL,
-          platform TEXT NOT NULL CHECK (platform IN ('ps','xbox','pc')),
-          ref_mode TEXT NOT NULL DEFAULT 'last_close',
-          ref_price NUMERIC,
-          rise_pct NUMERIC DEFAULT 5,
-          fall_pct NUMERIC DEFAULT 5,
-          cooloff_minutes INT NOT NULL DEFAULT 30,
-          quiet_start TIME,
-          quiet_end TIME,
-          prefer_dm BOOLEAN NOT NULL DEFAULT TRUE,
-          fallback_channel_id TEXT,
-          last_alert_at TIMESTAMPTZ,
-          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        )""")
-        await wconn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_user ON watchlist_alerts(user_id)")
-        await wconn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_pair ON watchlist_alerts(card_id, platform)")
-
-        await wconn.execute("""
-        CREATE TABLE IF NOT EXISTS alerts_log (
-          id BIGSERIAL PRIMARY KEY,
-          user_id TEXT NOT NULL,
-          user_discord_id TEXT,
-          card_id BIGINT NOT NULL,
-          platform TEXT NOT NULL,
-          direction TEXT NOT NULL,
-          pct NUMERIC NOT NULL,
-          price NUMERIC NOT NULL,
-          ref_mode TEXT NOT NULL,
-          ref_price NUMERIC,
-          sent_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        )""")
-        await wconn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_user_time ON alerts_log(user_id, sent_at)")
-
-    # Start alerts loop
-    _watchlist_task = asyncio.create_task(_alerts_poll_loop())
-    logging.info("â Watchlist alerts loop started (%ss)", WATCHLIST_POLL_INTERVAL)
-
-    try:
-        yield
-    finally:
-        if _watchlist_task:
-            _watchlist_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await _watchlist_task
-        for p in {pool, player_pool, watchlist_pool}:
-            if p is not None:
-                await p.close()
-        if HTTP_SESSION:
-            await HTTP_SESSION.close()
-                
 # --- FastAPI app ---
 app = FastAPI(lifespan=lifespan)
-# ensure all routes use the same pool created in lifespan()
-try:
-    from app.db import get_db as imported_get_db  # the one your routes currently reference
-except Exception:
-    imported_get_db = None
 
-async def _get_db():
-    # use the pool we created in lifespan()
+# Database dependency functions
+async def get_db():
+    """Main database connection dependency"""
+    if not hasattr(app.state, 'pool') or app.state.pool is None:
+        raise HTTPException(500, "Database pool not initialized") 
     async with app.state.pool.acquire() as conn:
         yield conn
 
-# make EVERY Depends(get_db) in already-defined routes use our _get_db
-if imported_get_db is not None:
-    app.dependency_overrides[imported_get_db] = _get_db
+async def get_player_db():
+    """Player database connection dependency"""
+    if not hasattr(app.state, 'player_pool') or app.state.player_pool is None:
+        raise HTTPException(500, "Player database pool not initialized")
+    async with app.state.player_pool.acquire() as conn:
+        yield conn
 
+async def get_watchlist_db():
+    """Watchlist database connection dependency"""
+    if not hasattr(app.state, 'watchlist_pool') or app.state.watchlist_pool is None:
+        raise HTTPException(500, "Watchlist database pool not initialized")
+    async with app.state.watchlist_pool.acquire() as conn:
+        yield conn
+
+def get_current_user(request: Request) -> str:
+    user_id = request.session.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    return user_id
+
+async def get_discord_user_info(access_token: str):
+    async with aiohttp.ClientSession() as session:
+        async with session.get(DISCORD_USERS_ME, headers={"Authorization": f"Bearer {access_token}"}) as resp:
+            if resp.status != 200:
+                return None
+            return await resp.json()
+
+async def get_member_role_names(discord_user_id: str) -> list[str]:
+    if not (DISCORD_BOT_TOKEN and DISCORD_SERVER_ID):
+        return []
+    try:
+        async with aiohttp.ClientSession(headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"}) as s:
+            # Member -> role ids
+            async with s.get(f"https://discord.com/api/guilds/{DISCORD_SERVER_ID}/members/{discord_user_id}") as r:
+                if r.status != 200:
+                    return []
+                member = await r.json()
+                role_ids = set(str(x) for x in (member.get("roles") or []))
+
+            # Guild roles -> map id->name
+            async with s.get(f"https://discord.com/api/guilds/{DISCORD_SERVER_ID}/roles") as r2:
+                if r2.status != 200:
+                    return []
+                roles_meta = await r2.json()
+                id_to_name = {str(rr["id"]): rr["name"] for rr in roles_meta}
+
+        return [id_to_name.get(rid, rid) for rid in role_ids]
+    except Exception:
+        return []
+
+# --- Premium by Discord Role ---
+DISCORD_PREMIUM_ROLE_ID = os.getenv("DISCORD_PREMIUM_ROLE_ID")
+
+_ROLE_CACHE: dict[str, dict] = {}
+ROLE_CACHE_TTL = 300  # 5 minutes
+
+async def user_has_premium_role(user_id: str) -> bool:
+    """Return True if the member has the Premium role in your guild (cached)."""
+    if not (DISCORD_BOT_TOKEN and DISCORD_SERVER_ID and DISCORD_PREMIUM_ROLE_ID):
+        return False
+
+    now = time.time()
+    hit = _ROLE_CACHE.get(user_id)
+    if hit and (now - hit["at"] < ROLE_CACHE_TTL):
+        return bool(hit["ok"])
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"https://discord.com/api/v10/guilds/{DISCORD_SERVER_ID}/members/{user_id}",
+                headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"}
+            ) as resp:
+                if resp.status != 200:
+                    ok = False
+                else:
+                    js = await resp.json()
+                    roles = js.get("roles") or []
+                    ok = DISCORD_PREMIUM_ROLE_ID in roles
+    except Exception:
+        ok = False
+
+    _ROLE_CACHE[user_id] = {"ok": ok, "at": now}
+    return ok
+
+async def check_server_membership(user_id: str) -> bool:
+    if not (DISCORD_BOT_TOKEN and DISCORD_SERVER_ID):
+        return True
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"https://discord.com/api/guilds/{DISCORD_SERVER_ID}/members/{user_id}",
+                headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"}
+            ) as resp:
+                return resp.status == 200
+    except Exception:
+        return False
+
+def issue_extension_token(discord_id: str) -> str:
+    now = int(time.time())
+    payload = {"sub": discord_id, "scope": "trade:ingest", "iat": now, "exp": now + JWT_TTL_SECONDS, "iss": JWT_ISSUER}
+    return jwt.encode(payload, JWT_PRIVATE_KEY, algorithm="HS256")
+
+def require_extension_jwt(request: Request):
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing Bearer token")
+    token = auth[7:]
+    try:
+        payload = jwt.decode(token, JWT_PRIVATE_KEY, algorithms=["HS256"], issuer=JWT_ISSUER)
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
+    scope = payload.get("scope")
+    if scope != "trade:ingest":
+        raise HTTPException(status_code=403, detail="Insufficient scope")
+    return SimpleNamespace(discord_id=payload.get("sub"))
+
+# Unified FUT.GG price fetch with lightweight cache + timeout + tiny retry (platform-aware)
+async def fetch_price(card_id: int, platform: str) -> Dict[str, Any]:
+    platform = (platform or "").lower()
+    key = f"{card_id}|{platform}"
+    now = time.time()
+
+    # serve fresh cache if still valid
+    if key in _price_cache and (now - _price_cache[key]["at"] < PRICE_CACHE_TTL):
+        c = _price_cache[key]
+        return {"price": c["price"], "isExtinct": c["isExtinct"], "updatedAt": c["updatedAt"]}
+
+    url = f"{FUTGG_BASE}/{card_id}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-GB,en;q=0.9",
+        "Referer": "https://www.fut.gg/",
+        "Origin": "https://www.fut.gg",
+    }
+    timeout = aiohttp.ClientTimeout(total=12)
+
+    def pick_platform_node(current: Dict[str, Any]) -> Dict[str, Any]:
+        # supports both flat and per-platform shapes
+        if any(k in current for k in ("ps", "xbox", "pc", "playstation")):
+            key_map = {"ps": "ps", "xbox": "xbox", "pc": "pc", "console": "ps"}
+            k = key_map.get(platform, "ps")
+            node = current.get(k)
+            if not node and k == "ps":
+                node = current.get("playstation")
+            return node or {}
+        return current
+
+    last_err = None
+    sess = HTTP_SESSION or aiohttp.ClientSession(timeout=timeout)
+    must_close = sess is not HTTP_SESSION
+    try:
+        for attempt in (0, 1, 2):  # tiny retry with backoff
+            try:
+                async with sess.get(url, headers=headers, timeout=timeout) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        current = (data.get("data") or {}).get("currentPrice") or {}
+                        node = pick_platform_node(current)
+                        price = node.get("price")
+                        is_extinct = node.get("isExtinct", False)
+                        updated_at = node.get("priceUpdatedAt") or current.get("priceUpdatedAt")
+                        _price_cache[key] = {"at": now, "price": price, "isExtinct": is_extinct, "updatedAt": updated_at}
+                        return {"price": price, "isExtinct": is_extinct, "updatedAt": updated_at}
+                    last_err = f"HTTP {r.status}"
+            except Exception as e:
+                last_err = str(e)
+
+            # backoff: 0.2s, 0.6s, 1.4s
+            await asyncio.sleep(0.2 * (3 ** attempt))
+    finally:
+        if must_close:
+            await sess.close()
+
+    # fall back to stale cache if available
+    cached = _price_cache.get(key)
+    if cached:
+        return {"price": cached["price"], "isExtinct": cached["isExtinct"], "updatedAt": cached["updatedAt"]}
+    raise HTTPException(status_code=502, detail=f"Failed to fetch price: {last_err}")
+
+ext_router = APIRouter()
+
+@ext_router.get("/ext/ping")
+async def ext_ping(auth = Depends(require_extension_jwt)):
+    return {"ok": True, "sub": auth.discord_id}
+
+@ext_router.post("/ext/trades")
+async def ext_add_trade(
+    sale: ExtSale,
+    auth = Depends(require_extension_jwt),
+    conn = Depends(get_db),
+):
+    discord_id = auth.discord_id or "unknown"
+    ts = datetime.fromtimestamp(int(sale.timestamp_ms) / 1000, tz=timezone.utc)
+
+    await conn.execute("""
+        INSERT INTO fut_trades (discord_id, trade_id, player_name, card_version, buy_price, sell_price, ts, source)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,'webapp')
+        ON CONFLICT (discord_id, trade_id)
+        DO UPDATE SET
+            player_name  = EXCLUDED.player_name,
+            card_version = COALESCE(EXCLUDED.card_version, fut_trades.card_version),
+            buy_price    = COALESCE(EXCLUDED.buy_price, fut_trades.buy_price),
+            sell_price   = EXCLUDED.sell_price,
+            ts           = EXCLUDED.ts
+    """, discord_id, int(sale.trade_id), sale.player_name, sale.card_version, sale.buy_price, sale.sell_price, ts)
+
+    player   = sale.player_name
+    version  = str(sale.card_version or "Standard")
+    qty      = 1
+    buy      = int(sale.buy_price or 0)
+    sell     = int(sale.sell_price or 0)
+    platform = "ps"
+    tag      = "fut-webapp"
+    ea_tax   = int(round(sell * qty * 0.05))
+    profit   = (sell - buy) * qty
+
+    await conn.execute("""
+        INSERT INTO trades (
+            user_id, player, version, buy, sell, quantity, platform,
+            profit, ea_tax, tag, notes, timestamp, trade_id
+        )
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+        ON CONFLICT (user_id, trade_id)
+        DO UPDATE SET
+            sell      = EXCLUDED.sell,
+            buy       = EXCLUDED.buy,
+            profit    = EXCLUDED.profit,
+            ea_tax    = EXCLUDED.ea_tax,
+            version   = EXCLUDED.version,
+            platform  = EXCLUDED.platform,
+            tag       = EXCLUDED.tag,
+            timestamp = EXCLUDED.timestamp
+    """, discord_id, player, version, buy, sell, qty, platform,
+         profit, ea_tax, tag, "", ts, int(sale.trade_id))
+
+    return {"ok": True}
+
+# ---- Router wiring (single, final) ----
+app.include_router(auth_me_router)          
+app.include_router(trade_finder_router)     
+app.include_router(ext_router)  
+
+# Import-based market router (candles/indicators) from app/routers/market.py
+app.include_router(market_router)           # exposes /api/market/* FROM THE IMPORT
+
+# Local summary router
+app.include_router(market_summary_router)   # exposes /api/market/summary
+
+# AI Engine — include ONCE with NO extra prefix (ai_engine.py already has prefix="/api/ai")
+app.include_router(ai_router)               # exposes /api/ai/*
+app.include_router(players_router)
+
+# Premium-only smart buy - router already has its own prefix and dependencies
+app.include_router(smart_buy_router)
+
+# Optional squad router
+try:
+    from app.routers.squad import router as squad_router
+    app.include_router(squad_router, prefix="/api")
+    logging.info("✅ Squad router loaded")
+except Exception as e:
+    logging.warning("⚠️ Squad router not loaded: %s", e)
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    # Keep our structured `detail` payloads (e.g., {feature, message, upgrade_url})
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://app.futhub.co.uk",
+        "https://www.futhub.co.uk",
+        "https://futhub.co.uk",
+        "https://api.futhub.co.uk",
+        "http://localhost:5173",
+        "http://localhost:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=SECRET_KEY,
+    same_site="none",
+    https_only=True,
+)
 
 from pydantic import BaseModel
 
@@ -1094,6 +967,19 @@ class SbcSolveReq(BaseModel):
     use_club_only: bool = False
     prefer_untradeable: bool = True
     max_candidates_per_slot: int = 100
+
+@app.get("/")
+async def root():
+    return {"message": "FUT Dashboard API", "status": "healthy"}
+
+@app.get("/health")
+async def health_check():
+    try:
+        async with pool.acquire() as conn:
+            await conn.fetchval("SELECT 1")
+        return {"status": "healthy", "database": "connected"}
+    except Exception as e:
+        return {"status": "unhealthy", "database": "disconnected", "error": str(e)}
 
 @app.get("/api/sbc/challenge/{code}")
 async def sbc_get_challenge(code: str, conn=Depends(get_db)):
@@ -1232,304 +1118,6 @@ async def get_entitlements(request: Request):
             "last_validated": datetime.now(timezone.utc).isoformat()
         }
 
-@app.exception_handler(HTTPException)
-async def http_exception_handler(request: Request, exc: HTTPException):
-    # Keep our structured `detail` payloads (e.g., {feature, message, upgrade_url})
-    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "https://app.futhub.co.uk",
-        "https://www.futhub.co.uk",
-        "https://futhub.co.uk",
-        "https://api.futhub.co.uk",
-        "http://localhost:5173",
-        "http://localhost:3000",
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-app.add_middleware(
-    SessionMiddleware,
-    secret_key=SECRET_KEY,
-    same_site="none",
-    https_only=True,
-)
-
-# Routers
-
-async def get_player_db():
-    async with app.state.player_pool.acquire() as conn:
-        yield conn
-
-async def get_watchlist_db():
-    async with watchlist_pool.acquire() as connection:
-        yield connection
-
-def get_current_user(request: Request) -> str:
-    user_id = request.session.get("user_id")
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    return user_id
-
-async def get_discord_user_info(access_token: str):
-    async with aiohttp.ClientSession() as session:
-        async with session.get(DISCORD_USERS_ME, headers={"Authorization": f"Bearer {access_token}"}) as resp:
-            if resp.status != 200:
-                return None
-            return await resp.json()
-
-async def get_member_role_names(discord_user_id: str) -> list[str]:
-    if not (DISCORD_BOT_TOKEN and DISCORD_SERVER_ID):
-        return []
-    try:
-        async with aiohttp.ClientSession(headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"}) as s:
-            # Member -> role ids
-            async with s.get(f"https://discord.com/api/guilds/{DISCORD_SERVER_ID}/members/{discord_user_id}") as r:
-                if r.status != 200:
-                    return []
-                member = await r.json()
-                role_ids = set(str(x) for x in (member.get("roles") or []))
-
-            # Guild roles -> map id->name
-            async with s.get(f"https://discord.com/api/guilds/{DISCORD_SERVER_ID}/roles") as r2:
-                if r2.status != 200:
-                    return []
-                roles_meta = await r2.json()
-                id_to_name = {str(rr["id"]): rr["name"] for rr in roles_meta}
-
-        return [id_to_name.get(rid, rid) for rid in role_ids]
-    except Exception:
-        return []
-
-
-# --- Premium by Discord Role ---
-DISCORD_PREMIUM_ROLE_ID = os.getenv("DISCORD_PREMIUM_ROLE_ID")
-
-_ROLE_CACHE: dict[str, dict] = {}
-ROLE_CACHE_TTL = 300  # 5 minutes
-
-async def user_has_premium_role(user_id: str) -> bool:
-    """Return True if the member has the Premium role in your guild (cached)."""
-    if not (DISCORD_BOT_TOKEN and DISCORD_SERVER_ID and DISCORD_PREMIUM_ROLE_ID):
-        return False
-
-    now = time.time()
-    hit = _ROLE_CACHE.get(user_id)
-    if hit and (now - hit["at"] < ROLE_CACHE_TTL):
-        return bool(hit["ok"])
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"https://discord.com/api/v10/guilds/{DISCORD_SERVER_ID}/members/{user_id}",
-                headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"}
-            ) as resp:
-                if resp.status != 200:
-                    ok = False
-                else:
-                    js = await resp.json()
-                    roles = js.get("roles") or []
-                    ok = DISCORD_PREMIUM_ROLE_ID in roles
-    except Exception:
-        ok = False
-
-    _ROLE_CACHE[user_id] = {"ok": ok, "at": now}
-    return ok
-
-
-async def check_server_membership(user_id: str) -> bool:
-    if not (DISCORD_BOT_TOKEN and DISCORD_SERVER_ID):
-        return True
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"https://discord.com/api/guilds/{DISCORD_SERVER_ID}/members/{user_id}",
-                headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"}
-            ) as resp:
-                return resp.status == 200
-    except Exception:
-        return False
-
-def issue_extension_token(discord_id: str) -> str:
-    now = int(time.time())
-    payload = {"sub": discord_id, "scope": "trade:ingest", "iat": now, "exp": now + JWT_TTL_SECONDS, "iss": JWT_ISSUER}
-    return jwt.encode(payload, JWT_PRIVATE_KEY, algorithm="HS256")
-
-def require_extension_jwt(request: Request):
-    auth = request.headers.get("authorization", "")
-    if not auth.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing Bearer token")
-    token = auth[7:]
-    try:
-        payload = jwt.decode(token, JWT_PRIVATE_KEY, algorithms=["HS256"], issuer=JWT_ISSUER)
-    except Exception as e:
-        raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
-    scope = payload.get("scope")
-    if scope != "trade:ingest":
-        raise HTTPException(status_code=403, detail="Insufficient scope")
-    return SimpleNamespace(discord_id=payload.get("sub"))
-
-# Unified FUT.GG price fetch with lightweight cache + timeout + tiny retry (platform-aware)
-async def fetch_price(card_id: int, platform: str) -> Dict[str, Any]:
-    platform = (platform or "").lower()
-    key = f"{card_id}|{platform}"
-    now = time.time()
-
-    # serve fresh cache if still valid
-    if key in _price_cache and (now - _price_cache[key]["at"] < PRICE_CACHE_TTL):
-        c = _price_cache[key]
-        return {"price": c["price"], "isExtinct": c["isExtinct"], "updatedAt": c["updatedAt"]}
-
-    url = f"{FUTGG_BASE}/{card_id}"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-GB,en;q=0.9",
-        "Referer": "https://www.fut.gg/",
-        "Origin": "https://www.fut.gg",
-    }
-    timeout = aiohttp.ClientTimeout(total=12)
-
-    def pick_platform_node(current: Dict[str, Any]) -> Dict[str, Any]:
-        # supports both flat and per-platform shapes
-        if any(k in current for k in ("ps", "xbox", "pc", "playstation")):
-            key_map = {"ps": "ps", "xbox": "xbox", "pc": "pc", "console": "ps"}
-            k = key_map.get(platform, "ps")
-            node = current.get(k)
-            if not node and k == "ps":
-                node = current.get("playstation")
-            return node or {}
-        return current
-
-    last_err = None
-    sess = HTTP_SESSION or aiohttp.ClientSession(timeout=timeout)
-    must_close = sess is not HTTP_SESSION
-    try:
-        for attempt in (0, 1, 2):  # tiny retry with backoff
-            try:
-                async with sess.get(url, headers=headers, timeout=timeout) as r:
-                    if r.status == 200:
-                        data = await r.json()
-                        current = (data.get("data") or {}).get("currentPrice") or {}
-                        node = pick_platform_node(current)
-                        price = node.get("price")
-                        is_extinct = node.get("isExtinct", False)
-                        updated_at = node.get("priceUpdatedAt") or current.get("priceUpdatedAt")
-                        _price_cache[key] = {"at": now, "price": price, "isExtinct": is_extinct, "updatedAt": updated_at}
-                        return {"price": price, "isExtinct": is_extinct, "updatedAt": updated_at}
-                    last_err = f"HTTP {r.status}"
-            except Exception as e:
-                last_err = str(e)
-
-            # backoff: 0.2s, 0.6s, 1.4s
-            await asyncio.sleep(0.2 * (3 ** attempt))
-    finally:
-        if must_close:
-            await sess.close()
-
-    # fall back to stale cache if available
-    cached = _price_cache.get(key)
-    if cached:
-        return {"price": cached["price"], "isExtinct": cached["isExtinct"], "updatedAt": cached["updatedAt"]}
-    raise HTTPException(status_code=502, detail=f"Failed to fetch price: {last_err}")
-    
-ext_router = APIRouter()
-
-@ext_router.get("/ext/ping")
-async def ext_ping(auth = Depends(require_extension_jwt)):
-    return {"ok": True, "sub": auth.discord_id}
-
-@ext_router.post("/ext/trades")
-async def ext_add_trade(
-    sale: ExtSale,
-    auth = Depends(require_extension_jwt),
-    conn = Depends(get_db),
-):
-    discord_id = auth.discord_id or "unknown"
-    ts = datetime.fromtimestamp(int(sale.timestamp_ms) / 1000, tz=timezone.utc)
-
-    await conn.execute("""
-        INSERT INTO fut_trades (discord_id, trade_id, player_name, card_version, buy_price, sell_price, ts, source)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,'webapp')
-        ON CONFLICT (discord_id, trade_id)
-        DO UPDATE SET
-            player_name  = EXCLUDED.player_name,
-            card_version = COALESCE(EXCLUDED.card_version, fut_trades.card_version),
-            buy_price    = COALESCE(EXCLUDED.buy_price, fut_trades.buy_price),
-            sell_price   = EXCLUDED.sell_price,
-            ts           = EXCLUDED.ts
-    """, discord_id, int(sale.trade_id), sale.player_name, sale.card_version, sale.buy_price, sale.sell_price, ts)
-
-    player   = sale.player_name
-    version  = str(sale.card_version or "Standard")
-    qty      = 1
-    buy      = int(sale.buy_price or 0)
-    sell     = int(sale.sell_price or 0)
-    platform = "ps"
-    tag      = "fut-webapp"
-    ea_tax   = int(round(sell * qty * 0.05))
-    profit   = (sell - buy) * qty
-
-    await conn.execute("""
-        INSERT INTO trades (
-            user_id, player, version, buy, sell, quantity, platform,
-            profit, ea_tax, tag, notes, timestamp, trade_id
-        )
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
-        ON CONFLICT (user_id, trade_id)
-        DO UPDATE SET
-            sell      = EXCLUDED.sell,
-            buy       = EXCLUDED.buy,
-            profit    = EXCLUDED.profit,
-            ea_tax    = EXCLUDED.ea_tax,
-            version   = EXCLUDED.version,
-            platform  = EXCLUDED.platform,
-            tag       = EXCLUDED.tag,
-            timestamp = EXCLUDED.timestamp
-    """, discord_id, player, version, buy, sell, qty, platform,
-         profit, ea_tax, tag, "", ts, int(sale.trade_id))
-
-    return {"ok": True}
-
-# ---- Router wiring (single, final) ----
-app.include_router(auth_me_router)          
-app.include_router(trade_finder_router)     
-app.include_router(ext_router)  
-
-# Import-based market router (candles/indicators) from app/routers/market.py
-app.include_router(market_router)           # exposes /api/market/* FROM THE IMPORT
-
-# Local summary router (rename to avoid shadowing)
-app.include_router(market_summary_router, prefix="/api/market-overview")  # Change this
-
-# AI Engine — include ONCE with NO extra prefix (ai_engine.py already has prefix="/api/ai")
-app.include_router(ai_router)               # exposes /api/ai/*
-app.include_router(players_router)
-
-# Premium-only smart buy
-app.include_router(
-    smart_buy_router,
-    prefix="/api",
-    dependencies=[Depends(require_feature("smart_buy"))],
-)
-
-@app.get("/")
-async def root():
-    return {"message": "FUT Dashboard API", "status": "healthy"}
-
-@app.get("/health")
-async def health_check():
-    try:
-        async with pool.acquire() as conn:
-            await conn.fetchval("SELECT 1")
-        return {"status": "healthy", "database": "connected"}
-    except Exception as e:
-        return {"status": "unhealthy", "database": "disconnected", "error": str(e)}
-
 @app.get("/api/login")
 async def login():
     state = secrets.token_urlsafe(24)
@@ -1540,13 +1128,9 @@ async def login():
         "response_type": "code",
         "scope": "identify",
         "state": state,
-        # change this:
-        # "prompt": "none",
-        # to either remove it or:
         "prompt": "consent",
     }
     return RedirectResponse(f"{DISCORD_OAUTH_AUTHORIZE}?{urlencode(params)}")
-
 
 @app.get("/api/price-history")
 async def price_history(playerId: int, platform: str = "ps", tf: str = "today"):
@@ -1557,7 +1141,6 @@ async def price_history(playerId: int, platform: str = "ps", tf: str = "today"):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Upstream error: {e}")
 
-# REPLACE your existing callback function with this
 @app.get("/api/callback")
 async def callback(request: Request):
     err = request.query_params.get("error")
@@ -1662,7 +1245,7 @@ async def oauth_start(redirect_uri: str):
         "prompt": "consent",
     }
     return RedirectResponse(f"{DISCORD_OAUTH_AUTHORIZE}?{urlencode(params)}")
-    
+
 async def fetch_dashboard_data(user_id: str, conn):
     portfolio = await conn.fetchrow("SELECT starting_balance FROM portfolio WHERE user_id=$1", user_id)
     stats = await conn.fetchrow(
@@ -1988,7 +1571,6 @@ async def watchlist_usage(request: Request, user_id: str = Depends(get_current_u
         "is_premium": bool(ent["is_premium"]),
     }
 
-
 @app.get("/api/watchlist")
 async def list_watch_items(user_id: str = Depends(get_current_user)):
     """
@@ -2076,8 +1658,6 @@ async def list_watch_items(user_id: str = Depends(get_current_user)):
         logging.exception("Watchlist GET error")
         raise HTTPException(status_code=500, detail=str(e))
 
-
-
 @app.delete("/api/watchlist/{watch_id}")
 async def delete_watch_item(
     watch_id: int, user_id: str = Depends(get_current_user)
@@ -2098,7 +1678,6 @@ async def delete_watch_item(
     except Exception as e:
         logging.exception("Watchlist DELETE error")
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.post("/api/watchlist/{watch_id}/refresh")
 async def refresh_watch_item(
@@ -2171,7 +1750,6 @@ async def refresh_watch_item(
         logging.exception("Watchlist REFRESH error")
         raise HTTPException(status_code=500, detail=str(e))
 
-
 async def _send_discord_dm(user_discord_id: str, content: str) -> bool:
     if not DISCORD_BOT_TOKEN or not user_discord_id:
         return False
@@ -2199,7 +1777,6 @@ async def _send_discord_dm(user_discord_id: str, content: str) -> bool:
         logging.warning("DM send failed: %s", e)
         return False
 
-
 async def _send_channel_fallback(channel_id: Optional[str], content: str) -> bool:
     if not DISCORD_BOT_TOKEN:
         return False
@@ -2222,7 +1799,6 @@ async def _send_channel_fallback(channel_id: Optional[str], content: str) -> boo
         logging.warning("Channel send failed: %s", e)
         return False
 
-
 def _fmt_alert(
     name: str,
     platform: str,
@@ -2232,14 +1808,13 @@ def _fmt_alert(
     ref_mode: str,
     ref_price: Optional[float],
 ) -> str:
-    arrow = "ð" if direction == "rise" else "ð"
-    rp = f"{int(ref_price):,}c" if isinstance(ref_price, (int, float)) else "â"
+    arrow = "📈" if direction == "rise" else "📉"
+    rp = f"{int(ref_price):,}c" if isinstance(ref_price, (int, float)) else "–"
     return (
-        f"{arrow} Watchlist Alert â¢ {name} ({platform.upper()})\n"
-        f"Current: {int(price):,}c â¢ Change: {pct:+.2f}%\n"
+        f"{arrow} Watchlist Alert • {name} ({platform.upper()})\n"
+        f"Current: {int(price):,}c • Change: {pct:+.2f}%\n"
         f"Ref: {rp} ({ref_mode})"
     )
-
 
 async def _ref_price_for_alert(row: asyncpg.Record) -> Optional[float]:
     mode = row["ref_mode"]
@@ -2264,7 +1839,6 @@ async def _ref_price_for_alert(row: asyncpg.Record) -> Optional[float]:
         return None
     return None
 
-
 async def _resolve_player_name(card_id: int) -> str:
     try:
         async with player_pool.acquire() as p:
@@ -2274,7 +1848,6 @@ async def _resolve_player_name(card_id: int) -> str:
         return r["name"] if r and r["name"] else f"Card {card_id}"
     except Exception:
         return f"Card {card_id}"
-
 
 async def _eval_alerts_for_pair(card_id: int, platform: str, price_now: float) -> int:
     sent = 0
@@ -2349,7 +1922,6 @@ async def _eval_alerts_for_pair(card_id: int, platform: str, price_now: float) -
             logging.warning("alert eval error: %s", e)
     return sent
 
-
 async def _alerts_poll_loop():
     """Improved alerts polling loop"""
     await asyncio.sleep(3)
@@ -2394,7 +1966,6 @@ async def _alerts_poll_loop():
             
         await asyncio.sleep(WATCHLIST_POLL_INTERVAL)
 
-
 async def _poll_pair_once(card_id: int, platform: str):
     try:
         live = await fetch_price(card_id, platform)
@@ -2407,7 +1978,6 @@ async def _poll_pair_once(card_id: int, platform: str):
     except Exception as e:
         logging.debug("poll pair error: %s", e)
 
-
 @app.get("/api/watchlist-alerts")
 async def list_watchlist_alerts(user_id: str = Depends(get_current_user)):
     async with watchlist_pool.acquire() as w:
@@ -2416,7 +1986,6 @@ async def list_watchlist_alerts(user_id: str = Depends(get_current_user)):
             user_id,
         )
     return {"items": [dict(r) for r in rows]}
-
 
 @app.post("/api/watchlist-alerts")
 async def create_watchlist_alert(
@@ -2465,7 +2034,6 @@ async def create_watchlist_alert(
         )
     return {"ok": True}
 
-
 @app.delete("/api/watchlist-alerts/{alert_id}")
 async def delete_watchlist_alert(
     alert_id: int, user_id: str = Depends(get_current_user)
@@ -2477,7 +2045,6 @@ async def delete_watchlist_alert(
     if res == "DELETE 0":
         raise HTTPException(404, "Alert not found")
     return {"ok": True}
-
 
 @app.post("/api/watchlist-alerts/test")
 async def test_alert_endpoint(
@@ -2494,8 +2061,6 @@ async def test_alert_endpoint(
         raise HTTPException(400, "No price available")
     n = await _eval_alerts_for_pair(card_id, plat, float(price))
     return {"sent": n}
-
-
 
 from datetime import datetime, timezone
 
@@ -2597,7 +2162,6 @@ async def get_current_user_info(request: Request, conn=Depends(get_db)):
         },
     }
 
-
 @app.get("/api/validate-premium")
 async def validate_premium(user_id: str = Depends(get_current_user), conn=Depends(get_db)):
     """Fast endpoint to validate premium status without full user data"""
@@ -2649,7 +2213,151 @@ async def get_user_settings(
                 theme, 
                 timezone, 
                 date_format, 
-                include_tax_in_profit, 
+                include_tax_in_profit= EXCLUDED.include_tax_in_profit,
+                default_chart_range  = EXCLUDED.default_chart_range,
+                visible_widgets      = EXCLUDED.visible_widgets,
+                updated_at           = NOW()
+        """,
+            user_id,
+            settings.default_platform,
+            json.dumps(settings.custom_tags),
+            settings.currency_format,
+            settings.theme,
+            settings.timezone,
+            settings.date_format,
+            settings.include_tax_in_profit,
+            settings.default_chart_range,
+            json.dumps(settings.visible_widgets),
+        )
+        
+        return {"message": "Settings updated successfully", "timestamp": datetime.now().isoformat()}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Error updating user settings: {e}")
+        raise HTTPException(status_code=500, detail="Failed to update settings")
+
+@app.post("/api/portfolio/balance")
+async def update_starting_balance(
+    request: Request, user_id: str = Depends(get_current_user), conn=Depends(get_db)
+):
+    data = await request.json()
+    starting_balance = parse_coin_amount(data.get("starting_balance", 0))
+    await conn.execute(
+        "INSERT INTO portfolio (user_id, starting_balance) VALUES ($1, $2) "
+        "ON CONFLICT (user_id) DO UPDATE SET starting_balance = $2",
+        user_id,
+        starting_balance,
+    )
+    return {"message": "Starting balance updated successfully"}
+
+@app.get("/api/goals")
+async def get_trading_goals(
+    user_id: str = Depends(get_current_user), conn=Depends(get_db)
+):
+    goals = await conn.fetch(
+        "SELECT * FROM trading_goals WHERE user_id=$1 ORDER BY created_at DESC",
+        user_id,
+    )
+    return {"goals": [dict(g) for g in goals]}
+
+@app.post("/api/goals")
+async def create_trading_goal(
+    goal: TradingGoal, user_id: str = Depends(get_current_user), conn=Depends(get_db)
+):
+    await conn.execute(
+        """
+        INSERT INTO trading_goals (user_id, title, target_amount, target_date, goal_type, is_completed, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, NOW())
+    """,
+        user_id,
+        goal.title,
+        goal.target_amount,
+        goal.target_date,
+        goal.goal_type,
+        goal.is_completed,
+    )
+    return {"message": "Goal created successfully"}
+
+@app.get("/api/analytics/advanced")
+async def get_advanced_analytics(
+    user_id: str = Depends(get_current_user), conn=Depends(get_db)
+):
+    daily_profits = await conn.fetch(
+        """
+        SELECT DATE(timestamp) as date, COALESCE(SUM(profit), 0) as daily_profit, COUNT(*) as trades_count
+        FROM trades WHERE user_id=$1 AND timestamp >= NOW() - INTERVAL '30 days'
+        GROUP BY DATE(timestamp) ORDER BY date
+    """,
+        user_id,
+    )
+    tag_performance = await conn.fetch(
+        """
+        SELECT tag, COUNT(*) as trade_count, COALESCE(SUM(profit), 0) as total_profit,
+               COALESCE(AVG(profit), 0) as avg_profit,
+               COUNT(CASE WHEN profit > 0 THEN 1 END) * 100.0 / COUNT(*) as win_rate
+        FROM trades WHERE user_id=$1 AND tag IS NOT NULL AND tag != ''
+        GROUP BY tag ORDER BY total_profit DESC
+    """,
+        user_id,
+    )
+    platform_stats = await conn.fetch(
+        """
+        SELECT platform, COUNT(*) as trade_count, COALESCE(SUM(profit), 0) as total_profit,
+               COALESCE(AVG(profit), 0) as avg_profit
+        FROM trades WHERE user_id=$1 GROUP BY platform
+    """,
+        user_id,
+    )
+    monthly_summary = await conn.fetch(
+        """
+        SELECT DATE_TRUNC('month', timestamp) as month, COUNT(*) as trades_count,
+               COALESCE(SUM(profit), 0) as total_profit, COALESCE(SUM(ea_tax), 0) as total_tax
+        FROM trades WHERE user_id=$1
+        GROUP BY DATE_TRUNC('month', timestamp) ORDER BY month DESC LIMIT 12
+    """,
+        user_id,
+    )
+    return {
+        "daily_profits": [dict(r) for r in daily_profits],
+        "tag_performance": [dict(r) for r in tag_performance],
+        "platform_stats": [dict(r) for r in platform_stats],
+        "monthly_summary": [dict(r) for r in monthly_summary],
+    }
+
+@app.put("/api/trades/bulk")
+async def bulk_edit_trades(
+    request: Request, user_id: str = Depends(get_current_user), conn=Depends(get_db)
+):
+    data = await request.json()
+    trade_ids = data.get("trade_ids", [])
+    updates = data.get("updates", {})
+    if not trade_ids or not updates:
+        raise HTTPException(status_code=400, detail="trade_ids and updates required")
+
+    set_clauses: list[str] = []
+    params: list[Any] = []
+
+    if "tag" in updates:
+        set_clauses.append(f"tag = ${len(params)+1}")
+        params.append(updates["tag"])
+    if "platform" in updates:
+        set_clauses.append(f"platform = ${len(params)+1}")
+        params.append(updates["platform"])
+
+    if not set_clauses:
+        raise HTTPException(status_code=400, detail="No valid updates provided")
+
+    params.extend([user_id, trade_ids])
+
+    query = (
+        f"UPDATE trades SET {', '.join(set_clauses)} "
+        f"WHERE user_id = ${len(params)-1} AND trade_id = ANY(${len(params)})"
+    )
+
+    await conn.execute(query, *params)
+    return {"message": f"Updated {len(trade_ids)} trades successfully"}_tax_in_profit, 
                 default_chart_range, 
                 visible_widgets,
                 created_at,
@@ -2718,7 +2426,6 @@ async def get_user_settings(
         logging.error(f"Error fetching user settings: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch settings")
 
-
 @app.post("/api/settings")
 async def update_user_settings(
     settings: UserSettings, user_id: str = Depends(get_current_user), conn=Depends(get_db)
@@ -2758,156 +2465,7 @@ async def update_user_settings(
                 theme                = EXCLUDED.theme,
                 timezone             = EXCLUDED.timezone,
                 date_format          = EXCLUDED.date_format,
-                include_tax_in_profit= EXCLUDED.include_tax_in_profit,
-                default_chart_range  = EXCLUDED.default_chart_range,
-                visible_widgets      = EXCLUDED.visible_widgets,
-                updated_at           = NOW()
-        """,
-            user_id,
-            settings.default_platform,
-            json.dumps(settings.custom_tags),
-            settings.currency_format,
-            settings.theme,
-            settings.timezone,
-            settings.date_format,
-            settings.include_tax_in_profit,
-            settings.default_chart_range,
-            json.dumps(settings.visible_widgets),
-        )
-        
-        return {"message": "Settings updated successfully", "timestamp": datetime.now().isoformat()}
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logging.error(f"Error updating user settings: {e}")
-        raise HTTPException(status_code=500, detail="Failed to update settings")
-
-@app.post("/api/portfolio/balance")
-async def update_starting_balance(
-    request: Request, user_id: str = Depends(get_current_user), conn=Depends(get_db)
-):
-    data = await request.json()
-    starting_balance = parse_coin_amount(data.get("starting_balance", 0))
-    await conn.execute(
-        "INSERT INTO portfolio (user_id, starting_balance) VALUES ($1, $2) "
-        "ON CONFLICT (user_id) DO UPDATE SET starting_balance = $2",
-        user_id,
-        starting_balance,
-    )
-    return {"message": "Starting balance updated successfully"}
-
-
-@app.get("/api/goals")
-async def get_trading_goals(
-    user_id: str = Depends(get_current_user), conn=Depends(get_db)
-):
-    goals = await conn.fetch(
-        "SELECT * FROM trading_goals WHERE user_id=$1 ORDER BY created_at DESC",
-        user_id,
-    )
-    return {"goals": [dict(g) for g in goals]}
-
-
-@app.post("/api/goals")
-async def create_trading_goal(
-    goal: TradingGoal, user_id: str = Depends(get_current_user), conn=Depends(get_db)
-):
-    await conn.execute(
-        """
-        INSERT INTO trading_goals (user_id, title, target_amount, target_date, goal_type, is_completed, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6, NOW())
-    """,
-        user_id,
-        goal.title,
-        goal.target_amount,
-        goal.target_date,
-        goal.goal_type,
-        goal.is_completed,
-    )
-    return {"message": "Goal created successfully"}
-
-
-@app.get("/api/analytics/advanced")
-async def get_advanced_analytics(
-    user_id: str = Depends(get_current_user), conn=Depends(get_db)
-):
-    daily_profits = await conn.fetch(
-        """
-        SELECT DATE(timestamp) as date, COALESCE(SUM(profit), 0) as daily_profit, COUNT(*) as trades_count
-        FROM trades WHERE user_id=$1 AND timestamp >= NOW() - INTERVAL '30 days'
-        GROUP BY DATE(timestamp) ORDER BY date
-    """,
-        user_id,
-    )
-    tag_performance = await conn.fetch(
-        """
-        SELECT tag, COUNT(*) as trade_count, COALESCE(SUM(profit), 0) as total_profit,
-               COALESCE(AVG(profit), 0) as avg_profit,
-               COUNT(CASE WHEN profit > 0 THEN 1 END) * 100.0 / COUNT(*) as win_rate
-        FROM trades WHERE user_id=$1 AND tag IS NOT NULL AND tag != ''
-        GROUP BY tag ORDER BY total_profit DESC
-    """,
-        user_id,
-    )
-    platform_stats = await conn.fetch(
-        """
-        SELECT platform, COUNT(*) as trade_count, COALESCE(SUM(profit), 0) as total_profit,
-               COALESCE(AVG(profit), 0) as avg_profit
-        FROM trades WHERE user_id=$1 GROUP BY platform
-    """,
-        user_id,
-    )
-    monthly_summary = await conn.fetch(
-        """
-        SELECT DATE_TRUNC('month', timestamp) as month, COUNT(*) as trades_count,
-               COALESCE(SUM(profit), 0) as total_profit, COALESCE(SUM(ea_tax), 0) as total_tax
-        FROM trades WHERE user_id=$1
-        GROUP BY DATE_TRUNC('month', timestamp) ORDER BY month DESC LIMIT 12
-    """,
-        user_id,
-    )
-    return {
-        "daily_profits": [dict(r) for r in daily_profits],
-        "tag_performance": [dict(r) for r in tag_performance],
-        "platform_stats": [dict(r) for r in platform_stats],
-        "monthly_summary": [dict(r) for r in monthly_summary],
-    }
-
-
-@app.put("/api/trades/bulk")
-async def bulk_edit_trades(
-    request: Request, user_id: str = Depends(get_current_user), conn=Depends(get_db)
-):
-    data = await request.json()
-    trade_ids = data.get("trade_ids", [])
-    updates = data.get("updates", {})
-    if not trade_ids or not updates:
-        raise HTTPException(status_code=400, detail="trade_ids and updates required")
-
-    set_clauses: list[str] = []
-    params: list[Any] = []
-
-    if "tag" in updates:
-        set_clauses.append(f"tag = ${len(params)+1}")
-        params.append(updates["tag"])
-    if "platform" in updates:
-        set_clauses.append(f"platform = ${len(params)+1}")
-        params.append(updates["platform"])
-
-    if not set_clauses:
-        raise HTTPException(status_code=400, detail="No valid updates provided")
-
-    params.extend([user_id, trade_ids])
-
-    query = (
-        f"UPDATE trades SET {', '.join(set_clauses)} "
-        f"WHERE user_id = ${len(params)-1} AND trade_id = ANY(${len(params)})"
-    )
-
-    await conn.execute(query, *params)
-    return {"message": f"Updated {len(trade_ids)} trades successfully"}
-
+                include
 
 @app.get("/api/export/trades")
 async def export_trades(
@@ -2993,7 +2551,6 @@ async def export_trades(
     except Exception as e:
         logging.error(f"Export error: {e}")
         raise HTTPException(status_code=500, detail="Failed to export data")
-
 
 @app.post("/api/import/trades")
 async def import_trades(
@@ -3232,7 +2789,6 @@ async def get_data_summary(
         logging.error(f"Data summary error: {e}")
         raise HTTPException(status_code=500, detail="Failed to get data summary")
 
-
 @app.get("/api/search-players")
 async def search_players(q: str = "", pos: Optional[str] = None):
     q = (q or "").strip()
@@ -3304,7 +2860,6 @@ async def search_players(q: str = "", pos: Optional[str] = None):
         logging.error(f"Player search error: {e}")
         return {"players": [], "error": str(e)}
 
-
 @app.get("/api/debug/session")
 async def debug_session(req: Request):
     return {
@@ -3312,7 +2867,6 @@ async def debug_session(req: Request):
         "session_user_id": req.session.get("user_id"),
         "all_session_keys": list(req.session.keys()),
     }
-
 
 async def _enrich_with_meta(items: list[dict]) -> list[dict]:
     if not items:
@@ -3346,7 +2900,6 @@ async def _enrich_with_meta(items: list[dict]) -> list[dict]:
             }
         )
     return out
-
 
 async def _attach_prices_ps(items: list[dict]) -> list[dict]:
     # Use our unified FUT.GG fetcher for consistency
@@ -3399,124 +2952,127 @@ async def api_trending(
         limit = max_items
         limited = True
 
-    # ---------- simple risers/fallers ----------
-    if kind in ("fallers", "risers"):
-        if kind == "fallers":
-            items, _ = await _momentum_page_items(tf_norm, 1)
-            items.sort(key=lambda x: x["percent"])
-            pick = items[:limit]
-        else:  # risers
-            _, html = await _momentum_page_items(tf_norm, 1)
-            last = _parse_last_page_number(html)
-            items, _ = await _momentum_page_items(tf_norm, last)
-            items.sort(key=lambda x: x["percent"], reverse=True)
-            pick = items[:limit]
+    try:
+        # ---------- simple risers/fallers ----------
+        if kind in ("fallers", "risers"):
+            if kind == "fallers":
+                items, _ = await _momentum_page_items(tf_norm, 1)
+                items.sort(key=lambda x: x["percent"])
+                pick = items[:limit]
+            else:  # risers
+                _, html = await _momentum_page_items(tf_norm, 1)
+                last = _parse_last_page_number(html)
+                items, _ = await _momentum_page_items(tf_norm, last)
+                items.sort(key=lambda x: x["percent"], reverse=True)
+                pick = items[:limit]
 
+            enriched = await _enrich_with_meta(pick)
+            enriched = await _attach_prices_ps(enriched)
+            return {"type": kind, "timeframe": f"{tf_norm}h", "items": enriched, "limited": limited}
+
+        # ---------- SMART MOVERS (6h vs 24h) ----------
+        async def _page_last(tf_str: str) -> int:
+            html1 = await _fetch_momentum_page(tf_str, 1)
+            return _parse_last_page_number(html1)
+        
+        async def _top_sets(tf_str: str, pages_each_side: int = 5):
+            """Return (fallers_map, risers_map) scanning first/last pages for a timeframe."""
+            last = await _page_last(tf_str)
+            fallers: dict[int, float] = {}
+            risers:  dict[int, float] = {}
+        
+            # First pages → fallers
+            for p in range(1, min(last, pages_each_side) + 1):
+                for it in _extract_items(await _fetch_momentum_page(tf_str, p)):
+                    fallers[int(it["card_id"])] = float(it["percent"])
+        
+            # Last pages → risers
+            for p in range(max(1, last - pages_each_side + 1), last + 1):
+                for it in _extract_items(await _fetch_momentum_page(tf_str, p)):
+                    risers[int(it["card_id"])] = float(it["percent"])
+        
+            return fallers, risers
+        
+        f6, r6   = await _top_sets("6",  pages_each_side=5)
+        f24, r24 = await _top_sets("24", pages_each_side=5)
+        
+        def _strongest(*maps: dict[int, float]) -> dict[int, float]:
+            out: dict[int, float] = {}
+            for mp in maps:
+                for cid, pct in mp.items():
+                    if cid not in out or abs(pct) > abs(out[cid]):
+                        out[cid] = pct
+            return out
+        
+        p6  = _strongest(f6,  r6)
+        p24 = _strongest(f24, r24)
+        
+        smart: list[tuple[int, float, float]] = []
+        seen: set[int] = set()
+        
+        # 1) True sign flips first
+        for cid, v6 in p6.items():
+            v24 = p24.get(cid)
+            if v24 is None: 
+                continue
+            if v6 * v24 < 0:
+                smart.append((cid, v6, v24))
+                seen.add(cid)
+        
+        # 2) Fallback: biggest divergences (|6h – 24h|)
+        if len(smart) < 10:
+            diffs = []
+            for cid, v6 in p6.items():
+                v24 = p24.get(cid)
+                if v24 is None or cid in seen:
+                    continue
+                diffs.append((abs(v6 - v24), cid, v6, v24))
+            diffs.sort(reverse=True)
+            for diff, cid, v6, v24 in diffs:
+                # require at least 5% divergence to avoid noise
+                if diff < 5:
+                    break
+                smart.append((cid, v6, v24))
+                seen.add(cid)
+                if len(smart) >= 10:
+                    break
+        
+        # 3) Final fill: largest combined magnitude
+        if len(smart) < 10:
+            fills = []
+            for cid, v6 in p6.items():
+                v24 = p24.get(cid)
+                if v24 is None or cid in seen:
+                    continue
+                fills.append((abs(v6) + abs(v24), cid, v6, v24))
+            fills.sort(reverse=True)
+            for _, cid, v6, v24 in fills:
+                smart.append((cid, v6, v24))
+                if len(smart) >= 10:
+                    break
+        
+        pick = [
+            {"card_id": cid, "percent_6h": round(v6, 2), "percent_24h": round(v24, 2), "percent": round(v6, 2)}
+            for cid, v6, v24 in smart[:limit]
+        ]
+        
         enriched = await _enrich_with_meta(pick)
-        enriched = await _attach_prices_ps(enriched)
-        return {"type": kind, "timeframe": f"{tf_norm}h", "items": enriched, "limited": limited}
+        # attach smart fields
+        meta_map = {it["pid"]: it for it in enriched}
+        for raw in pick:
+            pid = raw["card_id"]
+            if pid in meta_map:
+                meta_map[pid]["percent_6h"] = raw["percent_6h"]
+                meta_map[pid]["percent_24h"] = raw["percent_24h"]
+                meta_map[pid]["percent"] = raw["percent"]
+        
+        enriched = await _attach_prices_ps(list(meta_map.values()))
+        return {"type": "smart", "timeframe": "6h_vs_24h", "items": enriched, "limited": limited}
+        
+    except Exception as e:
+        logging.error(f"Trending API error: {e}")
+        return {"type": kind, "timeframe": f"{tf_norm}h", "items": [], "limited": limited}
 
-
-    # ---------- SMART MOVERS (6h vs 24h) ----------
-    async def _page_last(tf_str: str) -> int:
-        html1 = await _fetch_momentum_page(tf_str, 1)
-        return _parse_last_page_number(html1)
-    
-    async def _top_sets(tf_str: str, pages_each_side: int = 5):
-        """Return (fallers_map, risers_map) scanning first/last pages for a timeframe."""
-        last = await _page_last(tf_str)
-        fallers: dict[int, float] = {}
-        risers:  dict[int, float] = {}
-    
-        # First pages â fallers
-        for p in range(1, min(last, pages_each_side) + 1):
-            for it in _extract_items(await _fetch_momentum_page(tf_str, p)):
-                fallers[int(it["card_id"])] = float(it["percent"])
-    
-        # Last pages â risers
-        for p in range(max(1, last - pages_each_side + 1), last + 1):
-            for it in _extract_items(await _fetch_momentum_page(tf_str, p)):
-                risers[int(it["card_id"])] = float(it["percent"])
-    
-        return fallers, risers
-    
-    f6, r6   = await _top_sets("6",  pages_each_side=5)
-    f24, r24 = await _top_sets("24", pages_each_side=5)
-    
-    def _strongest(*maps: dict[int, float]) -> dict[int, float]:
-        out: dict[int, float] = {}
-        for mp in maps:
-            for cid, pct in mp.items():
-                if cid not in out or abs(pct) > abs(out[cid]):
-                    out[cid] = pct
-        return out
-    
-    p6  = _strongest(f6,  r6)
-    p24 = _strongest(f24, r24)
-    
-    smart: list[tuple[int, float, float]] = []
-    seen: set[int] = set()
-    
-    # 1) True sign flips first
-    for cid, v6 in p6.items():
-        v24 = p24.get(cid)
-        if v24 is None: 
-            continue
-        if v6 * v24 < 0:
-            smart.append((cid, v6, v24))
-            seen.add(cid)
-    
-    # 2) Fallback: biggest divergences (|6h â 24h|)
-    if len(smart) < 10:
-        diffs = []
-        for cid, v6 in p6.items():
-            v24 = p24.get(cid)
-            if v24 is None or cid in seen:
-                continue
-            diffs.append((abs(v6 - v24), cid, v6, v24))
-        diffs.sort(reverse=True)
-        for diff, cid, v6, v24 in diffs:
-            # require at least 5% divergence to avoid noise
-            if diff < 5:
-                break
-            smart.append((cid, v6, v24))
-            seen.add(cid)
-            if len(smart) >= 10:
-                break
-    
-    # 3) Final fill: largest combined magnitude
-    if len(smart) < 10:
-        fills = []
-        for cid, v6 in p6.items():
-            v24 = p24.get(cid)
-            if v24 is None or cid in seen:
-                continue
-            fills.append((abs(v6) + abs(v24), cid, v6, v24))
-        fills.sort(reverse=True)
-        for _, cid, v6, v24 in fills:
-            smart.append((cid, v6, v24))
-            if len(smart) >= 10:
-                break
-    
-    pick = [
-        {"card_id": cid, "percent_6h": round(v6, 2), "percent_24h": round(v24, 2), "percent": round(v6, 2)}
-        for cid, v6, v24 in smart[:limit]
-    ]
-    
-    enriched = await _enrich_with_meta(pick)
-    # attach smart fields
-    meta_map = {it["pid"]: it for it in enriched}
-    for raw in pick:
-        pid = raw["card_id"]
-        if pid in meta_map:
-            meta_map[pid]["percent_6h"] = raw["percent_6h"]
-            meta_map[pid]["percent_24h"] = raw["percent_24h"]
-            meta_map[pid]["percent"] = raw["percent"]
-    
-    enriched = await _attach_prices_ps(list(meta_map.values()))
-    return {"type": "smart", "timeframe": "6h_vs_24h", "items": enriched, "limited": limited}
-
-    
 def _cmp_now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -3638,7 +3194,6 @@ async def player_compare(
         except Exception:
             cid_int = None
 
-        # If you want to align with the unified fetcher, you could replace below with fetch_price(...).get("price")
         console_price = await get_player_price(cid_int, plat) if cid_int is not None else None
         pc_price = await get_player_price(cid_int, "pc") if (cid_int is not None and include_pc) else None
 
@@ -3872,7 +3427,6 @@ async def backtest(payload: Dict[str, Any]):
         "avg_hold_h": round(sum(((tr["t_out"]-tr["t_in"])/3600000.0) for tr in all_trades)/len(all_trades), 2) if all_trades else 0.0,
     }
     return {"equity": equity, "summary": summary, "trades": all_trades}
-    
 
 # -------------- Billing & Account Endpoints --------------
 
@@ -3900,7 +3454,7 @@ async def get_subscription_status(user_id: str = Depends(get_current_user), conn
             "subscription": {
                 "plan_name": "Annual Premium" if is_yearly else "Monthly Premium",
                 "next_billing_date": subscription["current_period_end"].isoformat() if subscription["current_period_end"] else None,
-                "amount_display": "Â£99.99/year" if is_yearly else "Â£9.99/month",
+                "amount_display": "£99.99/year" if is_yearly else "£9.99/month",
                 "status": subscription["status"],
                 "cancel_at_period_end": subscription["cancel_at_period_end"]
             }
@@ -3932,7 +3486,6 @@ async def create_checkout_session(
         profile = await conn.fetchrow("SELECT * FROM user_profiles WHERE user_id = $1", user_id)
         if not profile:
             raise HTTPException(status_code=404, detail="User profile not found")
-        # Create Stripe checkout session
         
         session = stripe.checkout.Session.create(
             customer_email=f"{profile['username']}@discord.local",  # Placeholder email
@@ -3949,7 +3502,7 @@ async def create_checkout_session(
                 'billing_cycle': billing_cycle
             },
             subscription_data={
-                'trial_period_days': data.get('trialDays', 7),  # ← Add this line
+                'trial_period_days': data.get('trialDays', 7),
                 'metadata': {
                     'user_id': user_id,
                     'discord_id': user_id
@@ -4105,34 +3658,6 @@ async def handle_subscription_created(subscription, conn):
         datetime.fromtimestamp(subscription.get('current_period_end'), tz=timezone.utc) if subscription.get('current_period_end') else None
     )
 
-async def handle_subscription_updated(subscription, conn):
-    """Handle subscription updates"""
-    user_id = (subscription.get('metadata') or {}).get('user_id')
-    if not user_id:
-        return
-    await conn.execute(
-        """
-        UPDATE subscriptions
-           SET status = $2, current_period_end = $3, cancel_at_period_end = $4
-         WHERE stripe_subscription_id = $1
-        """,
-        subscription.get('id'),
-        subscription.get('status'),
-        datetime.fromtimestamp(subscription.get('current_period_end'), tz=timezone.utc) if subscription.get('current_period_end') else None,
-        subscription.get('cancel_at_period_end', False)
-    )
-    is_active = subscription.get('status') == 'active'
-    await conn.execute(
-        """
-        UPDATE user_profiles
-           SET is_premium = $2, premium_until = $3, updated_at = NOW()
-         WHERE user_id = $1
-        """,
-        user_id,
-        is_active,
-        datetime.fromtimestamp(subscription.get('current_period_end'), tz=timezone.utc) if is_active and subscription.get('current_period_end') else None
-    )
-
 async def handle_subscription_deleted(subscription, conn):
     """Handle subscription cancellation"""
     user_id = (subscription.get('metadata') or {}).get('user_id')
@@ -4209,6 +3734,25 @@ except Exception as e:
 
 # ---------- Candle aggregation loop ----------
 ADVISORY_LOCK_KEY = 7741001  # prevents duplicate loops if you scale
+
+@app.on_event("startup")
+async def _bg_aggregator():
+    async def loop():
+        pool = await get_pool()
+        await asyncio.sleep(5)
+        while True:
+            try:
+                async with pool.acquire() as db:
+                    got = await db.fetchval("SELECT pg_try_advisory_lock($1)", ADVISORY_LOCK_KEY)
+                    if got:
+                        try:
+                            await aggregate_all_timeframes(db, since_hours=48)
+                        finally:
+                            await db.execute("SELECT pg_advisory_unlock($1)", ADVISORY_LOCK_KEY)
+            except Exception as e:
+                print("aggregate error:", e)
+            await asyncio.sleep(60)
+    asyncio.create_task(loop())
 
 # ---------- Global error handler (nicer 500s) ----------
 @app.exception_handler(Exception)
