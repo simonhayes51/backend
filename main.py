@@ -102,6 +102,9 @@ WATCHLIST_POLL_INTERVAL = int(os.getenv("WATCHLIST_POLL_INTERVAL", "60"))  # sec
 # ephemeral state store
 OAUTH_STATE: Dict[str, Dict[str, Any]] = {}
 
+_MARKET_SUMMARY_CACHE: dict = {}
+MARKET_SUMMARY_TTL = 90  # seconds
+
 def _prune_oauth_state(ttl: int = 600) -> None:
     now = time.time()
     stale = [k for k, v in OAUTH_STATE.items() if now - v.get("ts", 0) > ttl]
@@ -1217,15 +1220,12 @@ app.add_middleware(
 app.add_middleware(
     SessionMiddleware,
     secret_key=SECRET_KEY,
-    same_site="none" if IS_PROD else "lax",
-    https_only=IS_PROD,
+    same_site="none",
+    https_only=True,
+    domain=".futhub.co.uk",
 )
 
 # Routers
-
-async def get_db():
-    async with pool.acquire() as connection:
-        yield connection
 
 async def get_watchlist_db():
     async with watchlist_pool.acquire() as connection:
