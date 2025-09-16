@@ -408,6 +408,7 @@ async def _fetch_candidates_for_slot(
 
 
 # ---------- SOLVER ----------
+# ---------- SOLVER ----------
 async def _solve_challenge(
     con,
     ch_row: Any,
@@ -432,6 +433,11 @@ async def _solve_challenge(
             limit=max_candidates_per_slot,
             mode="cheap",
         )
+
+        # GUARD: if no candidates exist for this slot, fail fast
+        if not cands:
+            return {"ok": False, "error": f"no_candidates_available_for_{req_pos}"}
+
         chosen = None
         for c in cands:
             if c["card_id"] in used_ids:
@@ -441,6 +447,7 @@ async def _solve_challenge(
                 break
         if not chosen:
             return {"ok": False, "error": f"no_candidate_for_{req_pos}"}
+
         used_ids.add(chosen["card_id"])
         picks.append(chosen)
 
@@ -448,7 +455,7 @@ async def _solve_challenge(
 
     # 2) Upgrade to meet min average (cheapest; closest above target)
     target_avg = ch.get("min_squad_rating") or 0
-    curr_total_rating = sum(p["rating"] for p in picks)
+    curr_total_rating = sum(int(p["rating"]) for p in picks)
     curr_avg = curr_total_rating / 11.0
 
     if (not ok) or (target_avg > 0 and curr_avg < target_avg):
@@ -460,8 +467,8 @@ async def _solve_challenge(
             per_slot_choices: List[List[Dict[str, Any]]] = []
             for i in range(11):
                 req_pos = picks[i]["used_pos"]
-                curr_rating = picks[i]["rating"]
-                curr_price = picks[i]["price"]
+                curr_rating = int(picks[i]["rating"])
+                curr_price = int(picks[i]["price"])
 
                 upgrade_pool = await _fetch_candidates_for_slot(
                     con, req_pos, ch,
@@ -470,12 +477,33 @@ async def _solve_challenge(
                     mode="upgrade",  # rating DESC, price ASC
                 )
 
+                # GUARD: if even the upgrade pool is empty for any slot, we can't improve
+                if not upgrade_pool:
+                    return {
+                        "ok": False,
+                        "error": f"no_upgrade_candidates_for_{req_pos}",
+                        "summary": {"avg_rating": round(curr_avg, 2), "needed": int(target_avg)},
+                        "picks": [
+                            {
+                                "slot": i2 + 1,
+                                "req_pos": slots[i2],
+                                "card_id": p["card_id"],
+                                "name": p["name"],
+                                "rating": p["rating"],
+                                "used_pos": p["used_pos"],
+                                "price": p["price"],
+                                "source": p["source"],
+                            }
+                            for i2, p in enumerate(picks)
+                        ],
+                    }
+
                 opts: List[Dict[str, Any]] = [{"delta": 0, "extra": 0, "cand": None}]  # keep current
                 for c in upgrade_pool:
                     if c["card_id"] == picks[i]["card_id"]:
                         continue
-                    delta = max(0, int(c["rating"]) - int(curr_rating))
-                    extra = int(c["price"]) - int(curr_price)
+                    delta = max(0, int(c["rating"]) - curr_rating)
+                    extra = int(c["price"]) - curr_price
                     # skip strictly worse (no gain and not cheaper)
                     if delta == 0 and extra >= 0:
                         continue
@@ -529,23 +557,44 @@ async def _solve_challenge(
                 elif dp_cost[r] == best_cost and best_r is not None and r < best_r:
                     best_r = r
 
-            if best_r is not None and best_cost < INF:
-                r = best_r
-                chosen_idx = [0] * 11
-                while True:
-                    prev = dp_prev[r]
-                    if prev is None:
-                        break
-                    slot_idx, choice_idx, prev_r = prev
-                    chosen_idx[slot_idx] = choice_idx
-                    r = prev_r
+            # GUARD: if no valid upgrade path, return a clear error instead of hanging
+            if best_r is None or best_cost >= INF:
+                return {
+                    "ok": False,
+                    "error": "no_valid_upgrade_path",
+                    "summary": {"avg_rating": round(curr_avg, 2), "needed": int(target_avg)},
+                    "picks": [
+                        {
+                            "slot": i + 1,
+                            "req_pos": slots[i],
+                            "card_id": p["card_id"],
+                            "name": p["name"],
+                            "rating": p["rating"],
+                            "used_pos": p["used_pos"],
+                            "price": p["price"],
+                            "source": p["source"],
+                        }
+                        for i, p in enumerate(picks)
+                    ],
+                }
 
-                for i in range(11):
-                    opt = per_slot_choices[i][chosen_idx[i]]
-                    if opt["cand"] is not None:
-                        picks[i] = {**opt["cand"], "used_pos": picks[i]["used_pos"]}
+            # Apply chosen upgrades
+            r2 = best_r
+            chosen_idx = [0] * 11
+            while True:
+                prev = dp_prev[r2]
+                if prev is None:
+                    break
+                slot_idx, choice_idx, prev_r = prev
+                chosen_idx[slot_idx] = choice_idx
+                r2 = prev_r
 
-                ok, reasons = _validate(picks, ch)
+            for i in range(11):
+                opt = per_slot_choices[i][chosen_idx[i]]
+                if opt["cand"] is not None:
+                    picks[i] = {**opt["cand"], "used_pos": picks[i]["used_pos"]}
+
+            ok, reasons = _validate(picks, ch)
 
     # 3) Summaries
     chem_est = _estimate_chem(picks)
@@ -580,6 +629,7 @@ async def _solve_challenge(
         ],
         "price_snapshot": dt.datetime.utcnow(),
     }
+
 # Time helpers
 LONDON = ZoneInfo("Europe/London")
 UTC = timezone.utc
