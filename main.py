@@ -16,7 +16,7 @@ from bs4 import BeautifulSoup
 from types import SimpleNamespace
 from urllib.parse import urlencode
 from contextlib import asynccontextmanager, suppress
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple, AsyncGenerator
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
 from datetime import datetime, timedelta, timezone, time as dt_time
