@@ -40,6 +40,8 @@ from discord_manager import discord_manager
 from app.routers.market import router as market_router
 from app.routers.ai_engine import router as ai_router
 from app.routers.players import router as players_router
+from app.routers.watchlist import router as watchlist_router
+app.include_router(watchlist_router)
 
 # ----------------- BOOTSTRAP -----------------
 logging.basicConfig(level=logging.INFO)
@@ -1550,82 +1552,6 @@ async def get_player_price_proxy(card_id: str):
     except Exception as e:
         logging.error(f"Player price fetch error: {e}")
         return {"error": str(e)}
-
-@app.post("/api/watchlist")
-async def add_watch_item(
-    request: Request,
-    payload: WatchlistCreate,
-    user_id: str = Depends(get_current_user),
-):
-    """
-    Add (or upsert) a card to the user's watchlist.
-    Enforces plan limits and seeds with the latest live price (if available).
-    """
-    ent = await compute_entitlements(request)
-    max_allowed = int(ent["limits"]["watchlist_max"])
-
-    # Normalize platform
-    plat = (payload.platform or "").lower()
-    if plat not in ("ps", "xbox", "pc"):
-        plat = "ps"
-
-    try:
-        async with request.app.state.watchlist_pool.acquire() as conn:
-            used = await conn.fetchval(
-                "SELECT COUNT(*) FROM watchlist WHERE user_id=$1", user_id
-            )
-            if int(used or 0) >= max_allowed:
-                raise HTTPException(
-                    status_code=402,
-                    detail={
-                        "error": "limit_reached",
-                        "feature": "watchlist",
-                        "message": f"Free plan allows up to {max_allowed} watchlist players.",
-                        "upgrade_url": "/billing",
-                    },
-                )
-
-            live = await fetch_price(int(payload.card_id), plat)
-            val = live.get("price")
-            live_price = int(val) if isinstance(val, (int, float)) else None
-            start_price = live_price if isinstance(live_price, (int, float)) else 0
-
-            row = await conn.fetchrow(
-                """
-                INSERT INTO watchlist (
-                    user_id, card_id, player_name, version, platform,
-                    started_price, last_price, last_checked, notes
-                )
-                VALUES ($1,$2,$3,$4,$5,$6,$7,NOW(),$8)
-                ON CONFLICT (user_id, card_id, platform) DO UPDATE
-                  SET player_name = EXCLUDED.player_name,
-                      version     = EXCLUDED.version,
-                      notes       = EXCLUDED.notes,
-                      last_price  = EXCLUDED.last_price,
-                      last_checked= NOW()
-                RETURNING id
-                """,
-                user_id,
-                int(payload.card_id),
-                payload.player_name,
-                payload.version,
-                plat,
-                start_price,
-                int(live_price) if isinstance(live_price, (int, float)) else None,
-                payload.notes,
-            )
-
-            return {
-                "ok": True,
-                "id": row["id"],
-                "start_price": start_price,
-                "is_extinct": bool(live.get("isExtinct", False)),
-            }
-    except HTTPException:
-        raise
-    except Exception as e:
-        logging.exception("Watchlist POST error")
-        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/sbc/candidates")
 async def sbc_candidates(
