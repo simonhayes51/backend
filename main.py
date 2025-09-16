@@ -152,6 +152,13 @@ async def _fetch_momentum_page(tf: str, page: int) -> str:
 # ---- Market summary (cached) -----------------------------------------------
 market_summary_router = APIRouter()
 
+async def get_player_db(request: Request) -> AsyncGenerator:
+    pool = getattr(request.app.state, "player_pool", None)
+    if pool is None:
+        raise RuntimeError("player_pool not initialized")
+    async with pool.acquire() as conn:
+        yield conn
+
 @market_summary_router.get("/api/market/summary")
 async def market_summary(tf: str = "24", rise: float = 5.0, fall: float = 5.0):
     """
