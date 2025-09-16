@@ -1241,6 +1241,10 @@ app.add_middleware(
 
 # Routers
 
+async def get_player_db():
+    async with app.state.player_pool.acquire() as conn:
+        yield conn
+
 async def get_watchlist_db():
     async with watchlist_pool.acquire() as connection:
         yield connection
