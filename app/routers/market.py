@@ -23,7 +23,7 @@ async def get_candles(
             ORDER BY open_time DESC
             LIMIT $4
             """,
-            player_card_id, platform, timeframe, limit,
+            player_card_id, platform, timeframe, limit  # ← REMOVE the comma here
         )
         return [dict(r) for r in rows][::-1]
     except Exception as e:
