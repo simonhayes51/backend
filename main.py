@@ -2432,43 +2432,48 @@ async def test_alert_endpoint(
 
 
 
+from datetime import datetime, timezone
+
 @app.get("/api/me")
 async def get_current_user_info(request: Request, conn=Depends(get_db)):
     uid = request.session.get("user_id")
     if not uid:
         return {"authenticated": False}
-    
+
     # Get user profile
     profile = await conn.fetchrow(
-        "SELECT username, avatar_url, global_name, is_premium, premium_until FROM user_profiles WHERE user_id = $1", 
-        uid
+        """
+        SELECT username, avatar_url, global_name, is_premium, premium_until
+        FROM public.user_profiles
+        WHERE user_id = $1
+        """,
+        uid,
     )
-    
+
     if not profile:
         return {"authenticated": False}
-    
+
     # REAL-TIME PREMIUM VALIDATION
     is_premium = False
     premium_until = None
-    
+
     # Check active subscription in real-time
     active_subscription = await conn.fetchrow(
         """
         SELECT current_period_end, status, cancel_at_period_end
-        FROM subscriptions 
+        FROM public.subscriptions
         WHERE user_id = $1 
         AND status IN ('active', 'trialing', 'trial')
         ORDER BY created_at DESC 
         LIMIT 1
         """,
-        uid
+        uid,
     )
-    
+
     if active_subscription:
         current_period_end = active_subscription["current_period_end"]
         now = datetime.now(timezone.utc)
-        
-        # Check if subscription is still valid
+
         if current_period_end and current_period_end > now:
             is_premium = True
             premium_until = current_period_end
@@ -2476,40 +2481,38 @@ async def get_current_user_info(request: Request, conn=Depends(get_db)):
             # Subscription expired - update database immediately
             await conn.execute(
                 """
-                UPDATE user_profiles 
+                UPDATE public.user_profiles
                 SET is_premium = FALSE, premium_until = NULL, updated_at = NOW()
                 WHERE user_id = $1
                 """,
-                uid
+                uid,
             )
-            
-            # Also mark subscription as expired if needed
+
             await conn.execute(
                 """
-                UPDATE subscriptions 
+                UPDATE public.subscriptions
                 SET status = 'past_due' 
                 WHERE user_id = $1 AND current_period_end <= $2 AND status = 'active'
                 """,
-                uid, now
+                uid,
+                now,
             )
-            
-            # Remove Discord role immediately
+
             try:
                 from discord_manager import discord_manager
                 await discord_manager.remove_premium_role(uid)
             except Exception as e:
                 logger.warning(f"Failed to remove Discord role for expired user {uid}: {e}")
-    
-    # If database shows premium but no active subscription, fix it
+
     elif profile["is_premium"]:
         is_premium = False
         await conn.execute(
             """
-            UPDATE user_profiles 
+            UPDATE public.user_profiles
             SET is_premium = FALSE, premium_until = NULL, updated_at = NOW()
             WHERE user_id = $1
             """,
-            uid
+            uid,
         )
 
     return {
@@ -2525,9 +2528,10 @@ async def get_current_user_info(request: Request, conn=Depends(get_db)):
         "features": ["smart_buy", "trade_finder", "advanced_analytics"] if is_premium else [],
         "limits": {
             "watchlist_max": 500 if is_premium else 3,
-            "trending": {"timeframes": ["4h", "6h", "24h"] if is_premium else ["24h"]}
-        }
+            "trending": {"timeframes": ["4h", "6h", "24h"] if is_premium else ["24h"]},
+        },
     }
+
 
 @app.get("/api/validate-premium")
 async def validate_premium(user_id: str = Depends(get_current_user), conn=Depends(get_db)):
