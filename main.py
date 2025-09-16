@@ -1222,7 +1222,6 @@ app.add_middleware(
     secret_key=SECRET_KEY,
     same_site="none",
     https_only=True,
-    domain=".futhub.co.uk",
 )
 
 # Routers
