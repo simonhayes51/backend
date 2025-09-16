@@ -37,6 +37,13 @@ from fastapi.responses import RedirectResponse, JSONResponse, StreamingResponse,
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 from pydantic import BaseModel, Field
+# ----------------- SBC REQUEST MODEL -----------------
+class SolveRequest(BaseModel):
+    challenge_code: str
+    account_id: Optional[int] = None
+    use_club_only: bool = False
+    prefer_untradeable: bool = True
+    max_candidates_per_slot: int = 100
 from app.auth.entitlements import compute_entitlements, require_feature
 from app.services.price_history import get_price_history
 from app.services.prices import get_player_price  # still imported (not strictly required after unification)
