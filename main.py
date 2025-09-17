@@ -3025,10 +3025,7 @@ async def top_buys(
         return {"ok": False, "reason": f"top-buys failed: {e}", "data": []}
 
 @app.post("/api/ai/signal/buy")
-async def place_buy_order(
-    request: Request,
-    user_id: str = Depends(get_current_user),
-):
+async def place_buy_order(request: Request):
     """Place a buy order (mock implementation)"""
     try:
         data = await request.json()
@@ -3037,16 +3034,14 @@ async def place_buy_order(
         qty = int(data.get("qty", 1))
         max_price = int(data.get("max_price", 0))
         
-        # Mock implementation - in reality you'd integrate with EA's API
-        # For now, just return a success response
-        
-        # Simulate order placement
+        # Mock implementation - simulate order placement
         import random
+        import time
         filled = random.choice([True, False])  # 50% chance of immediate fill
         
         if filled:
             # Simulate filled order
-            fill_price = max_price - random.randint(0, int(max_price * 0.05))  # Fill slightly below max
+            fill_price = max_price - random.randint(0, int(max_price * 0.05))
             return {
                 "filled": True,
                 "fill": {
@@ -3068,7 +3063,7 @@ async def place_buy_order(
     except Exception as e:
         logging.error(f"Buy order error: {e}")
         raise HTTPException(500, f"Could not place buy order: {e}")
-
+        
 @app.get("/api/market/now")  
 async def get_current_price(
     player_card_id: str,
