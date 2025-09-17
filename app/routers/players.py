@@ -308,7 +308,7 @@ async def get_player_price_route(
             """
             SELECT close, open_time
             FROM fut_candles
-            WHERE card_id = $1::text AND platform = $2
+            WHERE player_card_id = $1::text AND platform = $2
             ORDER BY open_time DESC
             LIMIT 1
             """,
@@ -395,39 +395,57 @@ async def get_player_history_route(
 ):
     plat = _plat(platform)
 
-    # 1) Try FUT.GG first
+    # 1) Try your existing history service (FUT.GG proxy)
     try:
-        from app.services.price_history import get_price_history
         data = await get_price_history(card_id, plat, tf)
-        if data and isinstance(data, list) and len(data) > 0:
-            return {"card_id": card_id, "platform": plat, "tf": tf, "history": data, "source": "futgg"}
-    except Exception:
+        if isinstance(data, list) and data:
+            return {
+                "card_id": card_id,
+                "platform": plat,
+                "tf": tf,
+                "history": data,
+                "source": "futgg",
+            }
+    } except Exception:
+        # ignore and fall back to DB
         pass
 
-    # 2) Fallback: use fut_candles table
-    rows = await conn.fetch(
-        """
-        SELECT open_time, open, high, low, close
-        FROM fut_candles
-        WHERE card_id = $1::text AND platform = $2
-        ORDER BY open_time ASC
-        """,
-        str(card_id), plat,
-    )
-    if rows:
-        candles = [
-            {
-                "open_time": r["open_time"],
-                "open": float(r["open"]) if r["open"] is not None else None,
-                "high": float(r["high"]) if r["high"] is not None else None,
-                "low": float(r["low"]) if r["low"] is not None else None,
-                "close": float(r["close"]) if r["close"] is not None else None,
-            }
-            for r in rows
-        ]
-        return {"card_id": card_id, "platform": plat, "tf": tf, "history": candles, "source": "candles"}
+    # 2) DB fallback: fut_candles using player_card_id
+    try:
+        rows = await conn.fetch(
+            """
+            SELECT open_time, open, high, low, close
+            FROM fut_candles
+            WHERE player_card_id = $1::text
+              AND (platform = $2 OR platform IN ('ps','playstation','console'))
+            ORDER BY open_time ASC
+            """,
+            str(card_id), plat,
+        )
 
-    # 3) If nothing found
+        if rows:
+            candles = [
+                {
+                    "open_time": r["open_time"],
+                    "open": float(r["open"]) if r["open"] is not None else None,
+                    "high": float(r["high"]) if r["high"] is not None else None,
+                    "low":  float(r["low"])  if r["low"]  is not None else None,
+                    "close":float(r["close"])if r["close"]is not None else None,
+                }
+                for r in rows
+            ]
+            return {
+                "card_id": card_id,
+                "platform": plat,
+                "tf": tf,
+                "history": candles,
+                "source": "candles",
+            }
+    except Exception:
+        # swallow and return empty below
+        pass
+
+    # 3) Nothing available
     return {"card_id": card_id, "platform": plat, "tf": tf, "history": [], "source": "none"}
 
 
