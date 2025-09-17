@@ -57,6 +57,64 @@ def _pick_platform_node(current: Dict[str, Any], platform: str) -> Dict[str, Any
 # Endpoints
 # ------------------------------
 
+# Add this to app/routers/players.py
+
+@router.get("/resolve")
+async def resolve_player_by_name(
+    name: str = Query(..., description="Player name to resolve"),
+    conn = Depends(get_player_db),
+):
+    """
+    Resolve a player by name to get their card details
+    """
+    try:
+        # Search for exact match first, then fuzzy match
+        row = await conn.fetchrow(
+            """
+            SELECT card_id, name, rating, version, image_url, club, league, nation, position, altposition, price
+            FROM fut_players 
+            WHERE LOWER(name) = LOWER($1)
+            ORDER BY rating DESC
+            LIMIT 1
+            """,
+            name.strip()
+        )
+        
+        if not row:
+            # Try fuzzy matching
+            row = await conn.fetchrow(
+                """
+                SELECT card_id, name, rating, version, image_url, club, league, nation, position, altposition, price
+                FROM fut_players 
+                WHERE LOWER(name) LIKE LOWER($1)
+                ORDER BY rating DESC
+                LIMIT 1
+                """,
+                f"%{name.strip()}%"
+            )
+        
+        if not row:
+            raise HTTPException(status_code=404, detail="Player not found")
+        
+        return {
+            "card_id": int(row["card_id"]),
+            "name": row["name"],
+            "rating": row["rating"],
+            "version": row["version"],
+            "image_url": row["image_url"],
+            "club": row["club"],
+            "league": row["league"],
+            "nation": row["nation"],
+            "position": row["position"],
+            "altposition": row["altposition"],
+            "price": row["price"],
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Resolution failed: {e}")
+
 @router.get("/search")
 async def search_players(
     q: str = Query("", description="name or card_id substring"),
