@@ -246,7 +246,7 @@ async def players_autocomplete(
         pos_label = r["position"] or ""
         label = f"{name} ({rating}) {ver} {pos_label}".strip()
         items.append({
-            "value": cid,          # for <Select/> components
+            "value": cid,
             "label": label,
             "card_id": cid,
             "name": name,
@@ -303,7 +303,6 @@ async def get_player_price_route(
         where: List[str] = ["player_card_id = $1::text"]
         params: List[Any] = [str(card_id)]
 
-        # platform condition
         if plat == "ps":
             where.append("platform IN ('ps','playstation','console')")
         else:
@@ -330,7 +329,7 @@ async def get_player_price_route(
     except Exception:
         pass
 
-    # 2) Try fut_players snapshot (what Best Buys uses)
+    # 2) fut_players snapshot
     try:
         row = await conn.fetchrow(
             """
@@ -400,11 +399,11 @@ async def get_player_history_route(
     """
     Return OHLC candles for a player.
     Order: FUT.GG service first; if empty, fall back to fut_candles.
-    Includes 'ts' (epoch seconds) + 'iso' timestamps for robust client parsing.
+    Includes 'ts' (epoch seconds) + 'iso' for robust client parsing.
     """
     plat = _plat(platform)
 
-    # 1) Try your existing FUT.GG-backed service
+    # 1) Try FUT.GG-backed service
     try:
         data = await get_price_history(card_id, plat, tf)
         if isinstance(data, list) and data:
@@ -416,13 +415,12 @@ async def get_player_history_route(
                 "source": "futgg",
             }
     except Exception:
-        pass  # fall through to DB fallback
+        pass  # fall through
 
-    # 2) DB fallback: fut_candles (player_card_id, platform)
+    # 2) DB fallback
     try:
-        # pick a sensible window based on tf (defaults keep UI responsive)
         tf_map = {
-            "today": "2 days",   # cover quiet days too
+            "today": "2 days",
             "24h":  "1 day",
             "7d":   "7 days",
             "30d":  "30 days",
@@ -433,7 +431,6 @@ async def get_player_history_route(
         where: List[str] = ["player_card_id = $1::text"]
         params: List[Any] = [str(card_id)]
 
-        # platform condition (normalize synonyms only for PS)
         if plat == "ps":
             where.append("platform IN ('ps','playstation','console')")
         else:
@@ -451,14 +448,13 @@ async def get_player_history_route(
             ORDER BY open_time ASC
             LIMIT 2000
         """
-
         rows = await conn.fetch(sql, *params)
 
         candles = [
             {
                 "ts":  int(r["open_time"].timestamp()),
                 "iso": r["open_time"].isoformat(),
-                "open_time": r["open_time"].isoformat(),  # keep for backward compat
+                "open_time": r["open_time"].isoformat(),  # compat
                 "open":   int(r["open"])   if r["open"]   is not None else None,
                 "high":   int(r["high"])   if r["high"]   is not None else None,
                 "low":    int(r["low"])    if r["low"]    is not None else None,
@@ -467,7 +463,6 @@ async def get_player_history_route(
             for r in rows
         ]
 
-        # If window returned nothing, fallback to last N rows overall (same platform rule)
         if not candles:
             where2: List[str] = ["player_card_id = $1::text"]
             params2: List[Any] = [str(card_id)]
@@ -506,7 +501,6 @@ async def get_player_history_route(
             "source": "candles",
         }
     except Exception:
-        # Never 500; keep CORS headers intact
         return {"card_id": card_id, "platform": plat, "tf": tf, "history": [], "source": "none"}
 
 @router.get("/batch/meta")
