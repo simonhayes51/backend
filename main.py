@@ -1248,7 +1248,6 @@ async def price_history(playerId: int, platform: str = "ps", tf: str = "today"):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Upstream error: {e}")
 
-# REPLACE your existing callback function with this
 @app.get("/api/callback")
 async def callback(request: Request):
     err = request.query_params.get("error")
@@ -1290,6 +1289,7 @@ async def callback(request: Request):
             raise HTTPException(400, detail="Failed to fetch user data")
         user_id = user_data["id"]
 
+        # Handle extension flow (non-dashboard OAuth)
         if state and state in OAUTH_STATE and OAUTH_STATE.get(state, {}).get("flow") != "dashboard":
             meta = OAUTH_STATE.pop(state, None) or {}
             jwt_token = issue_extension_token(user_id)
@@ -1301,10 +1301,14 @@ async def callback(request: Request):
         if state:
             OAUTH_STATE.pop(state, None)
 
+        # CHECK MEMBERSHIP BEFORE SETTING SESSION DATA
         is_member = await check_server_membership(user_id)
         if not is_member:
+            # Clear any existing session data
+            request.session.clear()
             return RedirectResponse(f"{FRONTEND_URL}/access-denied")
 
+        # ONLY set session data for verified members
         username = f"{user_data.get('username','user')}#{user_data.get('discriminator', '0000')}"
         avatar_url = (
             f"https://cdn.discordapp.com/avatars/{user_id}/{user_data['avatar']}.png"
@@ -1313,6 +1317,23 @@ async def callback(request: Request):
         )
         global_name = user_data.get('global_name') or user_data.get('username') or "User"
 
+        # Store user profile in database
+        async with request.app.state.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO user_profiles (user_id, username, avatar_url, global_name, updated_at)
+                VALUES ($1, $2, $3, $4, NOW())
+                ON CONFLICT (user_id) 
+                DO UPDATE SET 
+                    username = EXCLUDED.username,
+                    avatar_url = EXCLUDED.avatar_url,
+                    global_name = EXCLUDED.global_name,
+                    updated_at = NOW()
+                """,
+                user_id, username, avatar_url, global_name
+            )
+
+        # Set session data only after membership verification
         request.session["user_id"] = user_id
         request.session["username"] = username
         request.session["avatar_url"] = avatar_url
@@ -1320,6 +1341,12 @@ async def callback(request: Request):
         request.session["roles"] = await get_member_role_names(user_id)
 
         return RedirectResponse(f"{FRONTEND_URL}/auth/done")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.exception("OAuth unexpected error: %s", e)
+        raise HTTPException(500, detail="Authentication failed")
 
     except HTTPException:
         raise
