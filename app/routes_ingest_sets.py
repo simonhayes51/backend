@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
-from app.db import get_pg
+from app.db import get_db
 from app.routes_ea import get_sid_for_user
 from app.ea_client import ea_get, ExpiredEA, RateLimitedEA
 from app.ea_sbc_sets_ingest import upsert_sets_payload
@@ -8,7 +8,7 @@ from app.ea_sbc_ingest import upsert_set_challenges
 router = APIRouter(prefix="/api/ingest", tags=["ingest"])
 
 @router.post("/sbs/sets")
-async def ingest_sets(include_challenges: bool = True, pg=Depends(get_pg)):
+async def ingest_sets(include_challenges: bool = True, pg=Depends(get_db)):
     sid = get_sid_for_user()
     try:
         sets_payload = await ea_get("sbs/sets", sid)
