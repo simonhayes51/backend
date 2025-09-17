@@ -8,7 +8,7 @@ from typing import AsyncGenerator, Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
-# If you already have this service, it’s safe to import (it doesn’t import main)
+# If you already have this service, it's safe to import (it doesn't import main)
 from app.services.price_history import get_price_history
 
 router = APIRouter(prefix="/api/players", tags=["players"])
@@ -57,8 +57,6 @@ def _pick_platform_node(current: Dict[str, Any], platform: str) -> Dict[str, Any
 # Endpoints
 # ------------------------------
 
-# Add this to app/routers/players.py
-
 @router.get("/resolve")
 async def resolve_player_by_name(
     name: str = Query(..., description="Player name to resolve"),
@@ -71,7 +69,7 @@ async def resolve_player_by_name(
         # Search for exact match first, then fuzzy match
         row = await conn.fetchrow(
             """
-            SELECT card_id, name, rating, version, image_url, club, league, nation, position, altposition, price
+            SELECT card_id, name, rating, version, image_url, club, league, nation, position, altposition, price_num, price
             FROM fut_players 
             WHERE LOWER(name) = LOWER($1)
             ORDER BY rating DESC
@@ -84,9 +82,9 @@ async def resolve_player_by_name(
             # Try fuzzy matching
             row = await conn.fetchrow(
                 """
-                SELECT card_id, name, rating, version, image_url, club, league, nation, position, altposition, price
+                SELECT card_id, name, rating, version, image_url, club, league, nation, position, altposition, price_num, price
                 FROM fut_players 
-                WHERE LOWER(name) LIKE LOWER($1)
+                WHERE LOWER(name) ILIKE LOWER($1)
                 ORDER BY rating DESC
                 LIMIT 1
                 """,
@@ -108,6 +106,7 @@ async def resolve_player_by_name(
             "position": row["position"],
             "altposition": row["altposition"],
             "price": row["price"],
+            "price_num": row["price_num"],
         }
         
     except HTTPException:
@@ -158,7 +157,7 @@ async def search_players(
     sql = f"""
         SELECT
           card_id, name, rating, version, image_url, club, league, nation,
-          position, altposition, price
+          position, altposition, price, price_num
         FROM fut_players
         WHERE {base_where}
         ORDER BY
@@ -183,6 +182,7 @@ async def search_players(
                 "position": r["position"],
                 "altposition": r["altposition"],
                 "price": r["price"],
+                "price_num": r["price_num"],
             }
             for r in rows
         ]
@@ -265,7 +265,7 @@ async def get_player(card_id: str, conn = Depends(get_player_db)):
     """
     row = await conn.fetchrow(
         """
-        SELECT card_id, name, rating, version, image_url, club, league, nation, position, altposition, price
+        SELECT card_id, name, rating, version, image_url, club, league, nation, position, altposition, price, price_num
         FROM fut_players
         WHERE card_id = $1::text
         """,
@@ -348,7 +348,7 @@ async def batch_meta(
         return {"items": []}
     rows = await conn.fetch(
         """
-        SELECT card_id, name, rating, version, image_url, club, league, nation, position, altposition, price
+        SELECT card_id, name, rating, version, image_url, club, league, nation, position, altposition, price, price_num
         FROM fut_players
         WHERE card_id = ANY($1::text[])
         """,
