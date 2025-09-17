@@ -23,7 +23,7 @@ async def list_sets(pg=Depends(get_db),
     return {"ok": True, "data": [dict(r) for r in rows]}
 
 @router.get("/challenges")
-async def list_challenges(pg=Depends(get_pg),
+async def list_challenges(pg=Depends(get_db),
                           set_id: int | None = Query(None),
                           code: str | None = Query(None),
                           limit: int = 100, offset: int = 0):
