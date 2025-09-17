@@ -17,7 +17,7 @@ async def top_buys(
     platform: str = "ps",
     limit: int = 36,
     db=Depends(get_db),
-) -> Dict[str, Any]:
+):
     """
     Get top buy recommendations with risk assessment
     """
