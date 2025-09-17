@@ -34,9 +34,12 @@ FUTGG_BASE = "https://www.fut.gg/api/fut/player-prices/26"
 
 def _plat(p: str) -> str:
     p = (p or "").lower()
-    if p in ("ps", "playstation", "console"): return "ps"
-    if p in ("xbox", "xb"): return "xbox"
-    if p in ("pc", "origin"): return "pc"
+    if p in ("ps", "playstation", "console"):
+        return "ps"
+    if p in ("xbox", "xb"):
+        return "xbox"
+    if p in ("pc", "origin"):
+        return "pc"
     return "ps"
 
 def _pick_platform_node(current: Dict[str, Any], platform: str) -> Dict[str, Any]:
@@ -127,6 +130,75 @@ async def search_players(
         ]
     }
 
+@router.get("/autocomplete")
+async def players_autocomplete(
+    q: str = Query("", description="name or card_id substring"),
+    pos: Optional[str] = Query(None, description="position filter like ST, CAM, CB"),
+    conn = Depends(get_player_db),
+):
+    """
+    Lightweight autocomplete list for UI dropdowns.
+    Returns items with {value, label, card_id, name, rating, version, image_url, position}.
+    """
+    q = (q or "").strip()
+    p = (pos or "").strip().upper() or None
+
+    where = []
+    params: List[Any] = []
+
+    if q:
+        where.append("(LOWER(name) LIKE LOWER($1) OR card_id::text LIKE $1)")
+        params.append(f"%{q}%")
+
+    if p:
+        params.append(p)
+        idx = len(params)
+        where.append(
+            f"""
+            (
+              UPPER(position) = ${idx}
+              OR (
+                COALESCE(altposition, '') <> ''
+                AND EXISTS (
+                  SELECT 1
+                  FROM regexp_split_to_table(altposition, '[,;/|\\s]+') ap
+                  WHERE UPPER(TRIM(ap)) = ${idx}
+                )
+              )
+            )
+            """
+        )
+
+    base_where = " AND ".join(where) if where else "TRUE"
+    sql = f"""
+        SELECT card_id, name, rating, version, image_url, position
+        FROM fut_players
+        WHERE {base_where}
+        ORDER BY rating DESC NULLS LAST, name ASC
+        LIMIT 20
+    """
+    rows = await conn.fetch(sql, *params)
+
+    items: List[Dict[str, Any]] = []
+    for r in rows:
+        cid = int(r["card_id"])
+        name = r["name"]
+        rating = r["rating"]
+        ver = r["version"] or ""
+        pos_label = r["position"] or ""
+        label = f"{name} ({rating}) {ver} {pos_label}".strip()
+        items.append({
+            "value": cid,          # for <Select/> components
+            "label": label,
+            "card_id": cid,
+            "name": name,
+            "rating": rating,
+            "version": ver,
+            "image_url": r["image_url"],
+            "position": pos_label,
+        })
+
+    return {"items": items}
 
 @router.get("/{card_id}")
 async def get_player(card_id: str, conn = Depends(get_player_db)):
@@ -147,14 +219,12 @@ async def get_player(card_id: str, conn = Depends(get_player_db)):
     d["card_id"] = int(d["card_id"])
     return d
 
-
 @router.get("/{card_id}/meta")
 async def get_player_meta(card_id: str, conn = Depends(get_player_db)):
     """
     Small alias for metadata (same as GET /{card_id}) to keep clients flexible.
     """
     return await get_player(card_id, conn)  # type: ignore[arg-type]
-
 
 @router.get("/{card_id}/price")
 async def get_player_price_route(
@@ -191,7 +261,6 @@ async def get_player_price_route(
         "updatedAt": node.get("priceUpdatedAt") or current.get("priceUpdatedAt"),
     }
 
-
 @router.get("/{card_id}/history")
 async def get_player_history_route(
     card_id: int,
@@ -208,9 +277,11 @@ async def get_player_history_route(
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"history error: {e}")
 
-
 @router.get("/batch/meta")
-async def batch_meta(ids: str = Query(..., description="CSV of card_ids"), conn = Depends(get_player_db)):
+async def batch_meta(
+    ids: str = Query(..., description="CSV of card_ids"),
+    conn = Depends(get_player_db),
+):
     """
     Batch metadata fetch for up to ~100 ids at once.
     """
@@ -225,7 +296,7 @@ async def batch_meta(ids: str = Query(..., description="CSV of card_ids"), conn 
         """,
         raw_ids,
     )
-    out = []
+    out: List[Dict[str, Any]] = []
     for r in rows:
         d = dict(r)
         d["card_id"] = int(d["card_id"])
