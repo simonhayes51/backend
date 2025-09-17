@@ -292,36 +292,92 @@ async def get_player_meta(card_id: str, conn = Depends(get_player_db)):
 async def get_player_price_route(
     card_id: int,
     platform: str = Query("ps", description="ps|xbox|pc|console"),
+    conn = Depends(get_player_db),
 ):
     """
-    Fetch current FUT.GG price for a player (per platform).
-    This is a self-contained fetch here to avoid importing from main.py.
+    Return latest price preferring local data:
+    1) fut_candles (last close)
+    2) fut_players.price_num
+    3) FUT.GG currentPrice (fallback)
     """
     plat = _plat(platform)
-    url = f"{FUTGG_BASE}/{card_id}"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-GB,en;q=0.9",
-        "Referer": "https://www.fut.gg/",
-        "Origin": "https://www.fut.gg",
-    }
-    timeout = aiohttp.ClientTimeout(total=12)
-    async with aiohttp.ClientSession(timeout=timeout) as sess:
-        async with sess.get(url, headers=headers) as r:
-            if r.status != 200:
-                raise HTTPException(status_code=502, detail=f"Upstream FUT.GG error {r.status}")
-            js = await r.json()
 
-    current = (js.get("data") or {}).get("currentPrice") or {}
-    node = _pick_platform_node(current, plat)
-    return {
-        "card_id": card_id,
-        "platform": plat,
-        "price": node.get("price"),
-        "isExtinct": node.get("isExtinct", False),
-        "updatedAt": node.get("priceUpdatedAt") or current.get("priceUpdatedAt"),
-    }
+    # 1) Try fut_candles (last close)
+    try:
+        row = await conn.fetchrow(
+            """
+            SELECT close, open_time
+            FROM fut_candles
+            WHERE card_id = $1::text AND platform = $2
+            ORDER BY open_time DESC
+            LIMIT 1
+            """,
+            str(card_id), plat,
+        )
+        if row and row["close"] is not None:
+            return {
+                "card_id": card_id,
+                "platform": plat,
+                "price": int(row["close"]),
+                "isExtinct": False,
+                "updatedAt": row["open_time"],
+                "source": "candles",
+            }
+    except Exception:
+        pass
+
+    # 2) Try fut_players snapshot (what Best Buys uses)
+    try:
+        row = await conn.fetchrow(
+            """
+            SELECT price_num, updated_at
+            FROM fut_players
+            WHERE card_id = $1::text
+            """,
+            str(card_id),
+        )
+        if row and row["price_num"] is not None:
+            return {
+                "card_id": card_id,
+                "platform": plat,
+                "price": int(row["price_num"]),
+                "isExtinct": False,
+                "updatedAt": row["updated_at"],
+                "source": "players",
+            }
+    except Exception:
+        pass
+
+    # 3) Fallback to FUT.GG live
+    try:
+        url = f"{FUTGG_BASE}/{card_id}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-GB,en;q=0.9",
+            "Referer": "https://www.fut.gg/",
+            "Origin": "https://www.fut.gg",
+        }
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as sess:
+            async with sess.get(url, headers=headers) as r:
+                if r.status == 200:
+                    js = await r.json()
+                    current = (js.get("data") or {}).get("currentPrice") or {}
+                    node = _pick_platform_node(current, plat)
+                    return {
+                        "card_id": card_id,
+                        "platform": plat,
+                        "price": node.get("price"),
+                        "isExtinct": node.get("isExtinct", False),
+                        "updatedAt": node.get("priceUpdatedAt") or current.get("priceUpdatedAt"),
+                        "source": "futgg",
+                    }
+    except Exception:
+        pass
+
+    # Nothing available
+    return {"card_id": card_id, "platform": plat, "price": None, "isExtinct": False, "updatedAt": None, "source": "none"}
 
 @router.get("/{card_id}/history")
 async def get_player_history_route(
