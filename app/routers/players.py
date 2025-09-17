@@ -118,11 +118,11 @@ async def resolve_player_by_name(
 async def search_players(
     q: str = Query("", description="name or card_id substring"),
     pos: Optional[str] = Query(None, description="exact position code like ST, CAM, CB"),
+    limit: int = Query(50, description="max results"),
     conn = Depends(get_player_db),
 ):
     """
     Search players in the fut_players table (player DB).
-    NOTE: main.py also exposes /api/search-players; this variant lives under /api/players/search.
     """
     q = (q or "").strip()
     p = (pos or "").strip().upper() or None
@@ -164,30 +164,36 @@ async def search_players(
           CASE WHEN price IS NULL THEN 1 ELSE 0 END,
           rating DESC NULLS LAST,
           name ASC
-        LIMIT 50
+        LIMIT ${'$' + str(len(params) + 1)}
     """
+    params.append(limit)
 
     rows = await conn.fetch(sql, *params)
+    
+    # Return in the format expected by SmartBuyerAI
+    players = [
+        {
+            "card_id": int(r["card_id"]),
+            "name": r["name"],
+            "rating": r["rating"],
+            "version": r["version"],
+            "image_url": r["image_url"],
+            "club": r["club"],
+            "league": r["league"],
+            "nation": r["nation"],
+            "position": r["position"],
+            "altposition": r["altposition"],
+            "price": r["price"],
+            "price_num": r["price_num"],
+        }
+        for r in rows
+    ]
+    
+    # Return both formats to be compatible with different components
     return {
-        "players": [
-            {
-                "card_id": int(r["card_id"]),
-                "name": r["name"],
-                "rating": r["rating"],
-                "version": r["version"],
-                "image_url": r["image_url"],
-                "club": r["club"],
-                "league": r["league"],
-                "nation": r["nation"],
-                "position": r["position"],
-                "altposition": r["altposition"],
-                "price": r["price"],
-                "price_num": r["price_num"],
-            }
-            for r in rows
-        ]
+        "players": players,  # For BestBuys compatibility
+        "data": players      # For SmartBuyerAI compatibility
     }
-
 @router.get("/autocomplete")
 async def players_autocomplete(
     q: str = Query("", description="name or card_id substring"),
