@@ -1003,10 +1003,20 @@ app.add_middleware(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_URL],     # exact, not "*"
-    allow_credentials=True,              # REQUIRED for cookies
-    allow_methods=["*"],
-    allow_headers=["Content-Type", "Authorization"],
+    allow_origins=[FRONTEND_URL],
+    allow_credentials=True,           # cookies!
+    allow_methods=["GET","POST","PUT","PATCH","DELETE","OPTIONS"],
+    allow_headers=["Content-Type","Authorization","X-Requested-With"],
+    expose_headers=[],                # optional
+)
+
+from starlette.middleware.sessions import SessionMiddleware
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=SECRET_KEY,
+    same_site="none",
+    https_only=True,
+    session_cookie="session",
 )
 
 # ---------------- Routers & helpers ----------------
