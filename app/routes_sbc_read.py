@@ -1,10 +1,10 @@
 from fastapi import APIRouter, Depends, Query
-from app.db import get_pg
+from app.db import get_db
 
 router = APIRouter(prefix="/api/sbc", tags=["sbc"])
 
 @router.get("/sets")
-async def list_sets(pg=Depends(get_pg),
+async def list_sets(pg=Depends(get_db),
                     q: str | None = Query(None),
                     category_id: int | None = Query(None),
                     limit: int = 50, offset: int = 0):
