@@ -6,7 +6,7 @@ from app.services.indicators import ema, rsi, bollinger, atr
 
 router = APIRouter(prefix="/api/market", tags=["Market"])
 
-# Add this to app/routers/market.py
+# REPLACE the /now endpoint in app/routers/market.py with this:
 
 @router.get("/now")
 async def get_current_price(
@@ -16,11 +16,37 @@ async def get_current_price(
 ) -> Dict[str, Any]:
     """Get current market price for a player"""
     try:
-        # Try to get the most recent candle data
-        row = await db.fetchrow(
+        from main import app
+        
+        # Get from fut_players table
+        async with app.state.player_pool.acquire() as pconn:
+            player_row = await pconn.fetchrow(
+                "SELECT price_num, price, name FROM fut_players WHERE card_id=$1",
+                player_card_id
+            )
+            
+            if player_row:
+                price = None
+                if player_row["price_num"]:
+                    price = int(player_row["price_num"])
+                elif player_row["price"] and str(player_row["price"]).isdigit():
+                    price = int(player_row["price"])
+                
+                if price:
+                    from datetime import datetime
+                    return {
+                        "player_card_id": player_card_id,
+                        "platform": platform,
+                        "price": price,
+                        "player_name": player_row["name"],
+                        "timestamp": datetime.now().isoformat()
+                    }
+        
+        # Fallback: try candle data
+        candle_row = await db.fetchrow(
             """
             SELECT close as price, open_time
-            FROM public.fut_candles
+            FROM fut_candles
             WHERE player_card_id=$1 AND platform=$2 
             ORDER BY open_time DESC
             LIMIT 1
@@ -28,31 +54,21 @@ async def get_current_price(
             player_card_id, platform
         )
         
-        if row:
+        if candle_row:
             return {
                 "player_card_id": player_card_id,
                 "platform": platform,
-                "price": float(row["price"]),
-                "timestamp": row["open_time"].isoformat() if row["open_time"] else None
+                "price": int(candle_row["price"]),
+                "timestamp": candle_row["open_time"].isoformat() if candle_row["open_time"] else None
             }
-        else:
-            # Fallback to fut_players table
-            async with db.acquire() as player_conn:
-                player_row = await player_conn.fetchrow(
-                    "SELECT price_num FROM fut_players WHERE card_id=$1::text",
-                    player_card_id
-                )
-                if player_row and player_row["price_num"]:
-                    return {
-                        "player_card_id": player_card_id,
-                        "platform": platform,
-                        "price": float(player_row["price_num"]),
-                        "timestamp": None
-                    }
-            
-            raise HTTPException(404, f"No price data found for player {player_card_id}")
-            
+        
+        raise HTTPException(404, f"No price data found for player {player_card_id}")
+        
+    except HTTPException:
+        raise
     except Exception as e:
+        import logging
+        logging.error(f"Current price error: {e}")
         raise HTTPException(500, f"Failed to get current price: {e}")
 
 @router.get("/candles")
