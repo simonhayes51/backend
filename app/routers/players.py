@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import aiohttp
 from typing import AsyncGenerator, Any, Dict, List, Optional
 
@@ -124,7 +123,7 @@ async def search_players(
     q = (q or "").strip()
     p = (pos or "").strip().upper() or None
 
-    where = []
+    where: List[str] = []
     params: List[Any] = []
 
     if q:
@@ -151,8 +150,6 @@ async def search_players(
         )
 
     base_where = " AND ".join(where) if where else "TRUE"
-
-    # Compute the placeholder index for LIMIT
     limit_idx = len(params) + 1
 
     sql = f"""
@@ -169,7 +166,6 @@ async def search_players(
     """
 
     params.append(limit)
-
     rows = await conn.fetch(sql, *params)
 
     players = [
@@ -205,7 +201,7 @@ async def players_autocomplete(
     q = (q or "").strip()
     p = (pos or "").strip().upper() or None
 
-    where = []
+    where: List[str] = []
     params: List[Any] = []
 
     if q:
@@ -302,19 +298,26 @@ async def get_player_price_route(
     """
     plat = _plat(platform)
 
-    # 1) Try fut_candles (latest close)
+    # 1) Try fut_candles (latest close) with correct per-platform filter
     try:
-        row = await conn.fetchrow(
-            """
+        where: List[str] = ["player_card_id = $1::text"]
+        params: List[Any] = [str(card_id)]
+
+        # platform condition
+        if plat == "ps":
+            where.append("platform IN ('ps','playstation','console')")
+        else:
+            params.append(plat)
+            where.append(f"platform = ${len(params)}")
+
+        sql = f"""
             SELECT close, open_time
             FROM fut_candles
-            WHERE player_card_id = $1::text
-              AND (platform = $2 OR platform IN ('ps','playstation','console'))
+            WHERE {' AND '.join(where)}
             ORDER BY open_time DESC
             LIMIT 1
-            """,
-            str(card_id), plat,
-        )
+        """
+        row = await conn.fetchrow(sql, *params)
         if row and row["close"] is not None:
             return {
                 "card_id": card_id,
@@ -397,6 +400,7 @@ async def get_player_history_route(
     """
     Return OHLC candles for a player.
     Order: FUT.GG service first; if empty, fall back to fut_candles.
+    Includes 'ts' (epoch seconds) + 'iso' timestamps for robust client parsing.
     """
     plat = _plat(platform)
 
@@ -426,17 +430,20 @@ async def get_player_history_route(
         }
         window = tf_map.get(tf, "2 days")
 
-        where = [
-            "player_card_id = $1::text",
-            "(platform = $2 OR platform IN ('ps','playstation','console'))",
-        ]
-        params = [str(card_id), plat]
+        where: List[str] = ["player_card_id = $1::text"]
+        params: List[Any] = [str(card_id)]
+
+        # platform condition (normalize synonyms only for PS)
+        if plat == "ps":
+            where.append("platform IN ('ps','playstation','console')")
+        else:
+            params.append(plat)
+            where.append(f"platform = ${len(params)}")
 
         if window:
-            idx = len(params) + 1
-            where.append(f"open_time >= now() - (${idx}::interval)")
-            params.append(window)   # e.g. "24 hours"
-            
+            params.append(window)  # e.g. "24 hours"
+            where.append(f"open_time >= now() - (${len(params)}::interval)")
+
         sql = f"""
             SELECT open_time, open, high, low, close
             FROM fut_candles
@@ -449,31 +456,40 @@ async def get_player_history_route(
 
         candles = [
             {
-                "open_time": r["open_time"],
-                "open":   (int(r["open"])   if r["open"]   is not None else None),
-                "high":   (int(r["high"])   if r["high"]   is not None else None),
-                "low":    (int(r["low"])    if r["low"]    is not None else None),
-                "close":  (int(r["close"])  if r["close"]  is not None else None),
+                "ts":  int(r["open_time"].timestamp()),
+                "iso": r["open_time"].isoformat(),
+                "open_time": r["open_time"].isoformat(),  # keep for backward compat
+                "open":   int(r["open"])   if r["open"]   is not None else None,
+                "high":   int(r["high"])   if r["high"]   is not None else None,
+                "low":    int(r["low"])    if r["low"]    is not None else None,
+                "close":  int(r["close"])  if r["close"]  is not None else None,
             }
             for r in rows
         ]
 
-        # If window returned nothing, fallback to last N rows overall
+        # If window returned nothing, fallback to last N rows overall (same platform rule)
         if not candles:
-            rows = await conn.fetch(
-                """
+            where2: List[str] = ["player_card_id = $1::text"]
+            params2: List[Any] = [str(card_id)]
+            if plat == "ps":
+                where2.append("platform IN ('ps','playstation','console')")
+            else:
+                params2.append(plat)
+                where2.append(f"platform = ${len(params2)}")
+
+            sql2 = f"""
                 SELECT open_time, open, high, low, close
                 FROM fut_candles
-                WHERE player_card_id = $1::text
-                  AND (platform = $2 OR platform IN ('ps','playstation','console'))
+                WHERE {' AND '.join(where2)}
                 ORDER BY open_time ASC
                 LIMIT 2000
-                """,
-                str(card_id), plat,
-            )
+            """
+            rows = await conn.fetch(sql2, *params2)
             candles = [
                 {
-                    "open_time": r["open_time"],
+                    "ts":  int(r["open_time"].timestamp()),
+                    "iso": r["open_time"].isoformat(),
+                    "open_time": r["open_time"].isoformat(),
                     "open": int(r["open"]) if r["open"] is not None else None,
                     "high": int(r["high"]) if r["high"] is not None else None,
                     "low":  int(r["low"])  if r["low"]  is not None else None,
