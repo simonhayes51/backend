@@ -1003,7 +1003,7 @@ app.add_middleware(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_ORIGIN],     # exact, not "*"
+    allow_origins=[FRONTEND_URL],     # exact, not "*"
     allow_credentials=True,              # REQUIRED for cookies
     allow_methods=["*"],
     allow_headers=["Content-Type", "Authorization"],
