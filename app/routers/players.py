@@ -433,9 +433,10 @@ async def get_player_history_route(
         params = [str(card_id), plat]
 
         if window:
-            where.append("open_time >= (NOW() AT TIME ZONE 'UTC') - INTERVAL $3")
-            params.append(window)
-
+            idx = len(params) + 1
+            where.append(f"open_time >= now() - (${idx}::interval)")
+            params.append(window)   # e.g. "24 hours"
+            
         sql = f"""
             SELECT open_time, open, high, low, close
             FROM fut_candles
