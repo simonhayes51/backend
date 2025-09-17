@@ -1002,37 +1002,13 @@ app.add_middleware(
 )
 
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[FRONTEND_URL],
-    allow_credentials=True,           # cookies!
-    allow_methods=["GET","POST","PUT","PATCH","DELETE","OPTIONS"],
-    allow_headers=["Content-Type","Authorization","X-Requested-With"],
-    expose_headers=[],                # optional
-)
-
-from starlette.middleware.sessions import SessionMiddleware
-app.add_middleware(
     SessionMiddleware,
     secret_key=SECRET_KEY,
-    same_site="none",
-    https_only=True,
-    session_cookie="session",
+    same_site="none" if IS_PROD else "lax",
+    https_only=IS_PROD,            # ✅ use this
 )
 
 # ---------------- Routers & helpers ----------------
-
-router = APIRouter()
-
-@router.get("/api/auth/callback")
-async def auth_callback(request: Request, code: str, state: str | None = None):
-    # ...exchange code with Discord, load/create user...
-    discord_id = "<resolved_user_id>"
-
-    # Write to the session (SessionMiddleware will emit Set-Cookie on this response)
-    request.session.update({"uid": discord_id, "iat": int(time.time())})
-
-    # Redirect the user to your app
-    return RedirectResponse(url=f"{FRONTEND_ORIGIN}/auth/done")
 
 # DB dependencies (use pools created in lifespan)
 async def get_db(request: Request):
