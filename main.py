@@ -40,6 +40,9 @@ from discord_manager import discord_manager
 from app.routers.market import router as market_router
 from app.routers.ai_engine import router as ai_router
 from app.routers.players import router as players_router
+from app.routes_ea import router as ea_router
+from app.routes_ingest_sets import router as ingest_router
+from app.routes_sbc_read import router as sbc_read_router
 
 
 # ----------------- BOOTSTRAP -----------------
@@ -879,6 +882,9 @@ app = FastAPI(lifespan=lifespan)
 
 from app.routers.watchlist import router as watchlist_router
 app.include_router(watchlist_router)
+app.include_router(ea_router)
+app.include_router(ingest_router)
+app.include_router(sbc_read_router)
 
 # Local DB dependency (use the pools created in lifespan)
 async def get_db():
