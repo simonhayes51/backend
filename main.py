@@ -989,12 +989,13 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://app.futhub.co.uk",
+        "https://app.futhub.co.uk",  # ← Make sure this is included
         "https://www.futhub.co.uk",
-        "https://futhub.co.uk",
+        "https://futhub.co.uk", 
         "https://api.futhub.co.uk",
         "http://localhost:5173",
         "http://localhost:3000",
+        # Add any other domains your frontend runs on
     ],
     allow_credentials=True,
     allow_methods=["*"],
