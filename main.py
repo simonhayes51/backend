@@ -1302,11 +1302,17 @@ async def callback(request: Request):
             OAUTH_STATE.pop(state, None)
 
         # CHECK MEMBERSHIP BEFORE SETTING SESSION DATA
+        print(f"🔍 Checking membership for user {user_id}")
         is_member = await check_server_membership(user_id)
+        print(f"🔍 Membership result: {is_member}")
+        
         if not is_member:
-            # Clear any existing session data
+            print(f"❌ User {user_id} is NOT a member - clearing session")
             request.session.clear()
+            print(f"🔍 Redirecting to: {FRONTEND_URL}/access-denied")
             return RedirectResponse(f"{FRONTEND_URL}/access-denied")
+
+        print(f"✅ User {user_id} is a member - proceeding with login")
 
         # ONLY set session data for verified members
         username = f"{user_data.get('username','user')}#{user_data.get('discriminator', '0000')}"
@@ -1341,12 +1347,6 @@ async def callback(request: Request):
         request.session["roles"] = await get_member_role_names(user_id)
 
         return RedirectResponse(f"{FRONTEND_URL}/auth/done")
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logging.exception("OAuth unexpected error: %s", e)
-        raise HTTPException(500, detail="Authentication failed")
 
     except HTTPException:
         raise
@@ -2098,8 +2098,23 @@ async def test_alert_endpoint(
 @app.get("/api/me")
 async def get_current_user_info(request: Request, conn=Depends(get_db)):
     uid = request.session.get("user_id")
+    print(f"🔍 /api/me called - user_id from session: {uid}")
+    
     if not uid:
+        print("❌ No user_id in session")
         return {"authenticated": False}
+
+    # RE-CHECK membership for authenticated users
+    print(f"🔍 Re-checking membership for authenticated user {uid}")
+    is_member = await check_server_membership(uid)
+    if not is_member:
+        print(f"❌ User {uid} no longer a member - clearing session")
+        request.session.clear()
+        return {
+            "authenticated": False, 
+            "error": "membership_revoked",
+            "message": "Discord server membership required"
+        }
 
     # Get user profile
     profile = await conn.fetchrow(
@@ -2108,6 +2123,8 @@ async def get_current_user_info(request: Request, conn=Depends(get_db)):
     )
 
     if not profile:
+        print(f"❌ No profile found for user {uid}")
+        request.session.clear()
         return {"authenticated": False}
 
     # REAL-TIME PREMIUM VALIDATION
@@ -2131,12 +2148,10 @@ async def get_current_user_info(request: Request, conn=Depends(get_db)):
         current_period_end = active_subscription["current_period_end"]
         now = datetime.now(timezone.utc)
 
-        # Check if subscription is still valid
         if current_period_end and current_period_end > now:
             is_premium = True
             premium_until = current_period_end
         else:
-            # Subscription expired - update database immediately
             await conn.execute(
                 """
                 UPDATE user_profiles
@@ -2145,34 +2160,10 @@ async def get_current_user_info(request: Request, conn=Depends(get_db)):
                 """,
                 uid
             )
-
-            # Also mark subscription as expired if needed
-            await conn.execute(
-                """
-                UPDATE subscriptions
-                SET status = 'past_due'
-                WHERE user_id = $1 AND current_period_end <= $2 AND status = 'active'
-                """,
-                uid, now
-            )
-
-            # Remove Discord role immediately
             try:
                 await discord_manager.remove_premium_role(uid)
             except Exception as e:
-                logger.warning(f"Failed to remove Discord role for expired user {uid}: {e}")
-
-    # If database shows premium but no active subscription, fix it
-    elif profile["is_premium"]:
-        is_premium = False
-        await conn.execute(
-            """
-            UPDATE user_profiles
-            SET is_premium = FALSE, premium_until = NULL, updated_at = NOW()
-            WHERE user_id = $1
-            """,
-            uid
-        )
+                logging.warning(f"Failed to remove Discord role for expired user {uid}: {e}")
 
     return {
         "authenticated": True,
@@ -3821,6 +3812,16 @@ async def _bg_aggregator():
 async def _any_error(request: Request, exc: Exception):
     import traceback; traceback.print_exc()
     return JSONResponse(status_code=500, content={"path": str(request.url), "error": str(exc)})
+
+@app.get("/api/debug/session-state")
+async def debug_session_state(request: Request):
+    """Debug endpoint to see current session state"""
+    return {
+        "session_data": dict(request.session),
+        "has_user_id": "user_id" in request.session,
+        "user_id_value": request.session.get("user_id"),
+        "cookies": dict(request.cookies),
+    }
 
 # ---------- Tiny probes (remove later) ----------
 _probe = APIRouter()
