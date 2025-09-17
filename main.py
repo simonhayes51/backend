@@ -1309,8 +1309,9 @@ async def callback(request: Request):
         if not is_member:
             print(f"❌ User {user_id} is NOT a member - clearing session")
             request.session.clear()
-            print(f"🔍 Redirecting to: {FRONTEND_URL}/access-denied")
-            return RedirectResponse(f"{FRONTEND_URL}/access-denied")
+            print(f"🔍 Redirecting to: {FRONTEND_URL}/#/access-denied")
+            # FIXED: Add hash routing for your frontend
+            return RedirectResponse(f"{FRONTEND_URL}/#/access-denied")
 
         print(f"✅ User {user_id} is a member - proceeding with login")
 
@@ -1346,7 +1347,8 @@ async def callback(request: Request):
         request.session["global_name"] = global_name
         request.session["roles"] = await get_member_role_names(user_id)
 
-        return RedirectResponse(f"{FRONTEND_URL}/auth/done")
+        # FIXED: Add hash routing for successful login too
+        return RedirectResponse(f"{FRONTEND_URL}/#/")
 
     except HTTPException:
         raise
