@@ -296,13 +296,13 @@ async def get_player_price_route(
 ):
     """
     Return latest price preferring local data:
-    1) fut_candles (last close)
-    2) fut_players.price_num
-    3) FUT.GG currentPrice (fallback)
+      1) fut_candles last close (per platform)
+      2) fut_players.price_num snapshot
+      3) FUT.GG currentPrice (fallback)
     """
     plat = _plat(platform)
 
-    # 1) Try fut_candles (last close)
+    # 1) Try fut_candles (latest close)
     try:
         row = await conn.fetchrow(
             """
@@ -348,7 +348,7 @@ async def get_player_price_route(
     except Exception:
         pass
 
-    # 3) Fallback to FUT.GG live
+    # 3) FUT.GG fallback
     try:
         url = f"{FUTGG_BASE}/{card_id}"
         headers = {
@@ -376,8 +376,15 @@ async def get_player_price_route(
     except Exception:
         pass
 
-    # Nothing available
-    return {"card_id": card_id, "platform": plat, "price": None, "isExtinct": False, "updatedAt": None, "source": "none"}
+    return {
+        "card_id": card_id,
+        "platform": plat,
+        "price": None,
+        "isExtinct": False,
+        "updatedAt": None,
+        "source": "none",
+    }
+
 
 @router.get("/{card_id}/history")
 async def get_player_history_route(
