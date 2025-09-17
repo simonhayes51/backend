@@ -406,7 +406,7 @@ async def get_player_history_route(
                 "history": data,
                 "source": "futgg",
             }
-    } except Exception:
+    except Exception:
         # ignore and fall back to DB
         pass
 
