@@ -308,7 +308,8 @@ async def get_player_price_route(
             """
             SELECT close, open_time
             FROM fut_candles
-            WHERE player_card_id = $1::text AND platform = $2
+            WHERE player_card_id = $1::text
+              AND (platform = $2 OR platform IN ('ps','playstation','console'))
             ORDER BY open_time DESC
             LIMIT 1
             """,
@@ -390,12 +391,16 @@ async def get_player_price_route(
 async def get_player_history_route(
     card_id: int,
     platform: str = Query("ps", description="ps|xbox|pc|console"),
-    tf: str = Query("today", description="history range understood by service"),
+    tf: str = Query("today", description="today|24h|7d|30d|all"),
     conn = Depends(get_player_db),
 ):
+    """
+    Return OHLC candles for a player.
+    Order: FUT.GG service first; if empty, fall back to fut_candles.
+    """
     plat = _plat(platform)
 
-    # 1) Try your existing history service (FUT.GG proxy)
+    # 1) Try your existing FUT.GG-backed service
     try:
         data = await get_price_history(card_id, plat, tf)
         if isinstance(data, list) and data:
@@ -407,47 +412,85 @@ async def get_player_history_route(
                 "source": "futgg",
             }
     except Exception:
-        # ignore and fall back to DB
-        pass
+        pass  # fall through to DB fallback
 
-    # 2) DB fallback: fut_candles using player_card_id
+    # 2) DB fallback: fut_candles (player_card_id, platform)
     try:
-        rows = await conn.fetch(
-            """
+        # pick a sensible window based on tf (defaults keep UI responsive)
+        tf_map = {
+            "today": "2 days",   # cover quiet days too
+            "24h":  "1 day",
+            "7d":   "7 days",
+            "30d":  "30 days",
+            "all":  None,
+        }
+        window = tf_map.get(tf, "2 days")
+
+        where = [
+            "player_card_id = $1::text",
+            "(platform = $2 OR platform IN ('ps','playstation','console'))",
+        ]
+        params = [str(card_id), plat]
+
+        if window:
+            where.append("open_time >= (NOW() AT TIME ZONE 'UTC') - INTERVAL $3")
+            params.append(window)
+
+        sql = f"""
             SELECT open_time, open, high, low, close
             FROM fut_candles
-            WHERE player_card_id = $1::text
-              AND (platform = $2 OR platform IN ('ps','playstation','console'))
+            WHERE {' AND '.join(where)}
             ORDER BY open_time ASC
-            """,
-            str(card_id), plat,
-        )
+            LIMIT 2000
+        """
 
-        if rows:
+        rows = await conn.fetch(sql, *params)
+
+        candles = [
+            {
+                "open_time": r["open_time"],
+                "open":   (int(r["open"])   if r["open"]   is not None else None),
+                "high":   (int(r["high"])   if r["high"]   is not None else None),
+                "low":    (int(r["low"])    if r["low"]    is not None else None),
+                "close":  (int(r["close"])  if r["close"]  is not None else None),
+            }
+            for r in rows
+        ]
+
+        # If window returned nothing, fallback to last N rows overall
+        if not candles:
+            rows = await conn.fetch(
+                """
+                SELECT open_time, open, high, low, close
+                FROM fut_candles
+                WHERE player_card_id = $1::text
+                  AND (platform = $2 OR platform IN ('ps','playstation','console'))
+                ORDER BY open_time ASC
+                LIMIT 2000
+                """,
+                str(card_id), plat,
+            )
             candles = [
                 {
                     "open_time": r["open_time"],
-                    "open": float(r["open"]) if r["open"] is not None else None,
-                    "high": float(r["high"]) if r["high"] is not None else None,
-                    "low":  float(r["low"])  if r["low"]  is not None else None,
-                    "close":float(r["close"])if r["close"]is not None else None,
+                    "open": int(r["open"]) if r["open"] is not None else None,
+                    "high": int(r["high"]) if r["high"] is not None else None,
+                    "low":  int(r["low"])  if r["low"]  is not None else None,
+                    "close":int(r["close"])if r["close"]is not None else None,
                 }
                 for r in rows
             ]
-            return {
-                "card_id": card_id,
-                "platform": plat,
-                "tf": tf,
-                "history": candles,
-                "source": "candles",
-            }
+
+        return {
+            "card_id": card_id,
+            "platform": plat,
+            "tf": tf,
+            "history": candles,
+            "source": "candles",
+        }
     except Exception:
-        # swallow and return empty below
-        pass
-
-    # 3) Nothing available
-    return {"card_id": card_id, "platform": plat, "tf": tf, "history": [], "source": "none"}
-
+        # Never 500; keep CORS headers intact
+        return {"card_id": card_id, "platform": plat, "tf": tf, "history": [], "source": "none"}
 
 @router.get("/batch/meta")
 async def batch_meta(
