@@ -2933,6 +2933,194 @@ async def _attach_prices_ps(items: list[dict]) -> list[dict]:
             it["price_ps"] = None
     return items
 
+@app.get("/api/ai/top-buys")
+async def top_buys(
+    platform: str = "ps",
+    limit: int = 36,
+    conn=Depends(get_db),
+):
+    """Get top buy recommendations with risk assessment"""
+    try:
+        # Get players with price data, prioritize by rating and reasonable prices
+        async with app.state.player_pool.acquire() as pconn:
+            rows = await pconn.fetch(
+                """
+                SELECT 
+                    card_id as player_card_id,
+                    name,
+                    rating,
+                    position,
+                    version,
+                    image_url,
+                    price_num as current_price,
+                    club,
+                    league,
+                    nation
+                FROM fut_players 
+                WHERE price_num IS NOT NULL 
+                    AND price_num > 1000 
+                    AND price_num < 2000000
+                    AND rating >= 75
+                ORDER BY 
+                    CASE WHEN rating >= 90 THEN 1
+                         WHEN rating >= 85 THEN 2  
+                         WHEN rating >= 80 THEN 3
+                         ELSE 4 END,
+                    price_num ASC
+                LIMIT $1
+                """, 
+                limit
+            )
+        
+        results = []
+        for row in rows:
+            current = row["current_price"]
+            
+            # Mock some analysis data based on price patterns
+            # In production, you'd calculate these from real market data
+            card_id_int = int(row["player_card_id"])
+            price_variance = (card_id_int % 100) / 1000  # Mock variance 0-0.1
+            
+            # Simulate median price (slightly different from current)
+            median7 = int(current * (0.95 + price_variance))
+            
+            # Calculate percentage difference
+            if median7 > 0:
+                cheap_pct = (current - median7) / median7
+            else:
+                cheap_pct = 0
+            
+            # Mock volume (based on rating and price)
+            vol24 = max(10, (row["rating"] or 75) - 50 + (card_id_int % 30))
+            
+            # Determine risk level
+            abs_cheap_pct = abs(cheap_pct)
+            if abs_cheap_pct < 0.05:
+                risk_label = "Low"
+            elif abs_cheap_pct < 0.15:
+                risk_label = "Medium"
+            else:
+                risk_label = "High"
+            
+            results.append({
+                "player_card_id": str(row["player_card_id"]),
+                "player": {
+                    "name": row["name"],
+                    "rating": row["rating"],
+                    "position": row["position"],
+                    "version": row["version"] or "Standard",
+                    "image_url": row["image_url"]
+                },
+                "current": current,
+                "median7": median7,
+                "cheap_pct": cheap_pct,
+                "vol24": vol24,
+                "risk_label": risk_label
+            })
+        
+        return results
+        
+    except Exception as e:
+        logging.error(f"top-buys error: {e}")
+        return {"ok": False, "reason": f"top-buys failed: {e}", "data": []}
+
+@app.post("/api/ai/signal/buy")
+async def place_buy_order(
+    request: Request,
+    user_id: str = Depends(get_current_user),
+):
+    """Place a buy order (mock implementation)"""
+    try:
+        data = await request.json()
+        player_card_id = data.get("player_card_id")
+        platform = data.get("platform", "ps")
+        qty = int(data.get("qty", 1))
+        max_price = int(data.get("max_price", 0))
+        
+        # Mock implementation - in reality you'd integrate with EA's API
+        # For now, just return a success response
+        
+        # Simulate order placement
+        import random
+        filled = random.choice([True, False])  # 50% chance of immediate fill
+        
+        if filled:
+            # Simulate filled order
+            fill_price = max_price - random.randint(0, int(max_price * 0.05))  # Fill slightly below max
+            return {
+                "filled": True,
+                "fill": {
+                    "price": fill_price,
+                    "quantity": qty
+                },
+                "order_id": f"mock_{int(time.time())}"
+            }
+        else:
+            # Simulate pending order  
+            return {
+                "filled": False,
+                "pending": True,
+                "limit_price": max_price,
+                "quantity": qty,
+                "order_id": f"mock_{int(time.time())}"
+            }
+            
+    except Exception as e:
+        logging.error(f"Buy order error: {e}")
+        raise HTTPException(500, f"Could not place buy order: {e}")
+
+@app.get("/api/market/now")  
+async def get_current_price(
+    player_card_id: str,
+    platform: str = "ps",
+):
+    """Get current market price for a player"""
+    try:
+        # First try to get from fut_players table (most reliable)
+        async with app.state.player_pool.acquire() as pconn:
+            player_row = await pconn.fetchrow(
+                "SELECT price_num, name FROM fut_players WHERE card_id=$1",
+                player_card_id
+            )
+            
+            if player_row and player_row["price_num"]:
+                return {
+                    "player_card_id": player_card_id,
+                    "platform": platform,
+                    "price": int(player_row["price_num"]),
+                    "player_name": player_row["name"],
+                    "timestamp": datetime.now().isoformat()
+                }
+        
+        # Fallback: try to get most recent candle data
+        async with app.state.pool.acquire() as conn:
+            candle_row = await conn.fetchrow(
+                """
+                SELECT close as price, open_time
+                FROM fut_candles
+                WHERE player_card_id=$1 AND platform=$2 
+                ORDER BY open_time DESC
+                LIMIT 1
+                """,
+                player_card_id, platform
+            )
+            
+            if candle_row:
+                return {
+                    "player_card_id": player_card_id,
+                    "platform": platform,
+                    "price": int(candle_row["price"]),
+                    "timestamp": candle_row["open_time"].isoformat() if candle_row["open_time"] else None
+                }
+            
+            raise HTTPException(404, f"No price data found for player {player_card_id}")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Current price error: {e}")
+        raise HTTPException(500, f"Failed to get current price: {e}")
+
 @app.get("/api/trending")
 async def api_trending(
     request: Request,
