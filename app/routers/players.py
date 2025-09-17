@@ -391,16 +391,45 @@ async def get_player_history_route(
     card_id: int,
     platform: str = Query("ps", description="ps|xbox|pc|console"),
     tf: str = Query("today", description="history range understood by service"),
+    conn = Depends(get_player_db),
 ):
-    """
-    Proxy to your internal price history service for a given player/platform.
-    """
     plat = _plat(platform)
+
+    # 1) Try FUT.GG first
     try:
+        from app.services.price_history import get_price_history
         data = await get_price_history(card_id, plat, tf)
-        return {"card_id": card_id, "platform": plat, "tf": tf, "history": data}
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"history error: {e}")
+        if data and isinstance(data, list) and len(data) > 0:
+            return {"card_id": card_id, "platform": plat, "tf": tf, "history": data, "source": "futgg"}
+    except Exception:
+        pass
+
+    # 2) Fallback: use fut_candles table
+    rows = await conn.fetch(
+        """
+        SELECT open_time, open, high, low, close
+        FROM fut_candles
+        WHERE card_id = $1::text AND platform = $2
+        ORDER BY open_time ASC
+        """,
+        str(card_id), plat,
+    )
+    if rows:
+        candles = [
+            {
+                "open_time": r["open_time"],
+                "open": float(r["open"]) if r["open"] is not None else None,
+                "high": float(r["high"]) if r["high"] is not None else None,
+                "low": float(r["low"]) if r["low"] is not None else None,
+                "close": float(r["close"]) if r["close"] is not None else None,
+            }
+            for r in rows
+        ]
+        return {"card_id": card_id, "platform": plat, "tf": tf, "history": candles, "source": "candles"}
+
+    # 3) If nothing found
+    return {"card_id": card_id, "platform": plat, "tf": tf, "history": [], "source": "none"}
+
 
 @router.get("/batch/meta")
 async def batch_meta(
