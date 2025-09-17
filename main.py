@@ -1002,13 +1002,27 @@ app.add_middleware(
 )
 
 app.add_middleware(
-    SessionMiddleware,
-    secret_key=SECRET_KEY,
-    same_site="none" if IS_PROD else "lax",
-    https_only=IS_PROD,            # ✅ use this
+    CORSMiddleware,
+    allow_origins=[FRONTEND_ORIGIN],     # exact, not "*"
+    allow_credentials=True,              # REQUIRED for cookies
+    allow_methods=["*"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
 # ---------------- Routers & helpers ----------------
+
+router = APIRouter()
+
+@router.get("/api/auth/callback")
+async def auth_callback(request: Request, code: str, state: str | None = None):
+    # ...exchange code with Discord, load/create user...
+    discord_id = "<resolved_user_id>"
+
+    # Write to the session (SessionMiddleware will emit Set-Cookie on this response)
+    request.session.update({"uid": discord_id, "iat": int(time.time())})
+
+    # Redirect the user to your app
+    return RedirectResponse(url=f"{FRONTEND_ORIGIN}/auth/done")
 
 # DB dependencies (use pools created in lifespan)
 async def get_db(request: Request):
