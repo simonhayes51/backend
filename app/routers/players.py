@@ -121,9 +121,6 @@ async def search_players(
     limit: int = Query(50, description="max results"),
     conn = Depends(get_player_db),
 ):
-    """
-    Search players in the fut_players table (player DB).
-    """
     q = (q or "").strip()
     p = (pos or "").strip().upper() or None
 
@@ -136,7 +133,7 @@ async def search_players(
 
     if p:
         params.append(p)
-        idx = len(params)
+        idx = len(params)  # position param index
         where.append(
             f"""
             (
@@ -154,6 +151,10 @@ async def search_players(
         )
 
     base_where = " AND ".join(where) if where else "TRUE"
+
+    # Compute the placeholder index for LIMIT
+    limit_idx = len(params) + 1
+
     sql = f"""
         SELECT
           card_id, name, rating, version, image_url, club, league, nation,
@@ -164,13 +165,13 @@ async def search_players(
           CASE WHEN price IS NULL THEN 1 ELSE 0 END,
           rating DESC NULLS LAST,
           name ASC
-        LIMIT ${'$' + str(len(params) + 1)}
+        LIMIT ${limit_idx}
     """
+
     params.append(limit)
 
     rows = await conn.fetch(sql, *params)
-    
-    # Return in the format expected by SmartBuyerAI
+
     players = [
         {
             "card_id": int(r["card_id"]),
@@ -188,12 +189,9 @@ async def search_players(
         }
         for r in rows
     ]
-    
-    # Return both formats to be compatible with different components
-    return {
-        "players": players,  # For BestBuys compatibility
-        "data": players      # For SmartBuyerAI compatibility
-    }
+
+    return {"players": players, "data": players}
+
 @router.get("/autocomplete")
 async def players_autocomplete(
     q: str = Query("", description="name or card_id substring"),
