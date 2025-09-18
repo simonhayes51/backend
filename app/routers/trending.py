@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import time
 from typing import Literal, List, Optional, Dict, Tuple
@@ -24,11 +25,10 @@ REQ_HEADERS = {
 }
 FUTGG_PRICE_URL = "https://www.fut.gg/api/fut/player-prices/26/{card_id}"
 
-# Light in-memory cache for momentum pages
-_CACHE: Dict[Tuple[str, int], Tuple[float, str]] = {}
 CACHE_TTL = 120  # seconds
+_CACHE: Dict[Tuple[str, int], Tuple[float, str]] = {}
 
-# Permissive: capture the LAST numeric segment on any /players/... link
+# Permissive: grab the LAST number in any /players/... link (matches 26-<card_id>, /.../<card_id>, etc.)
 LAST_NUM_RE = re.compile(r"/players/\S*?(\d+)/?$", re.IGNORECASE)
 PCT_RE = re.compile(r"([+\-]?\s?\d+(?:\.\d+)?)\s*%")
 
@@ -50,22 +50,20 @@ def _norm_tf(tf: Optional[str]) -> str:
     return tf if tf in {"6", "12", "24"} else "24"
 
 def _human_tf(tf_num: str) -> str:
-    """Return '6h'|'12h'|'24h' from '6'|'12'|'24'."""
     return f"{tf_num}h"
 
-async def _fetch_html(session: aiohttp.ClientSession, url: str) -> str:
+async def _fetch_html(session: aiohttp.ClientSession, url: str) -> Optional[str]:
     try:
         async with session.get(url, headers=REQ_HEADERS) as r:
             if r.status != 200:
-                raise HTTPException(status_code=502, detail=f"Upstream {r.status}")
+                logging.warning("Trending: upstream %s returned %s", url, r.status)
+                return None
             return await r.text()
-    except HTTPException:
-        raise
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Fetch failed: {e}") from e
+        logging.warning("Trending: fetch failed %s: %s", url, e)
+        return None
 
-async def _momentum_page(tf: str, page: int) -> str:
-    """Fetch (with cache) a FUT.GG momentum page."""
+async def _momentum_page(tf: str, page: int) -> Optional[str]:
     now = time.time()
     key = (tf, page)
     hit = _CACHE.get(key)
@@ -77,28 +75,32 @@ async def _momentum_page(tf: str, page: int) -> str:
     async with aiohttp.ClientSession(timeout=timeout) as sess:
         html = await _fetch_html(sess, url)
 
-    _CACHE[key] = (now, html)
+    if html is not None:
+        _CACHE[key] = (now, html)
     return html
 
 def _parse_last_page_num(html: str) -> int:
-    soup = BeautifulSoup(html, "html.parser")
-    last = 1
-    for a in soup.find_all("a", href=True):
-        href = a.get("href") or ""
-        if "page=" in href:
-            try:
-                n = int(href.split("page=", 1)[1].split("&", 1)[0])
-                last = max(last, n)
-            except Exception:
-                continue
-        else:
-            t = (a.text or "").strip()
-            if t.isdigit():
-                last = max(last, int(t))
-    return last
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        last = 1
+        for a in soup.find_all("a", href=True):
+            href = a.get("href") or ""
+            if "page=" in href:
+                try:
+                    n = int(href.split("page=", 1)[1].split("&", 1)[0])
+                    last = max(last, n)
+                except Exception:
+                    continue
+            else:
+                t = (a.text or "").strip()
+                if t.isdigit():
+                    last = max(last, int(t))
+        return last
+    except Exception as e:
+        logging.warning("Trending: last-page parse error: %s", e)
+        return 1
 
 def _nearest_percent_text(node) -> Optional[float]:
-    # Crawl up to 5 ancestors; then siblings for a % pattern
     cur = node
     for _ in range(5):
         if cur is None:
@@ -128,40 +130,45 @@ def _nearest_percent_text(node) -> Optional[float]:
     return None
 
 def _extract_items(html: str) -> List[dict]:
-    """Return [{'card_id': int, 'percent': float}, ...] from a momentum page."""
-    soup = BeautifulSoup(html, "html.parser")
-    items: List[dict] = []
-    seen: set[int] = set()
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        items: List[dict] = []
+        seen: set[int] = set()
 
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if "/players/" not in href:
-            continue
-        m = LAST_NUM_RE.search(href)
-        if not m:
-            continue
-        try:
-            cid = int(m.group(1))
-        except Exception:
-            continue
-        if cid in seen:
-            continue
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if "/players/" not in href:
+                continue
+            m = LAST_NUM_RE.search(href)
+            if not m:
+                continue
+            try:
+                cid = int(m.group(1))
+            except Exception:
+                continue
+            if cid in seen:
+                continue
 
-        pct = _nearest_percent_text(a)
-        if pct is None:
-            continue
+            pct = _nearest_percent_text(a)
+            if pct is None:
+                continue
 
-        items.append({"card_id": cid, "percent": pct})
-        seen.add(cid)
+            items.append({"card_id": cid, "percent": pct})
+            seen.add(cid)
 
-    return items
+        return items
+    except Exception as e:
+        logging.warning("Trending: extract error: %s", e)
+        return []
 
 async def _page_items(tf: str, page: int) -> List[dict]:
     html = await _momentum_page(tf, page)
+    if not html:
+        return []
     return _extract_items(html)
 
 async def _get_console_price(card_id: int, platform: str = "ps") -> Optional[int]:
-    """Return a price or None. Tries price → lowestBin → LCPrice."""
+    """Return a price or None. Tries price → lowestBin → LCPrice. Never throws."""
     url = FUTGG_PRICE_URL.format(card_id=card_id)
     timeout = aiohttp.ClientTimeout(total=10)
     try:
@@ -177,32 +184,36 @@ async def _get_console_price(card_id: int, platform: str = "ps") -> Optional[int
     try:
         p = data.get("prices", {}).get(key, {}) or {}
         val = p.get("price") or p.get("lowestBin") or p.get("LCPrice")
-        if isinstance(val, (int, float)) and val > 0:
-            return int(val)
+        return int(val) if isinstance(val, (int, float)) and val > 0 else None
     except Exception:
-        pass
-    return None
+        return None
 
 async def _enrich_meta(req: Request, rows: List[dict]) -> List[dict]:
     if not rows:
         return []
-    ids = [int(x["card_id"]) for x in rows]  # cast to int for bigint lookup
+    ids = [int(x["card_id"]) for x in rows]  # bigint lookup
 
-    async with req.app.state.player_pool.acquire() as conn:
-        dbrows = await conn.fetch(
-            """
-            SELECT card_id, name, rating, position, league, nation, club, image_url
-            FROM fut_players
-            WHERE card_id = ANY($1::bigint[])
-            """,
-            ids,
-        )
+    try:
+        async with req.app.state.player_pool.acquire() as conn:
+            dbrows = await conn.fetch(
+                """
+                SELECT card_id, name, rating, position, league, nation, club, image_url
+                FROM fut_players
+                WHERE card_id = ANY($1::bigint[])
+                """,
+                ids,
+            )
+        meta = {int(r["card_id"]): dict(r) for r in dbrows}
+    except Exception as e:
+        logging.warning("Trending: DB enrich failed: %s", e)
+        meta = {}
 
-    meta = {int(r["card_id"]): dict(r) for r in dbrows}
     out: List[dict] = []
     for r in rows:
         cid = int(r["card_id"])
         m = meta.get(cid, {})
+        if not m:
+            logging.warning("Trending: card_id %s not found in fut_players", cid)
         out.append({
             "card_id": cid,
             "id": str(cid),
@@ -219,37 +230,53 @@ async def _enrich_meta(req: Request, rows: List[dict]) -> List[dict]:
 
 async def _attach_prices(items: List[dict]) -> List[dict]:
     async def one(it: dict) -> dict:
-        it["prices"] = {"console": await _get_console_price(int(it["card_id"]), "ps"), "pc": None}
-        return it
+        try:
+            it["prices"] = {"console": await _get_console_price(int(it["card_id"]), "ps"), "pc": None}
+            return it
+        except Exception as e:
+            logging.warning("Trending: price attach failed for %s: %s", it.get("card_id"), e)
+            it["prices"] = {"console": None, "pc": None}
+            return it
+
     results = await asyncio.gather(*(one(i) for i in items), return_exceptions=True)
-    return [r for r in results if not isinstance(r, Exception)]
+    out: List[dict] = []
+    for r in results:
+        if isinstance(r, Exception):
+            logging.warning("Trending: gather error: %s", r)
+            continue
+        out.append(r)
+    return out
 
 async def _fetch_trending(kind: Literal["risers", "fallers"], tf: str, limit: int) -> List[dict]:
     """
-    More robust:
-    - Try primary page (fallers: first, risers: last).
-    - If that yields <limit, also sample the other end and merge.
+    Robust fetch:
+    - Fallers: first page; Risers: last page.
+    - If <limit, sample the opposite end and merge.
     """
-    first_html = await _momentum_page(tf, 1)
-    last_page = _parse_last_page_num(first_html)
+    try:
+        first_html = await _momentum_page(tf, 1)
+        last_page = _parse_last_page_num(first_html or "") if first_html else 1
 
-    if kind == "fallers":
-        base = await _page_items(tf, 1)
-        base.sort(key=lambda x: x["percent"])
-        out = base[:limit]
-        if len(out) < limit and last_page > 1:
-            tail = await _page_items(tf, last_page)
-            tail.sort(key=lambda x: x["percent"])
-            out = (base + tail)[:limit]
-    else:
-        base = await _page_items(tf, last_page)
-        base.sort(key=lambda x: x["percent"], reverse=True)
-        out = base[:limit]
-        if len(out) < limit and last_page > 1:
-            head = await _page_items(tf, 1)
-            head.sort(key=lambda x: x["percent"], reverse=True)
-            out = (base + head)[:limit]
-    return out
+        if kind == "fallers":
+            base = await _page_items(tf, 1)
+            base.sort(key=lambda x: x["percent"])
+            out = base[:limit]
+            if len(out) < limit and last_page > 1:
+                tail = await _page_items(tf, last_page)
+                tail.sort(key=lambda x: x["percent"])
+                out = (base + tail)[:limit]
+        else:
+            base = await _page_items(tf, last_page)
+            base.sort(key=lambda x: x["percent"], reverse=True)
+            out = base[:limit]
+            if len(out) < limit and last_page > 1:
+                head = await _page_items(tf, 1)
+                head.sort(key=lambda x: x["percent"], reverse=True)
+                out = (base + head)[:limit]
+        return out
+    except Exception as e:
+        logging.warning("Trending: fetch_trending failed (%s %sh): %s", kind, tf, e)
+        return []
 
 # ------------------ Route ------------------
 @router.get("/trending", response_model=TrendingOut)
@@ -262,6 +289,7 @@ async def trending(
 ):
     """
     Dashboard: /api/trending?type=fallers&tf=24  (or tf=24h)
+    Always returns 200 with best-effort items (except 402 for Smart without premium).
     """
     ent = await compute_entitlements(req)
     limits = ent.get("limits", {}).get("trending", {"timeframes": ["24h"], "limit": 5})
@@ -292,52 +320,57 @@ async def trending(
         limit = max_items
         limited = True
 
-    if type_ == "smart":
-        f6  = await _fetch_trending("fallers", "6",  limit=50)
-        r6  = await _fetch_trending("risers",  "6",  limit=50)
-        f24 = await _fetch_trending("fallers", "24", limit=50)
-        r24 = await _fetch_trending("risers",  "24", limit=50)
+    try:
+        if type_ == "smart":
+            f6  = await _fetch_trending("fallers", "6",  limit=50)
+            r6  = await _fetch_trending("risers",  "6",  limit=50)
+            f24 = await _fetch_trending("fallers", "24", limit=50)
+            r24 = await _fetch_trending("risers",  "24", limit=50)
 
-        f6m  = {int(x["card_id"]): float(x["percent"]) for x in f6}
-        r6m  = {int(x["card_id"]): float(x["percent"]) for x in r6}
-        f24m = {int(x["card_id"]): float(x["percent"]) for x in f24}
-        r24m = {int(x["card_id"]): float(x["percent"]) for x in r24}
+            f6m  = {int(x["card_id"]): float(x["percent"]) for x in f6}
+            r6m  = {int(x["card_id"]): float(x["percent"]) for x in r6}
+            f24m = {int(x["card_id"]): float(x["percent"]) for x in f24}
+            r24m = {int(x["card_id"]): float(x["percent"]) for x in r24}
 
-        smart_ids: set[int] = set()
-        smart_map: Dict[int, Dict[str, float]] = {}
+            smart_ids: set[int] = set()
+            smart_map: Dict[int, Dict[str, float]] = {}
 
-        # riser 6h, faller 24h
-        for cid, p6 in r6m.items():
-            if cid in f24m:
-                smart_ids.add(cid)
-                smart_map[cid] = {"chg6hPct": p6, "chg24hPct": f24m[cid]}
-        # faller 6h, riser 24h
-        for cid, p6 in f6m.items():
-            if cid in r24m:
-                smart_ids.add(cid)
-                smart_map[cid] = {"chg6hPct": p6, "chg24hPct": r24m[cid]}
+            # riser 6h, faller 24h
+            for cid, p6 in r6m.items():
+                if cid in f24m:
+                    smart_ids.add(cid)
+                    smart_map[cid] = {"chg6hPct": p6, "chg24hPct": f24m[cid]}
+            # faller 6h, riser 24h
+            for cid, p6 in f6m.items():
+                if cid in r24m:
+                    smart_ids.add(cid)
+                    smart_map[cid] = {"chg6hPct": p6, "chg24hPct": r24m[cid]}
 
-        raw = [{"card_id": cid, "percent": smart_map[cid]["chg6hPct"]} for cid in smart_ids]
+            raw = [{"card_id": cid, "percent": smart_map[cid]["chg6hPct"]} for cid in smart_ids]
+            enriched = await _enrich_meta(req, raw)
+            enriched = await _attach_prices(enriched)
+            for e in enriched:
+                cid = int(e["card_id"])
+                pair = smart_map.get(cid, {})
+                e["trend"] = {"chg6hPct": pair.get("chg6hPct"), "chg24hPct": pair.get("chg24hPct")}
+            enriched.sort(key=lambda x: abs(x["trend"].get("chg6hPct") or 0), reverse=True)
+            if debug:
+                for e in enriched:
+                    e["__debug"] = {"smart_map": {"6h": e["trend"]["chg6hPct"], "24h": e["trend"]["chg24hPct"]}}
+            return {"type": "smart", "timeframe": tf_human, "items": enriched[:limit], "limited": limited}
+
+        # Simple risers/fallers
+        raw = await _fetch_trending(kind=type_, tf=tf_num, limit=limit)
         enriched = await _enrich_meta(req, raw)
         enriched = await _attach_prices(enriched)
         for e in enriched:
-            cid = int(e["card_id"])
-            pair = smart_map.get(cid, {})
-            e["trend"] = {"chg6hPct": pair.get("chg6hPct"), "chg24hPct": pair.get("chg24hPct")}
-        enriched.sort(key=lambda x: abs(x["trend"].get("chg6hPct") or 0), reverse=True)
+            e["trend"] = {"chg24hPct": float(e["percent"]) if tf_num == "24" else None}
         if debug:
             for e in enriched:
-                e["__debug"] = {"smart_map": smart_map.get(int(e["card_id"]))}
-        return {"type": "smart", "timeframe": tf_human, "items": enriched[:limit], "limited": limited}
+                e["__debug"] = {"percent": e.get("percent")}
+        return {"type": type_, "timeframe": tf_human, "items": enriched[:limit], "limited": limited}
 
-    # Simple risers/fallers
-    raw = await _fetch_trending(kind=type_, tf=tf_num, limit=limit)
-    enriched = await _enrich_meta(req, raw)
-    enriched = await _attach_prices(enriched)
-    for e in enriched:
-        e["trend"] = {"chg24hPct": float(e["percent"]) if tf_num == "24" else None}
-    if debug:
-        for e in enriched:
-            e["__debug"] = {"percent": e.get("percent")}
-
-    return {"type": type_, "timeframe": tf_human, "items": enriched[:limit], "limited": limited}
+    except Exception as e:
+        # Final safety net: never 500 — just return best-effort/empty.
+        logging.warning("Trending: unhandled error, returning best-effort: %s", e)
+        return {"type": type_, "timeframe": tf_human, "items": [], "limited": limited}
