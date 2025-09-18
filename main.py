@@ -990,19 +990,20 @@ async def get_entitlements(request: Request):
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
-    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "https://app.futhub.co.uk",  # ← Make sure this is included
+    response = JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    # Manually set CORS headers (since CORSMiddleware is bypassed)
+    origin = request.headers.get("origin")
+    allowed = [
+        "https://app.futhub.co.uk",
         "https://www.futhub.co.uk",
-        "https://futhub.co.uk", 
-        "https://api.futhub.co.uk",
+        "https://futhub.co.uk",
         "http://localhost:5173",
         "http://localhost:3000",
-        # Add any other domains your frontend runs on
-    ],
+    ]
+    if origin in allowed:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+    return response
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
