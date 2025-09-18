@@ -27,6 +27,7 @@ from fastapi import (
 )
 from fastapi.responses import RedirectResponse, JSONResponse, StreamingResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
 from starlette.middleware.sessions import SessionMiddleware
 from pydantic import BaseModel, Field
 
@@ -988,21 +989,19 @@ async def get_entitlements(request: Request):
             "last_validated": datetime.now(timezone.utc).isoformat()
         }
 
+ALLOWED_ORIGINS = [
+    "https://app.futhub.co.uk",
+    "https://www.futhub.co.uk",
+    "https://futhub.co.uk",
+    "http://localhost:5173",
+    "http://localhost:3000",
+]
+
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
-    response = JSONResponse(
-        status_code=exc.status_code,
-        content={"detail": exc.detail}
-    )
+    response = JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
     origin = request.headers.get("origin")
-    allowed = [
-        "https://app.futhub.co.uk",
-        "https://www.futhub.co.uk",
-        "https://futhub.co.uk",
-        "http://localhost:5173",
-        "http://localhost:3000",
-    ]
-    if origin in allowed:
+    if origin in ALLOWED_ORIGINS:
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Access-Control-Allow-Credentials"] = "true"
     return response
@@ -1011,7 +1010,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     response = JSONResponse(status_code=422, content={"detail": exc.errors()})
     origin = request.headers.get("origin")
-    if origin in allowed:
+    if origin in ALLOWED_ORIGINS:
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Access-Control-Allow-Credentials"] = "true"
     return response
@@ -1020,21 +1019,14 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 async def unhandled_exception_handler(request: Request, exc: Exception):
     response = JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
     origin = request.headers.get("origin")
-    if origin in allowed:
+    if origin in ALLOWED_ORIGINS:
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Access-Control-Allow-Credentials"] = "true"
     return response
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://app.futhub.co.uk",
-        "https://www.futhub.co.uk",
-        "https://futhub.co.uk",
-        "https://api.futhub.co.uk",
-        "http://localhost:5173",
-        "http://localhost:3000",
-    ],
+    allow_origins=ALLOWED_ORIGINS + ["https://api.futhub.co.uk"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1046,6 +1038,7 @@ app.add_middleware(
     same_site="none" if IS_PROD else "lax",
     https_only=IS_PROD,
 )
+
     
 # ---------------- Routers & helpers ----------------
 
