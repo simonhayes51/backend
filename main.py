@@ -37,6 +37,7 @@ from app.services.prices import get_player_price  # optional
 from app.routers.smart_buy import router as smart_buy_router
 from app.routers.trade_finder import router as trade_finder_router
 from app.routers.auth_me import router as auth_me_router
+from app.routers.trending import router as trending_router
 from discord_manager import discord_manager
 from app.routers.market import router as market_router
 from app.routers.ai_engine import router as ai_router
@@ -886,6 +887,7 @@ app.include_router(watchlist_router)
 app.include_router(ea_router)
 app.include_router(ingest_router)
 app.include_router(sbc_read_router)
+app.include_router(trending_router)
 
 # Local DB dependency (use the pools created in lifespan)
 async def get_db():
