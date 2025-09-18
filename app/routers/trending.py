@@ -1,9 +1,10 @@
+# app/routers/trending.py
 from __future__ import annotations
 
 import asyncio
 import re
 import time
-from typing import Literal, List, Optional, Dict, Any, Tuple
+from typing import Literal, List, Optional, Dict, Tuple
 
 import aiohttp
 from bs4 import BeautifulSoup
@@ -23,9 +24,10 @@ REQ_HEADERS = {
 }
 FUTGG_PRICE_URL = "https://www.fut.gg/api/fut/player-prices/26/{card_id}"
 
-# light in-memory cache for momentum pages
+# Light in-memory cache for momentum pages
 _CACHE: Dict[Tuple[str, int], Tuple[float, str]] = {}
 CACHE_TTL = 120  # seconds
+
 _CARD_HREF_RE = re.compile(r"/players/(\d+)/.+-(\d+)/?$", re.IGNORECASE)
 _PCT_RE = re.compile(r"([+\-]?\s?\d+(?:\.\d+)?)\s*%")
 
@@ -46,6 +48,10 @@ def _norm_tf(tf: Optional[str]) -> str:
         tf = tf[:-1]
     return tf if tf in {"6", "12", "24"} else "24"
 
+def _human_tf(tf_num: str) -> str:
+    """Return '6h'|'12h'|'24h' from '6'|'12'|'24'."""
+    return f"{tf_num}h"
+
 async def _fetch_html(session: aiohttp.ClientSession, url: str) -> str:
     try:
         async with session.get(url, headers=REQ_HEADERS) as r:
@@ -58,6 +64,7 @@ async def _fetch_html(session: aiohttp.ClientSession, url: str) -> str:
         raise HTTPException(status_code=502, detail=f"Fetch failed: {e}") from e
 
 async def _momentum_page(tf: str, page: int) -> str:
+    """Fetch (with cache) a FUT.GG momentum page."""
     now = time.time()
     key = (tf, page)
     hit = _CACHE.get(key)
@@ -80,8 +87,7 @@ def _parse_last_page_num(html: str) -> int:
         if "page=" in href:
             try:
                 n = int(href.split("page=", 1)[1].split("&", 1)[0])
-                if n > last:
-                    last = n
+                last = max(last, n)
             except Exception:
                 continue
         else:
@@ -95,7 +101,7 @@ def _extract_items(html: str) -> List[dict]:
     soup = BeautifulSoup(html, "html.parser")
     found: List[Tuple[str, str]] = []
 
-    # Find links that carry the card id in the canonical /players/...-<card_id> path
+    # Find links that carry the card id via canonical /players/...-<card_id> path
     for a in soup.find_all("a", href=True):
         m = _CARD_HREF_RE.search(a["href"])
         if not m:
@@ -214,17 +220,18 @@ async def _fetch_trending(kind: Literal["risers", "fallers"], tf: str, limit: in
 async def trending(
     req: Request,
     type_: Literal["risers", "fallers", "smart"] = Query("risers", alias="type"),
-    timeframe: Literal["4h", "6h", "24h"] = Query("24h", alias="tf"),
+    # accept "24" or "24h" (and 6/12 variants) from the FE
+    tf_raw: str = Query("24h", alias="tf"),
     limit: int = Query(10, ge=1, le=50),
 ):
     """
-    Dashboard fetch: /api/trending?type=fallers&tf=24
+    Dashboard fetch: /api/trending?type=fallers&tf=24  (or tf=24h)
     """
     ent = await compute_entitlements(req)
     limits = ent.get("limits", {}).get("trending", {"timeframes": ["24h"], "limit": 5})
     limited = False
 
-    # premium gate for Smart
+    # Premium gate for Smart
     if type_ == "smart" and not ent.get("is_premium", False):
         raise HTTPException(
             status_code=402,
@@ -236,21 +243,22 @@ async def trending(
             },
         )
 
-    # coerce timeframe for free users
-    if timeframe not in limits.get("timeframes", ["24h"]):
-        timeframe = "24h"
+    # Normalise timeframe + present in 'xh' form for UI/limits
+    tf_num = _norm_tf(tf_raw)        # "24h"/"24" -> "24"
+    tf_human = _human_tf(tf_num)     # "24" -> "24h"
+
+    if tf_human not in limits.get("timeframes", ["24h"]):
+        tf_num = "24"
+        tf_human = "24h"
         limited = True
 
-    # cap result size
     max_items = int(limits.get("limit", 5))
     if limit > max_items:
         limit = max_items
         limited = True
 
-    tf = _norm_tf(timeframe)
-
+    # Smart movers (flip 6h vs 24h)
     if type_ == "smart":
-        # Identify movers that flip direction between 6h and 24h
         f6  = await _fetch_trending("fallers", "6",  limit=50)
         r6  = await _fetch_trending("risers",  "6",  limit=50)
         f24 = await _fetch_trending("fallers", "24", limit=50)
@@ -264,11 +272,13 @@ async def trending(
         smart_ids: set[int] = set()
         smart_map: Dict[int, Dict[str, float]] = {}
 
+        # riser 6h, faller 24h
         for cid, p6 in r6m.items():
             if cid in f24m:
                 smart_ids.add(cid)
                 smart_map[cid] = {"chg6hPct": p6, "chg24hPct": f24m[cid]}
 
+        # faller 6h, riser 24h
         for cid, p6 in f6m.items():
             if cid in r24m:
                 smart_ids.add(cid)
@@ -282,13 +292,13 @@ async def trending(
             pair = smart_map.get(cid, {})
             e["trend"] = {"chg6hPct": pair.get("chg6hPct"), "chg24hPct": pair.get("chg24hPct")}
         enriched.sort(key=lambda x: abs(x["trend"].get("chg6hPct") or 0), reverse=True)
-        return {"type": "smart", "timeframe": timeframe, "items": enriched[:limit], "limited": limited}
+        return {"type": "smart", "timeframe": tf_human, "items": enriched[:limit], "limited": limited}
 
-    # simple risers/fallers
-    raw = await _fetch_trending(kind=type_, tf=tf, limit=limit)
+    # Simple risers/fallers
+    raw = await _fetch_trending(kind=type_, tf=tf_num, limit=limit)
     enriched = await _enrich_meta(req, raw)
     enriched = await _attach_prices(enriched)
     for e in enriched:
-        e["trend"] = {"chg24hPct": float(e["percent"]) if tf == "24" else None}
+        e["trend"] = {"chg24hPct": float(e["percent"]) if tf_num == "24" else None}
 
-    return {"type": type_, "timeframe": timeframe, "items": enriched[:limit], "limited": limited}
+    return {"type": type_, "timeframe": tf_human, "items": enriched[:limit], "limited": limited}
