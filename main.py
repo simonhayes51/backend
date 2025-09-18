@@ -994,7 +994,6 @@ async def http_exception_handler(request: Request, exc: HTTPException):
         status_code=exc.status_code,
         content={"detail": exc.detail}
     )
-    # Manually set CORS headers so even error responses are accepted in browser
     origin = request.headers.get("origin")
     allowed = [
         "https://app.futhub.co.uk",
@@ -1007,7 +1006,25 @@ async def http_exception_handler(request: Request, exc: HTTPException):
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Access-Control-Allow-Credentials"] = "true"
     return response
-    
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    response = JSONResponse(status_code=422, content={"detail": exc.errors()})
+    origin = request.headers.get("origin")
+    if origin in allowed:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+    return response
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    response = JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
+    origin = request.headers.get("origin")
+    if origin in allowed:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+    return response
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -1027,9 +1044,9 @@ app.add_middleware(
     SessionMiddleware,
     secret_key=SECRET_KEY,
     same_site="none" if IS_PROD else "lax",
-    https_only=IS_PROD,            # ✅ use this
+    https_only=IS_PROD,
 )
-
+    
 # ---------------- Routers & helpers ----------------
 
 # DB dependencies (use pools created in lifespan)
