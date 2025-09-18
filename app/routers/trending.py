@@ -1,4 +1,3 @@
-# app/routers/trending.py
 from __future__ import annotations
 
 import asyncio
@@ -24,12 +23,12 @@ REQ_HEADERS = {
 }
 FUTGG_PRICE_URL = "https://www.fut.gg/api/fut/player-prices/26/{card_id}"
 
-# Light in-memory cache for momentum pages
 _CACHE: Dict[Tuple[str, int], Tuple[float, str]] = {}
 CACHE_TTL = 120  # seconds
 
-_CARD_HREF_RE = re.compile(r"/players/(\d+)/.+-(\d+)/?$", re.IGNORECASE)
-_PCT_RE = re.compile(r"([+\-]?\s?\d+(?:\.\d+)?)\s*%")
+# more permissive: capture the LAST numeric segment on any /players/... link
+LAST_NUM_RE = re.compile(r"/players/\S*?(\d+)/?$", re.IGNORECASE)
+PCT_RE = re.compile(r"([+\-]?\s?\d+(?:\.\d+)?)\s*%")
 
 # ------------------ Models ------------------
 class TrendingOut(BaseModel):
@@ -40,7 +39,6 @@ class TrendingOut(BaseModel):
 
 # ------------------ Helpers ------------------
 def _norm_tf(tf: Optional[str]) -> str:
-    """Return '6'|'12'|'24' from input like '6' or '6h'."""
     if not tf:
         return "24"
     tf = tf.lower().strip()
@@ -49,7 +47,6 @@ def _norm_tf(tf: Optional[str]) -> str:
     return tf if tf in {"6", "12", "24"} else "24"
 
 def _human_tf(tf_num: str) -> str:
-    """Return '6h'|'12h'|'24h' from '6'|'12'|'24'."""
     return f"{tf_num}h"
 
 async def _fetch_html(session: aiohttp.ClientSession, url: str) -> str:
@@ -64,7 +61,6 @@ async def _fetch_html(session: aiohttp.ClientSession, url: str) -> str:
         raise HTTPException(status_code=502, detail=f"Fetch failed: {e}") from e
 
 async def _momentum_page(tf: str, page: int) -> str:
-    """Fetch (with cache) a FUT.GG momentum page."""
     now = time.time()
     key = (tf, page)
     hit = _CACHE.get(key)
@@ -96,41 +92,59 @@ def _parse_last_page_num(html: str) -> int:
                 last = max(last, int(t))
     return last
 
+def _nearest_percent_text(node) -> Optional[float]:
+    # crawl up to 5 ancestors; then siblings
+    cur = node
+    for _ in range(5):
+        if cur is None:
+            break
+        txt = cur.get_text(" ", strip=True) if hasattr(cur, "get_text") else ""
+        m = PCT_RE.search(txt or "")
+        if m:
+            try:
+                return float(m.group(1).replace(" ", ""))
+            except Exception:
+                pass
+        cur = getattr(cur, "parent", None)
+    # sibling scan
+    parent = getattr(node, "parent", None)
+    if parent:
+        for sib in getattr(parent, "children", []):
+            try:
+                txt = sib.get_text(" ", strip=True)
+                m = PCT_RE.search(txt or "")
+                if m:
+                    return float(m.group(1).replace(" ", ""))
+            except Exception:
+                continue
+    return None
+
 def _extract_items(html: str) -> List[dict]:
-    """Return [{'card_id': int, 'percent': float}, ...] from a momentum page."""
     soup = BeautifulSoup(html, "html.parser")
-    found: List[Tuple[str, str]] = []
-
-    # Find links that carry the card id via canonical /players/...-<card_id> path
-    for a in soup.find_all("a", href=True):
-        m = _CARD_HREF_RE.search(a["href"])
-        if not m:
-            continue
-        # bubble a bit to find text containing %
-        node = a
-        for _ in range(4):
-            if node is None or getattr(node, "name", None) == "body":
-                break
-            text = node.get_text(" ", strip=True)
-            if "%" in text:
-                found.append((m.group(2), text))
-                break
-            node = node.parent
-
     items: List[dict] = []
-    seen = set()
-    for card_id, txt in found:
-        if card_id in seen:
+    seen: set[int] = set()
+
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if "/players/" not in href:
             continue
-        m = _PCT_RE.search(txt)
+        m = LAST_NUM_RE.search(href)
         if not m:
             continue
         try:
-            pct = float(m.group(1).replace(" ", ""))
-            items.append({"card_id": int(card_id), "percent": pct})
-            seen.add(card_id)
+            cid = int(m.group(1))
         except Exception:
             continue
+        if cid in seen:
+            continue
+
+        pct = _nearest_percent_text(a)
+        if pct is None:
+            continue
+
+        items.append({"card_id": cid, "percent": pct})
+        seen.add(cid)
+
     return items
 
 async def _page_items(tf: str, page: int) -> List[dict]:
@@ -148,10 +162,9 @@ async def _get_console_price(card_id: int, platform: str = "ps") -> Optional[int
                 data = await r.json()
     except Exception:
         return None
-
-    plat_key = "ps" if platform == "ps" else "xbox"
+    key = "ps" if platform == "ps" else "xbox"
     try:
-        price = data.get("prices", {}).get(plat_key, {}).get("price")
+        price = data.get("prices", {}).get(key, {}).get("price")
         if isinstance(price, (int, float)) and price > 0:
             return int(price)
     except Exception:
@@ -195,43 +208,52 @@ async def _attach_prices(items: List[dict]) -> List[dict]:
         it["prices"] = {"console": await _get_console_price(int(it["card_id"]), "ps"), "pc": None}
         return it
     results = await asyncio.gather(*(one(i) for i in items), return_exceptions=True)
-    out: List[dict] = []
-    for r in results:
-        if isinstance(r, Exception):
-            continue
-        out.append(r)
-    return out
+    return [r for r in results if not isinstance(r, Exception)]
 
 async def _fetch_trending(kind: Literal["risers", "fallers"], tf: str, limit: int) -> List[dict]:
+    """
+    More robust:
+    - Try primary page (fallers: first, risers: last).
+    - If that yields <limit, also sample the other end and merge.
+    """
+    # primary
+    first_html = await _momentum_page(tf, 1)
+    last_page = _parse_last_page_num(first_html)
+
     if kind == "fallers":
-        items = await _page_items(tf, 1)  # biggest fallers early pages
-        items.sort(key=lambda x: x["percent"])  # most negative first
-        return items[:limit]
+        base = await _page_items(tf, 1)
+        base.sort(key=lambda x: x["percent"])
+        out = base[:limit]
+        if len(out) < limit and last_page > 1:
+            tail = await _page_items(tf, last_page)
+            tail.sort(key=lambda x: x["percent"])
+            out = (base + tail)[:limit]
     else:
-        # for risers, take last page and sort desc
-        first_html = await _momentum_page(tf, 1)
-        last = _parse_last_page_num(first_html)
-        items = await _page_items(tf, last)
-        items.sort(key=lambda x: x["percent"], reverse=True)
-        return items[:limit]
+        base = await _page_items(tf, last_page)
+        base.sort(key=lambda x: x["percent"], reverse=True)
+        out = base[:limit]
+        if len(out) < limit and last_page > 1:
+            head = await _page_items(tf, 1)
+            head.sort(key=lambda x: x["percent"], reverse=True)
+            out = (base + head)[:limit]
+    return out
 
 # ------------------ Route ------------------
 @router.get("/trending", response_model=TrendingOut)
 async def trending(
     req: Request,
     type_: Literal["risers", "fallers", "smart"] = Query("risers", alias="type"),
-    # accept "24" or "24h" (and 6/12 variants) from the FE
     tf_raw: str = Query("24h", alias="tf"),
     limit: int = Query(10, ge=1, le=50),
+    debug: bool = Query(False),
 ):
     """
-    Dashboard fetch: /api/trending?type=fallers&tf=24  (or tf=24h)
+    Dashboard: /api/trending?type=fallers&tf=24  (or tf=24h)
     """
     ent = await compute_entitlements(req)
     limits = ent.get("limits", {}).get("trending", {"timeframes": ["24h"], "limit": 5})
     limited = False
 
-    # Premium gate for Smart
     if type_ == "smart" and not ent.get("is_premium", False):
         raise HTTPException(
             status_code=402,
@@ -243,9 +265,8 @@ async def trending(
             },
         )
 
-    # Normalise timeframe + present in 'xh' form for UI/limits
-    tf_num = _norm_tf(tf_raw)        # "24h"/"24" -> "24"
-    tf_human = _human_tf(tf_num)     # "24" -> "24h"
+    tf_num = _norm_tf(tf_raw)
+    tf_human = _human_tf(tf_num)
 
     if tf_human not in limits.get("timeframes", ["24h"]):
         tf_num = "24"
@@ -257,7 +278,6 @@ async def trending(
         limit = max_items
         limited = True
 
-    # Smart movers (flip 6h vs 24h)
     if type_ == "smart":
         f6  = await _fetch_trending("fallers", "6",  limit=50)
         r6  = await _fetch_trending("risers",  "6",  limit=50)
@@ -272,13 +292,10 @@ async def trending(
         smart_ids: set[int] = set()
         smart_map: Dict[int, Dict[str, float]] = {}
 
-        # riser 6h, faller 24h
         for cid, p6 in r6m.items():
             if cid in f24m:
                 smart_ids.add(cid)
                 smart_map[cid] = {"chg6hPct": p6, "chg24hPct": f24m[cid]}
-
-        # faller 6h, riser 24h
         for cid, p6 in f6m.items():
             if cid in r24m:
                 smart_ids.add(cid)
@@ -292,13 +309,19 @@ async def trending(
             pair = smart_map.get(cid, {})
             e["trend"] = {"chg6hPct": pair.get("chg6hPct"), "chg24hPct": pair.get("chg24hPct")}
         enriched.sort(key=lambda x: abs(x["trend"].get("chg6hPct") or 0), reverse=True)
+        if debug:
+            # lightweight debug surface without schema change
+            for e in enriched:
+                e["__debug"] = {"smart_map": smart_map.get(int(e["card_id"]))}
         return {"type": "smart", "timeframe": tf_human, "items": enriched[:limit], "limited": limited}
 
-    # Simple risers/fallers
     raw = await _fetch_trending(kind=type_, tf=tf_num, limit=limit)
     enriched = await _enrich_meta(req, raw)
     enriched = await _attach_prices(enriched)
     for e in enriched:
         e["trend"] = {"chg24hPct": float(e["percent"]) if tf_num == "24" else None}
+    if debug:
+        for e in enriched:
+            e["__debug"] = {"percent": e.get("percent")}
 
     return {"type": type_, "timeframe": tf_human, "items": enriched[:limit], "limited": limited}
