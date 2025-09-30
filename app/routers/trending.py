@@ -33,11 +33,7 @@ _CACHE: Dict[Tuple[str, int], Tuple[float, str]] = {}
 #   /players/247333
 #   /players/26-247333/erling-haaland
 #   /players/247333?version=26
-CARD_ID_RE = re.compile(
-    r"/players/(?:\d{2}-)?(?P<id>\d+)(?:[/?#]|$)", re.IGNORECASE
-)
-
-# strictly match a percentage token
+CARD_ID_RE = re.compile(r"/players/(?:\d{2}-)?(?P<id>\d+)(?:[/?#]|$)", re.IGNORECASE)
 PCT_RE = re.compile(r"([+-]?\d+(?:\.\d+)?)\s*%")
 
 # ------------------ Models ------------------
@@ -49,9 +45,16 @@ class TrendingOut(BaseModel):
 
 # ------------------ Helpers ------------------
 def _norm_tf(tf: Optional[str]) -> str:
+    """
+    Normalise timeframe to '4'|'6'|'12'|'24'.
+    Accepts '4h','6h','12h','24h', and aliases like 'today','day','daily' -> '24'.
+    Anything unknown -> '24'.
+    """
     if not tf:
         return "24"
-    tf = tf.lower().strip()
+    tf = tf.strip().lower()
+    if tf in {"today", "day", "daily", "24hours", "24hr"}:
+        return "24"
     if tf.endswith("h"):
         tf = tf[:-1]
     return tf if tf in {"4", "6", "12", "24"} else "24"
@@ -100,7 +103,6 @@ def _parse_last_page_num(html: str) -> int:
                     last = max(last, n)
                 except Exception:
                     pass
-        # In case the links are rendered as numbers without query params:
         for a in soup.find_all("a"):
             t = (a.text or "").strip()
             if t.isdigit():
@@ -112,15 +114,13 @@ def _parse_last_page_num(html: str) -> int:
 
 def _closest_card_container(node: Tag) -> Optional[Tag]:
     """
-    Walk up until we hit a tile-like wrapper. FUT.GG uses card/article/div tiles.
-    We keep the scope tight so we don't pick up percentages from headers/ads.
+    Walk up until we hit a tile-like wrapper. We keep scope tight so we don't
+    pick % from headers/ads. If not found, return parent.
     """
     cur = node
     for _ in range(6):
         if cur is None or not isinstance(cur, Tag):
-            return None
-        # heuristics: a tile usually has multiple child nodes (image, name, percent etc.)
-        # and often carries classes for layout/card; we don't depend on exact class names.
+            break
         classes = " ".join(cur.get("class", []))
         if cur.name in {"article", "li", "div"} and (
             "card" in classes or "player" in classes or "tile" in classes or cur.find("img")
@@ -131,22 +131,21 @@ def _closest_card_container(node: Tag) -> Optional[Tag]:
 
 def _percent_in_container(container: Tag) -> Optional[float]:
     """
-    Find the first percentage text inside the given container, *excluding* items that
-    look like ads or global headers. We only search spans/divs within this container.
+    Find a percentage inside the given container. Looser match but scoped to the tile.
     """
     if not container:
         return None
-    # common places: spans/divs with +/-xx%
-    for el in container.find_all(["span", "div"], string=PCT_RE, limit=3):
-        txt = (el.get_text(" ", strip=True) or "").strip()
+    # 1) Look for spans/divs with % first (fast path)
+    for el in container.find_all(["span", "div", "strong", "p"], limit=10):
+        txt = (el.get_text(" ", strip=True) or "")
         m = PCT_RE.search(txt)
         if m:
             try:
                 return float(m.group(1))
             except Exception:
                 continue
-    # fallback: search container text, but keep it local
-    txt = container.get_text(" ", strip=True) if container else ""
+    # 2) Fallback: any % within the container's text
+    txt = container.get_text(" ", strip=True)
     m = PCT_RE.search(txt)
     if m:
         try:
@@ -179,8 +178,6 @@ def _extract_items(html: str) -> List[dict]:
 
             container = _closest_card_container(a) or a
             pct = _percent_in_container(container)
-
-            # Require a percent within the same tile; ignore global/stray percentages
             if pct is None:
                 continue
 
@@ -201,8 +198,7 @@ async def _page_items(tf: str, page: int) -> List[dict]:
 async def _get_console_price(card_id: int, platform: str = "ps") -> Optional[int]:
     """
     Return a price or None. Tries price → lowestBin → LCPrice.
-    If PS is missing it tries Xbox once.
-    Never raises.
+    If PS is missing it tries Xbox once. Never raises.
     """
     url = FUTGG_PRICE_URL.format(card_id=card_id)
     timeout = aiohttp.ClientTimeout(total=10)
@@ -231,7 +227,6 @@ async def _get_console_price(card_id: int, platform: str = "ps") -> Optional[int
     key = "ps" if platform == "ps" else "xbox"
     val = pick(prices.get(key, {}))
     if val is None and platform == "ps":
-        # one retry on xbox in case PS is missing early in cycle
         val = pick(prices.get("xbox", {}))
     return val
 
@@ -274,7 +269,7 @@ async def _enrich_meta(req: Request, rows: List[dict]) -> List[dict]:
     return out
 
 async def _attach_prices(items: List[dict]) -> List[dict]:
-    sem = asyncio.Semaphore(16)  # be polite
+    sem = asyncio.Semaphore(16)
 
     async def one(it: dict) -> dict:
         async with sem:
@@ -330,15 +325,23 @@ async def _fetch_trending(kind: Literal["risers", "fallers"], tf: str, limit: in
 @router.get("/trending", response_model=TrendingOut)
 async def trending(
     req: Request,
-    type_: Literal["risers", "fallers", "smart"] = Query("risers", alias="type"),
-    tf_raw: str = Query("24h", alias="tf"),  # accepts "24" or "24h"
+    type_raw: str = Query("fallers", alias="type"),
+    tf_raw: str = Query("24h", alias="tf"),
     limit: int = Query(10, ge=1, le=50),
     debug: bool = Query(False),
 ):
     """
-    Dashboard: /api/trending?type=fallers&tf=24  (or tf=24h)
-    Always returns 200 with best-effort items (except 402 for Smart without premium).
+    /api/trending?type=fallers&tf=24h
+    Tolerates bad inputs: unknown type -> fallers, 'tf=today' -> 24h.
     """
+    # Be lenient with 'type'
+    t = (type_raw or "fallers").lower()
+    type_: Literal["risers", "fallers", "smart"]
+    if t not in {"risers", "fallers", "smart"}:
+        type_ = "fallers"  # default
+    else:
+        type_ = t  # type: ignore
+
     ent = await compute_entitlements(req)
     limits = ent.get("limits", {}).get("trending", {"timeframes": ["24h"], "limit": 5})
     limited = False
@@ -383,12 +386,14 @@ async def trending(
             smart_ids: set[int] = set()
             smart_map: Dict[int, Dict[str, float]] = {}
 
+            # Up on 6h, down on 24h
             for cid, p6 in r6m.items():
-                if cid in f24m:  # up on 6h, down on 24h
+                if cid in f24m:
                     smart_ids.add(cid)
                     smart_map[cid] = {"chg6hPct": p6, "chg24hPct": f24m[cid]}
+            # Down on 6h, up on 24h
             for cid, p6 in f6m.items():
-                if cid in r24m:  # down on 6h, up on 24h
+                if cid in r24m:
                     smart_ids.add(cid)
                     smart_map[cid] = {"chg6hPct": p6, "chg24hPct": r24m[cid]}
 
@@ -412,10 +417,10 @@ async def trending(
         for e in enriched:
             if tf_num == "24":
                 e["trend"] = {"chg24hPct": float(e["percent"])}
-            elif tf_num == "6":
-                e["trend"] = {"chg6hPct": float(e["percent"])}
             elif tf_num == "12":
                 e["trend"] = {"chg12hPct": float(e["percent"])}
+            elif tf_num == "6":
+                e["trend"] = {"chg6hPct": float(e["percent"])}
             else:
                 e["trend"] = {"chg4hPct": float(e["percent"])}
         if debug:
