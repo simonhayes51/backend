@@ -8,7 +8,7 @@ import time
 from typing import Literal, List, Optional, Dict, Tuple
 
 import aiohttp
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 from fastapi import APIRouter, Request, HTTPException, Query
 from pydantic import BaseModel
 
@@ -28,26 +28,33 @@ FUTGG_PRICE_URL = "https://www.fut.gg/api/fut/player-prices/26/{card_id}"
 CACHE_TTL = 120  # seconds
 _CACHE: Dict[Tuple[str, int], Tuple[float, str]] = {}
 
-# Permissive: grab the LAST number in any /players/... link (matches 26-<card_id>, /.../<card_id>, etc.)
-LAST_NUM_RE = re.compile(r"/players/\S*?(\d+)/?$", re.IGNORECASE)
-PCT_RE = re.compile(r"([+\-]?\s?\d+(?:\.\d+)?)\s*%")
+# Accept:
+#   /players/26-247333
+#   /players/247333
+#   /players/26-247333/erling-haaland
+#   /players/247333?version=26
+CARD_ID_RE = re.compile(
+    r"/players/(?:\d{2}-)?(?P<id>\d+)(?:[/?#]|$)", re.IGNORECASE
+)
+
+# strictly match a percentage token
+PCT_RE = re.compile(r"([+-]?\d+(?:\.\d+)?)\s*%")
 
 # ------------------ Models ------------------
 class TrendingOut(BaseModel):
     type: Literal["risers", "fallers", "smart"]
-    timeframe: Literal["4h", "6h", "24h"]
+    timeframe: Literal["4h", "6h", "12h", "24h"]
     items: List[dict]
     limited: bool = False
 
 # ------------------ Helpers ------------------
 def _norm_tf(tf: Optional[str]) -> str:
-    """Return '6'|'12'|'24' from input like '6' or '6h'."""
     if not tf:
         return "24"
     tf = tf.lower().strip()
     if tf.endswith("h"):
         tf = tf[:-1]
-    return tf if tf in {"6", "12", "24"} else "24"
+    return tf if tf in {"4", "6", "12", "24"} else "24"
 
 def _human_tf(tf_num: str) -> str:
     return f"{tf_num}h"
@@ -80,53 +87,72 @@ async def _momentum_page(tf: str, page: int) -> Optional[str]:
     return html
 
 def _parse_last_page_num(html: str) -> int:
+    if not html:
+        return 1
     try:
         soup = BeautifulSoup(html, "html.parser")
         last = 1
         for a in soup.find_all("a", href=True):
-            href = a.get("href") or ""
+            href = a["href"]
             if "page=" in href:
                 try:
                     n = int(href.split("page=", 1)[1].split("&", 1)[0])
                     last = max(last, n)
                 except Exception:
-                    continue
-            else:
-                t = (a.text or "").strip()
-                if t.isdigit():
-                    last = max(last, int(t))
+                    pass
+        # In case the links are rendered as numbers without query params:
+        for a in soup.find_all("a"):
+            t = (a.text or "").strip()
+            if t.isdigit():
+                last = max(last, int(t))
         return last
     except Exception as e:
         logging.warning("Trending: last-page parse error: %s", e)
         return 1
 
-def _nearest_percent_text(node) -> Optional[float]:
+def _closest_card_container(node: Tag) -> Optional[Tag]:
+    """
+    Walk up until we hit a tile-like wrapper. FUT.GG uses card/article/div tiles.
+    We keep the scope tight so we don't pick up percentages from headers/ads.
+    """
     cur = node
-    for _ in range(5):
-        if cur is None:
-            break
-        try:
-            txt = cur.get_text(" ", strip=True)
-        except Exception:
-            txt = ""
-        m = PCT_RE.search(txt or "")
+    for _ in range(6):
+        if cur is None or not isinstance(cur, Tag):
+            return None
+        # heuristics: a tile usually has multiple child nodes (image, name, percent etc.)
+        # and often carries classes for layout/card; we don't depend on exact class names.
+        classes = " ".join(cur.get("class", []))
+        if cur.name in {"article", "li", "div"} and (
+            "card" in classes or "player" in classes or "tile" in classes or cur.find("img")
+        ):
+            return cur
+        cur = cur.parent
+    return node.parent if isinstance(node.parent, Tag) else None
+
+def _percent_in_container(container: Tag) -> Optional[float]:
+    """
+    Find the first percentage text inside the given container, *excluding* items that
+    look like ads or global headers. We only search spans/divs within this container.
+    """
+    if not container:
+        return None
+    # common places: spans/divs with +/-xx%
+    for el in container.find_all(["span", "div"], string=PCT_RE, limit=3):
+        txt = (el.get_text(" ", strip=True) or "").strip()
+        m = PCT_RE.search(txt)
         if m:
             try:
-                return float(m.group(1).replace(" ", ""))
-            except Exception:
-                pass
-        cur = getattr(cur, "parent", None)
-
-    parent = getattr(node, "parent", None)
-    if parent:
-        for sib in getattr(parent, "children", []):
-            try:
-                txt = sib.get_text(" ", strip=True)
-                m = PCT_RE.search(txt or "")
-                if m:
-                    return float(m.group(1).replace(" ", ""))
+                return float(m.group(1))
             except Exception:
                 continue
+    # fallback: search container text, but keep it local
+    txt = container.get_text(" ", strip=True) if container else ""
+    m = PCT_RE.search(txt)
+    if m:
+        try:
+            return float(m.group(1))
+        except Exception:
+            return None
     return None
 
 def _extract_items(html: str) -> List[dict]:
@@ -135,21 +161,26 @@ def _extract_items(html: str) -> List[dict]:
         items: List[dict] = []
         seen: set[int] = set()
 
+        # Only consider anchors that go to a player page
         for a in soup.find_all("a", href=True):
             href = a["href"]
             if "/players/" not in href:
                 continue
-            m = LAST_NUM_RE.search(href)
+
+            m = CARD_ID_RE.search(href)
             if not m:
                 continue
             try:
-                cid = int(m.group(1))
+                cid = int(m.group("id"))
             except Exception:
                 continue
             if cid in seen:
                 continue
 
-            pct = _nearest_percent_text(a)
+            container = _closest_card_container(a) or a
+            pct = _percent_in_container(container)
+
+            # Require a percent within the same tile; ignore global/stray percentages
             if pct is None:
                 continue
 
@@ -168,9 +199,14 @@ async def _page_items(tf: str, page: int) -> List[dict]:
     return _extract_items(html)
 
 async def _get_console_price(card_id: int, platform: str = "ps") -> Optional[int]:
-    """Return a price or None. Tries price → lowestBin → LCPrice. Never throws."""
+    """
+    Return a price or None. Tries price → lowestBin → LCPrice.
+    If PS is missing it tries Xbox once.
+    Never raises.
+    """
     url = FUTGG_PRICE_URL.format(card_id=card_id)
     timeout = aiohttp.ClientTimeout(total=10)
+    data = None
     try:
         async with aiohttp.ClientSession(timeout=timeout) as sess:
             async with sess.get(url, headers=REQ_HEADERS) as r:
@@ -179,19 +215,30 @@ async def _get_console_price(card_id: int, platform: str = "ps") -> Optional[int
                 data = await r.json()
     except Exception:
         return None
-
-    key = "ps" if platform == "ps" else "xbox"
-    try:
-        p = data.get("prices", {}).get(key, {}) or {}
-        val = p.get("price") or p.get("lowestBin") or p.get("LCPrice")
-        return int(val) if isinstance(val, (int, float)) and val > 0 else None
-    except Exception:
+    if not isinstance(data, dict):
         return None
+
+    def pick(d: dict) -> Optional[int]:
+        if not isinstance(d, dict):
+            return None
+        for k in ("price", "lowestBin", "LCPrice"):
+            v = d.get(k)
+            if isinstance(v, (int, float)) and v > 0:
+                return int(v)
+        return None
+
+    prices = data.get("prices", {}) or {}
+    key = "ps" if platform == "ps" else "xbox"
+    val = pick(prices.get(key, {}))
+    if val is None and platform == "ps":
+        # one retry on xbox in case PS is missing early in cycle
+        val = pick(prices.get("xbox", {}))
+    return val
 
 async def _enrich_meta(req: Request, rows: List[dict]) -> List[dict]:
     if not rows:
         return []
-    ids = [int(x["card_id"]) for x in rows]  # bigint lookup
+    ids = [int(x["card_id"]) for x in rows]
 
     try:
         async with req.app.state.player_pool.acquire() as conn:
@@ -212,8 +259,6 @@ async def _enrich_meta(req: Request, rows: List[dict]) -> List[dict]:
     for r in rows:
         cid = int(r["card_id"])
         m = meta.get(cid, {})
-        if not m:
-            logging.warning("Trending: card_id %s not found in fut_players", cid)
         out.append({
             "card_id": cid,
             "id": str(cid),
@@ -229,13 +274,16 @@ async def _enrich_meta(req: Request, rows: List[dict]) -> List[dict]:
     return out
 
 async def _attach_prices(items: List[dict]) -> List[dict]:
+    sem = asyncio.Semaphore(16)  # be polite
+
     async def one(it: dict) -> dict:
-        try:
-            it["prices"] = {"console": await _get_console_price(int(it["card_id"]), "ps"), "pc": None}
-            return it
-        except Exception as e:
-            logging.warning("Trending: price attach failed for %s: %s", it.get("card_id"), e)
-            it["prices"] = {"console": None, "pc": None}
+        async with sem:
+            try:
+                price = await _get_console_price(int(it["card_id"]), "ps")
+                it["prices"] = {"console": price, "pc": None}
+            except Exception as e:
+                logging.warning("Trending: price attach failed for %s: %s", it.get("card_id"), e)
+                it["prices"] = {"console": None, "pc": None}
             return it
 
     results = await asyncio.gather(*(one(i) for i in items), return_exceptions=True)
@@ -335,14 +383,12 @@ async def trending(
             smart_ids: set[int] = set()
             smart_map: Dict[int, Dict[str, float]] = {}
 
-            # riser 6h, faller 24h
             for cid, p6 in r6m.items():
-                if cid in f24m:
+                if cid in f24m:  # up on 6h, down on 24h
                     smart_ids.add(cid)
                     smart_map[cid] = {"chg6hPct": p6, "chg24hPct": f24m[cid]}
-            # faller 6h, riser 24h
             for cid, p6 in f6m.items():
-                if cid in r24m:
+                if cid in r24m:  # down on 6h, up on 24h
                     smart_ids.add(cid)
                     smart_map[cid] = {"chg6hPct": p6, "chg24hPct": r24m[cid]}
 
@@ -364,13 +410,19 @@ async def trending(
         enriched = await _enrich_meta(req, raw)
         enriched = await _attach_prices(enriched)
         for e in enriched:
-            e["trend"] = {"chg24hPct": float(e["percent"]) if tf_num == "24" else None}
+            if tf_num == "24":
+                e["trend"] = {"chg24hPct": float(e["percent"])}
+            elif tf_num == "6":
+                e["trend"] = {"chg6hPct": float(e["percent"])}
+            elif tf_num == "12":
+                e["trend"] = {"chg12hPct": float(e["percent"])}
+            else:
+                e["trend"] = {"chg4hPct": float(e["percent"])}
         if debug:
             for e in enriched:
                 e["__debug"] = {"percent": e.get("percent")}
         return {"type": type_, "timeframe": tf_human, "items": enriched[:limit], "limited": limited}
 
     except Exception as e:
-        # Final safety net: never 500 — just return best-effort/empty.
         logging.warning("Trending: unhandled error, returning best-effort: %s", e)
         return {"type": type_, "timeframe": tf_human, "items": [], "limited": limited}
