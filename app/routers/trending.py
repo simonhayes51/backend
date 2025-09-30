@@ -51,6 +51,23 @@ def _cid_from_href(href: str) -> Optional[int]:
             pass
     return None
 
+def _name_hint_from_href(href: str) -> Optional[str]:
+    """
+    From /players/<lead>-<slug>/<maybe 26-id>/ -> 'Nice Name'
+    e.g. /players/256853-malik-tillman/26-50588501/ -> 'Malik Tillman'
+    """
+    try:
+        if "/players/" not in href:
+            return None
+        path = href.split("/players/", 1)[1].strip("/")
+        first_seg = path.split("/", 1)[0]
+        # drop any leading digits- prefix e.g. "256853-malik-tillman" -> "malik-tillman"
+        slug = first_seg.split("-", 1)[1] if "-" in first_seg and first_seg.split("-", 1)[0].isdigit() else first_seg
+        words = [w for w in slug.replace("-", " ").split() if w]
+        return " ".join(w.capitalize() for w in words) if words else None
+    except Exception:
+        return None
+
 # ------------------ Models ------------------
 class TrendingOut(BaseModel):
     type: Literal["risers", "fallers", "smart"]
@@ -148,7 +165,8 @@ def _extract_items(html: str) -> List[dict]:
     seen: set[int] = set()
 
     for a in soup.find_all("a", href=True):
-        cid = _cid_from_href(a["href"])
+        href = a["href"]
+        cid = _cid_from_href(href)
         if not cid:
             continue
         if cid in seen:
@@ -158,7 +176,7 @@ def _extract_items(html: str) -> List[dict]:
         if pct is None:
             continue
 
-        items.append({"card_id": cid, "percent": pct})
+        items.append({"card_id": cid, "percent": pct, "name_hint": _name_hint_from_href(href)})
         seen.add(cid)
 
     return items
@@ -204,10 +222,12 @@ async def _enrich_meta(req: Request, rows: List[dict]) -> List[dict]:
     for r in rows:
         cid = int(r["card_id"])
         m = meta.get(cid, {})
+        # fall back to name_hint if DB missing
+        name = m.get("name") or r.get("name_hint") or f"Card {cid}"
         out.append({
             "card_id": cid,
             "id": str(cid),
-            "name": m.get("name") or f"Card {cid}",
+            "name": name,
             "rating": m.get("rating"),
             "position": m.get("position"),
             "league": m.get("league"),
@@ -318,7 +338,7 @@ async def trending(
                 smart_ids.add(cid)
                 smart_map[cid] = {"chg6hPct": p6, "chg24hPct": r24m[cid]}
 
-        raw = [{"card_id": cid, "percent": smart_map[cid]["chg6hPct"]} for cid in smart_ids]
+        raw = [{"card_id": cid, "percent": smart_map[cid]["chg6hPct"], "name_hint": None} for cid in smart_ids]
         enriched = await _enrich_meta(req, raw)
         enriched = await _attach_prices(enriched)
         for e in enriched:
