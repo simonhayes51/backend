@@ -26,20 +26,20 @@ FUTGG_PRICE_URL = "https://www.fut.gg/api/fut/player-prices/26/{card_id}"
 _CACHE: Dict[Tuple[str, int], Tuple[float, str]] = {}
 CACHE_TTL = 120  # seconds
 
-# permissive: capture the LAST numeric segment on any /players/... link
-LAST_NUM_RE = re.compile(r"/players/\S*?(\d+)/?$", re.IGNORECASE)
+# STRICT player link matcher: /players/26-<id> or /players/<id> (with optional trailing slash)
+CARD_ID_RE = re.compile(r"/players/(?:\d{2}-)?(?P<id>\d+)(?:/|$)", re.IGNORECASE)
 PCT_RE = re.compile(r"([+\-]?\s?\d+(?:\.\d+)?)\s*%")
 
 # ------------------ Models ------------------
 class TrendingOut(BaseModel):
     type: Literal["risers", "fallers", "smart"]
-    timeframe: Literal["6h", "12h", "24h"]  # <-- allow 12h (UI sends this)
+    timeframe: Literal["6h", "12h", "24h"]
     items: List[dict]
     limited: bool = False
 
 # ------------------ Helpers ------------------
 def _norm_tf(tf: Optional[str]) -> str:
-    """Return '6'|'12'|'24' from inputs like '6' or '6h' or 'today'."""
+    """Return '6'|'12'|'24' from inputs like '6', '6h', or 'today'."""
     if not tf:
         return "24"
     tf = tf.lower().strip()
@@ -129,13 +129,12 @@ def _extract_items(html: str) -> List[dict]:
 
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        if "/players/" not in href:
-            continue
-        m = LAST_NUM_RE.search(href)
+        # Only process real player links, never pagination or other /players/... URLs
+        m = CARD_ID_RE.search(href)
         if not m:
             continue
         try:
-            cid = int(m.group(1))
+            cid = int(m.group("id"))
         except Exception:
             continue
         if cid in seen:
@@ -176,7 +175,7 @@ async def _get_console_price(card_id: int, platform: str = "ps") -> Optional[int
 async def _enrich_meta(req: Request, rows: List[dict]) -> List[dict]:
     if not rows:
         return []
-    ids = [int(x["card_id"]) for x in rows]  # use bigint[] to avoid text-cast misses
+    ids = [int(x["card_id"]) for x in rows]  # bigint lookup (avoids text-cast misses)
     async with req.app.state.player_pool.acquire() as conn:
         dbrows = await conn.fetch(
             """
