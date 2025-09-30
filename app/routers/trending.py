@@ -26,9 +26,30 @@ FUTGG_PRICE_URL = "https://www.fut.gg/api/fut/player-prices/26/{card_id}"
 _CACHE: Dict[Tuple[str, int], Tuple[float, str]] = {}
 CACHE_TTL = 120  # seconds
 
-# STRICT player link matcher: /players/26-<id> or /players/<id> (with optional trailing slash)
-CARD_ID_RE = re.compile(r"/players/(?:\d{2}-)?(?P<id>\d+)(?:/|$)", re.IGNORECASE)
+# ---------- ID & percent parsing ----------
+# Prefer explicit "26-<id>" segment; otherwise take the last number after /players/
+_26_SEGMENT_RE = re.compile(r"/players/[^?#]*/26-(\d+)(?:[/?#]|$)", re.IGNORECASE)
+_LAST_NUM_AFTER_PLAYERS_RE = re.compile(r"/players/[^?#]*?(\d+)(?:[/?#]|$)", re.IGNORECASE)
+
 PCT_RE = re.compile(r"([+\-]?\s?\d+(?:\.\d+)?)\s*%")
+
+def _cid_from_href(href: str) -> Optional[int]:
+    """Extract the correct FUT card_id from any /players/... href."""
+    if "/players/" not in href:
+        return None
+    m = _26_SEGMENT_RE.search(href)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            pass
+    m = _LAST_NUM_AFTER_PLAYERS_RE.search(href)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            pass
+    return None
 
 # ------------------ Models ------------------
 class TrendingOut(BaseModel):
@@ -39,7 +60,7 @@ class TrendingOut(BaseModel):
 
 # ------------------ Helpers ------------------
 def _norm_tf(tf: Optional[str]) -> str:
-    """Return '6'|'12'|'24' from inputs like '6', '6h', or 'today'."""
+    """Return '6'|'12'|'24' from inputs like '6', '6h', 'today'."""
     if not tf:
         return "24"
     tf = tf.lower().strip()
@@ -96,7 +117,7 @@ def _parse_last_page_num(html: str) -> int:
     return last
 
 def _nearest_percent_text(node) -> Optional[float]:
-    # crawl up to 5 ancestors; then siblings
+    """Find a % near the link: walk up a few ancestors, then scan siblings."""
     cur = node
     for _ in range(5):
         if cur is None:
@@ -109,7 +130,6 @@ def _nearest_percent_text(node) -> Optional[float]:
             except Exception:
                 pass
         cur = getattr(cur, "parent", None)
-    # sibling scan
     parent = getattr(node, "parent", None)
     if parent:
         for sib in getattr(parent, "children", []):
@@ -128,14 +148,8 @@ def _extract_items(html: str) -> List[dict]:
     seen: set[int] = set()
 
     for a in soup.find_all("a", href=True):
-        href = a["href"]
-        # Only process real player links, never pagination or other /players/... URLs
-        m = CARD_ID_RE.search(href)
-        if not m:
-            continue
-        try:
-            cid = int(m.group("id"))
-        except Exception:
+        cid = _cid_from_href(a["href"])
+        if not cid:
             continue
         if cid in seen:
             continue
@@ -175,7 +189,7 @@ async def _get_console_price(card_id: int, platform: str = "ps") -> Optional[int
 async def _enrich_meta(req: Request, rows: List[dict]) -> List[dict]:
     if not rows:
         return []
-    ids = [int(x["card_id"]) for x in rows]  # bigint lookup (avoids text-cast misses)
+    ids = [int(x["card_id"]) for x in rows]  # bigint lookup
     async with req.app.state.player_pool.acquire() as conn:
         dbrows = await conn.fetch(
             """
@@ -213,9 +227,9 @@ async def _attach_prices(items: List[dict]) -> List[dict]:
 
 async def _fetch_trending(kind: Literal["risers", "fallers"], tf: str, limit: int) -> List[dict]:
     """
-    More robust:
-    - Try primary page (fallers: first, risers: last).
-    - If that yields <limit, also sample the other end and merge.
+    Strategy:
+    - Fallers: first page (lowest % first); if not enough, also sample last page and merge.
+    - Risers : last page (highest % first); if not enough, also sample first page and merge.
     """
     first_html = await _momentum_page(tf, 1)
     last_page = _parse_last_page_num(first_html)
@@ -248,7 +262,7 @@ async def trending(
     debug: bool = Query(False),
 ):
     """
-    Dashboard: /api/trending?type=fallers&tf=24  (or tf=24h)
+    Example: /api/trending?type=fallers&tf=24  (or tf=24h)
     """
     ent = await compute_entitlements(req)
     limits = ent.get("limits", {}).get("trending", {"timeframes": ["24h"], "limit": 5})
@@ -293,10 +307,12 @@ async def trending(
         smart_ids: set[int] = set()
         smart_map: Dict[int, Dict[str, float]] = {}
 
+        # Up on 6h, down on 24h
         for cid, p6 in r6m.items():
             if cid in f24m:
                 smart_ids.add(cid)
                 smart_map[cid] = {"chg6hPct": p6, "chg24hPct": f24m[cid]}
+        # Down on 6h, up on 24h
         for cid, p6 in f6m.items():
             if cid in r24m:
                 smart_ids.add(cid)
@@ -315,6 +331,7 @@ async def trending(
                 e["__debug"] = {"smart_map": smart_map.get(int(e["card_id"]))}
         return {"type": "smart", "timeframe": tf_human, "items": enriched[:limit], "limited": limited}
 
+    # Simple risers/fallers
     raw = await _fetch_trending(kind=type_, tf=tf_num, limit=limit)
     enriched = await _enrich_meta(req, raw)
     enriched = await _attach_prices(enriched)
