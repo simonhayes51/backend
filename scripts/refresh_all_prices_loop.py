@@ -10,19 +10,23 @@ import asyncpg
 from dotenv import load_dotenv
 
 load_dotenv()
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is required")
 
-# Platforms you want to log (stored as TEXT). Comma-separated in env if you want more.
+# Platforms to record (TEXT). Comma-separated in env (e.g., "ps,xbox")
 PLATFORMS = [p.strip().lower() for p in os.getenv("PLATFORMS", "ps").split(",") if p.strip()]
 
-# ---------- Tuning knobs ----------
-CONCURRENCY = int(os.getenv("REFRESH_CONCURRENCY", "32"))   # parallel requests
-BATCH_SIZE  = int(os.getenv("REFRESH_BATCH_SIZE", "1000"))  # ids per fetch chunk
-SLEEP_SECS  = int(os.getenv("REFRESH_INTERVAL_SEC", "300")) # loop every 5 minutes
+# ---------- Tuning ----------
+CONCURRENCY = int(os.getenv("REFRESH_CONCURRENCY", "32"))     # parallel HTTP
+BATCH_SIZE  = int(os.getenv("REFRESH_BATCH_SIZE", "1000"))    # ids per fetch chunk
+SLEEP_SECS  = int(os.getenv("REFRESH_INTERVAL_SEC", "300"))   # loop every N seconds
 
 FUTGG_PRICE_URL = "https://www.fut.gg/api/fut/player-prices/26/{card_id}"
 HEADERS = {
@@ -35,43 +39,42 @@ HEADERS = {
 
 # ---------- Migrations ----------
 DDL_STMTS = [
+    # Players snapshot (BIGINT PK)
     """
     CREATE TABLE IF NOT EXISTS public.fut_players (
-        card_id TEXT PRIMARY KEY
+        card_id BIGINT PRIMARY KEY,
+        price TEXT,
+        price_num BIGINT,
+        price_updated_at TIMESTAMPTZ
     );
     """,
-    """
-    ALTER TABLE public.fut_players
-        ADD COLUMN IF NOT EXISTS price TEXT,
-        ADD COLUMN IF NOT EXISTS price_num BIGINT,
-        ADD COLUMN IF NOT EXISTS price_updated_at TIMESTAMPTZ;
-    """,
+    # History (card_id BIGINT)
     """
     CREATE TABLE IF NOT EXISTS public.fut_prices_history (
         id BIGSERIAL PRIMARY KEY,
-        card_id  TEXT NOT NULL,
+        card_id  BIGINT NOT NULL,
         platform TEXT NOT NULL,
         price    TEXT NOT NULL,
         captured_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
     """,
     "CREATE INDEX IF NOT EXISTS idx_prices_history_card_time ON public.fut_prices_history(card_id, platform, captured_at DESC);",
-
+    # Ticks (FK to players)
     """
     CREATE TABLE IF NOT EXISTS public.fut_ticks (
         id BIGSERIAL PRIMARY KEY,
-        player_card_id TEXT NOT NULL REFERENCES public.fut_players(card_id) ON DELETE CASCADE,
+        player_card_id BIGINT NOT NULL REFERENCES public.fut_players(card_id) ON DELETE CASCADE,
         platform TEXT NOT NULL CHECK (platform IN ('ps','xbox')),
         ts TIMESTAMPTZ NOT NULL,
         price INT NOT NULL
     );
     """,
     "CREATE INDEX IF NOT EXISTS fut_ticks_player_idx ON public.fut_ticks (player_card_id, platform, ts);",
-
+    # Candles (FK to players)
     """
     CREATE TABLE IF NOT EXISTS public.fut_candles (
         id BIGSERIAL PRIMARY KEY,
-        player_card_id TEXT NOT NULL REFERENCES public.fut_players(card_id) ON DELETE CASCADE,
+        player_card_id BIGINT NOT NULL REFERENCES public.fut_players(card_id) ON DELETE CASCADE,
         platform TEXT NOT NULL CHECK (platform IN ('ps','xbox')),
         timeframe TEXT NOT NULL,
         open_time TIMESTAMPTZ NOT NULL,
@@ -88,14 +91,80 @@ DDL_STMTS = [
     """,
 ]
 
+# Optional: align existing TEXT columns to BIGINT (no-op if already BIGINT)
+ALIGN_TYPES = [
+    # fut_players.card_id
+    """
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='fut_players'
+          AND column_name='card_id' AND data_type <> 'bigint'
+      ) THEN
+        ALTER TABLE public.fut_players
+          ALTER COLUMN card_id TYPE BIGINT
+          USING NULLIF(regexp_replace(card_id::text, '\\D', '', 'g'), '')::bigint;
+      END IF;
+    END $$;
+    """,
+    # fut_prices_history.card_id
+    """
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='fut_prices_history'
+          AND column_name='card_id' AND data_type <> 'bigint'
+      ) THEN
+        ALTER TABLE public.fut_prices_history
+          ALTER COLUMN card_id TYPE BIGINT
+          USING NULLIF(regexp_replace(card_id::text, '\\D', '', 'g'), '')::bigint;
+      END IF;
+    END $$;
+    """,
+    # fut_ticks.player_card_id
+    """
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='fut_ticks'
+          AND column_name='player_card_id' AND data_type <> 'bigint'
+      ) THEN
+        ALTER TABLE public.fut_ticks
+          ALTER COLUMN player_card_id TYPE BIGINT
+          USING NULLIF(regexp_replace(player_card_id::text, '\\D', '', 'g'), '')::bigint;
+      END IF;
+    END $$;
+    """,
+    # fut_candles.player_card_id
+    """
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='fut_candles'
+          AND column_name='player_card_id' AND data_type <> 'bigint'
+      ) THEN
+        ALTER TABLE public.fut_candles
+          ALTER COLUMN player_card_id TYPE BIGINT
+          USING NULLIF(regexp_replace(player_card_id::text, '\\D', '', 'g'), '')::bigint;
+      END IF;
+    END $$;
+    """,
+]
+
 async def run_migrations(pool: asyncpg.Pool):
     async with pool.acquire() as conn:
         for stmt in DDL_STMTS:
             await conn.execute(stmt)
-    logging.info("Migrations applied (players, history, ticks, candles).")
+        for stmt in ALIGN_TYPES:
+            await conn.execute(stmt)
+    logging.info("Migrations applied (players, history, ticks, candles; BIGINT aligned).")
 
 # ---------- Fetching ----------
-async def _fetch_one(session: aiohttp.ClientSession, card_id: str) -> Optional[str]:
+async def _fetch_one(session: aiohttp.ClientSession, card_id: int) -> Optional[str]:
     url = FUTGG_PRICE_URL.format(card_id=str(card_id))
     try:
         async with session.get(url, timeout=15) as r:
@@ -106,53 +175,53 @@ async def _fetch_one(session: aiohttp.ClientSession, card_id: str) -> Optional[s
             price = cur.get("price")
             if price is None:
                 return None
-            return str(price)  # always TEXT
+            return str(price)  # keep snapshot text; parse separately for ints
     except Exception:
         return None
 
-async def _fetch_prices_for_ids(card_ids: List[str]) -> Dict[str, str]:
-    out: Dict[str, str] = {}
+async def _fetch_prices_for_ids(card_ids: List[int]) -> Dict[int, str]:
+    out: Dict[int, str] = {}
     sem = asyncio.Semaphore(CONCURRENCY)
     async with aiohttp.ClientSession(headers=HEADERS) as sess:
-        async def worker(cid: str):
+        async def worker(cid: int):
             async with sem:
-                p = await _fetch_one(sess, str(cid))
+                p = await _fetch_one(sess, cid)
                 if isinstance(p, str) and p.strip():
-                    out[str(cid)] = p.strip()
-        tasks = [asyncio.create_task(worker(str(cid))) for cid in card_ids]
+                    out[cid] = p.strip()
+        tasks = [asyncio.create_task(worker(int(cid))) for cid in card_ids]
         await asyncio.gather(*tasks, return_exceptions=True)
     return out
 
 # ---------- DB helpers ----------
-async def _load_card_ids(conn: asyncpg.Connection) -> List[str]:
+async def _load_card_ids(conn: asyncpg.Connection) -> List[int]:
     rows = await conn.fetch("SELECT card_id FROM public.fut_players")
-    return [str(r["card_id"]) for r in rows if r["card_id"] is not None]
+    # asyncpg already returns int for BIGINT; cast defensively
+    return [int(r["card_id"]) for r in rows if r["card_id"] is not None]
 
-async def _update_snapshot(conn: asyncpg.Connection, prices: List[Tuple[str, str]]):
-    # ensure TEXT bindings
-    prices = [(str(price_text), str(card_id)) for price_text, card_id in prices]
+async def _update_snapshot(conn: asyncpg.Connection, prices: List[Tuple[str, int]]):
+    # prices: list of (price_text, card_id:int)
     sql = """
         UPDATE public.fut_players
         SET price = $1::text,
-            price_num = NULLIF($1, '')::bigint,
+            price_num = NULLIF(regexp_replace($1, '[^0-9]', '', 'g'), '')::bigint,
             price_updated_at = NOW()
-        WHERE card_id = $2::text
+        WHERE card_id = $2::bigint
     """
     await conn.executemany(sql, prices)
 
-async def _insert_history(conn: asyncpg.Connection, rows: List[Tuple[str, str, str]]):
-    rows = [(str(cid), str(plat), str(price)) for cid, plat, price in rows]
+async def _insert_history(conn: asyncpg.Connection, rows: List[Tuple[int, str, str]]):
+    # rows: (card_id:int, platform:text, price:text)
     sql = """
         INSERT INTO public.fut_prices_history (card_id, platform, price, captured_at)
-        VALUES ($1::text, $2::text, $3::text, NOW())
+        VALUES ($1::bigint, $2::text, $3::text, NOW())
     """
     await conn.executemany(sql, rows)
 
-async def _insert_ticks(conn: asyncpg.Connection, rows: List[Tuple[str, str, int]]):
-    rows = [(str(cid), str(plat), int(price)) for cid, plat, price in rows]
+async def _insert_ticks(conn: asyncpg.Connection, rows: List[Tuple[int, str, int]]):
+    # rows: (card_id:int, platform:text, price:int)
     sql = """
         INSERT INTO public.fut_ticks (player_card_id, platform, ts, price)
-        VALUES ($1::text, $2::text, NOW(), $3::int)
+        VALUES ($1::bigint, $2::text, NOW(), $3::int)
     """
     await conn.executemany(sql, rows)
 
@@ -189,7 +258,7 @@ async def _rollup_15m(conn: asyncpg.Connection, since_hours: int = 48):
         DO UPDATE SET open=EXCLUDED.open, high=EXCLUDED.high, low=EXCLUDED.low,
                       close=EXCLUDED.close, volume=EXCLUDED.volume;
         """,
-        since_hours,  # int is fine with INTERVAL multiply
+        since_hours,
     )
 
 # ---------- Refresh pass ----------
@@ -204,7 +273,7 @@ async def _refresh_once(pool: asyncpg.Pool):
 
     logging.info("Starting refresh for %s cards on platforms=%s ...", total, ",".join(PLATFORMS))
 
-    prices_map: Dict[str, str] = {}
+    prices_map: Dict[int, str] = {}
     for i in range(0, total, BATCH_SIZE):
         chunk = card_ids[i : i + BATCH_SIZE]
         chunk_prices = await _fetch_prices_for_ids(chunk)
@@ -216,13 +285,13 @@ async def _refresh_once(pool: asyncpg.Pool):
         return
 
     # 1) Update snapshot
-    pairs_snapshot: List[Tuple[str, str]] = [(str(p), str(cid)) for cid, p in prices_map.items()]
+    pairs_snapshot: List[Tuple[str, int]] = [(p, cid) for cid, p in prices_map.items()]
     async with pool.acquire() as conn:
         await _update_snapshot(conn, pairs_snapshot)
 
     # 2) History + 3) Ticks
-    hist_rows: List[Tuple[str, str, str]] = []
-    tick_rows: List[Tuple[str, str, int]] = []
+    hist_rows: List[Tuple[int, str, str]] = []
+    tick_rows: List[Tuple[int, str, int]] = []
 
     for cid, ptxt in prices_map.items():
         try:
@@ -230,10 +299,11 @@ async def _refresh_once(pool: asyncpg.Pool):
         except Exception:
             continue
         for plat in PLATFORMS:
-            hist_rows.append((str(cid), str(plat), str(ptxt)))
-            tick_rows.append((str(cid), str(plat), int(pint)))
+            hist_rows.append((cid, plat, ptxt))
+            tick_rows.append((cid, plat, pint))
 
     async with pool.acquire() as conn:
+        # batch writes to keep memory stable
         for j in range(0, len(hist_rows), 5000):
             await _insert_history(conn, hist_rows[j : j + 5000])
         for j in range(0, len(tick_rows), 5000):
@@ -242,9 +312,7 @@ async def _refresh_once(pool: asyncpg.Pool):
 
     logging.info(
         "Updated fut_players (%s), wrote %s history rows and %s ticks, rolled 15m candles.",
-        len(pairs_snapshot),
-        len(hist_rows),
-        len(tick_rows),
+        len(pairs_snapshot), len(hist_rows), len(tick_rows)
     )
 
 # ---------- Main loop ----------
