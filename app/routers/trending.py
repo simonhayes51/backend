@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
-from typing import Literal, List, Optional, Dict, Tuple
+from typing import Literal, List, Optional, Dict, Tuple, Any
 
 import aiohttp
 from bs4 import BeautifulSoup, Tag
@@ -28,11 +29,6 @@ FUTGG_PRICE_URL = "https://www.fut.gg/api/fut/player-prices/26/{card_id}"
 CACHE_TTL = 120  # seconds
 _CACHE: Dict[Tuple[str, int], Tuple[float, str]] = {}
 
-# Accept:
-#   /players/26-247333
-#   /players/247333
-#   /players/26-247333/erling-haaland
-#   /players/247333?version=26
 CARD_ID_RE = re.compile(r"/players/(?:\d{2}-)?(?P<id>\d+)(?:[/?#]|$)", re.IGNORECASE)
 PCT_RE = re.compile(r"([+-]?\d+(?:\.\d+)?)\s*%")
 
@@ -45,11 +41,7 @@ class TrendingOut(BaseModel):
 
 # ------------------ Helpers ------------------
 def _norm_tf(tf: Optional[str]) -> str:
-    """
-    Normalise timeframe to '4'|'6'|'12'|'24'.
-    Accepts '4h','6h','12h','24h', and aliases like 'today','day','daily' -> '24'.
-    Anything unknown -> '24'.
-    """
+    """Map alias timeframes to '4'|'6'|'12'|'24'."""
     if not tf:
         return "24"
     tf = tf.strip().lower()
@@ -113,10 +105,6 @@ def _parse_last_page_num(html: str) -> int:
         return 1
 
 def _closest_card_container(node: Tag) -> Optional[Tag]:
-    """
-    Walk up until we hit a tile-like wrapper. Keep scope tight so we don't
-    pick % from headers/ads. If not found, return parent.
-    """
     cur = node
     for _ in range(6):
         if cur is None or not isinstance(cur, Tag):
@@ -130,14 +118,9 @@ def _closest_card_container(node: Tag) -> Optional[Tag]:
     return node.parent if isinstance(node.parent, Tag) else None
 
 def _percent_in_container(container: Tag) -> Optional[float]:
-    """
-    Find a percentage inside the given container.
-    Looks at visible text first, then common attributes (data-change, title, aria-label).
-    """
     if not container:
         return None
-
-    # 1) Visible text within the tile
+    # visible text
     txt = container.get_text(" ", strip=True) or ""
     m = PCT_RE.search(txt)
     if m:
@@ -145,10 +128,9 @@ def _percent_in_container(container: Tag) -> Optional[float]:
             return float(m.group(1))
         except Exception:
             pass
-
-    # 2) Attributes on descendants
-    for el in container.find_all(True):  # all tags within container
-        for attr in ("data-change", "title", "aria-label"):
+    # attributes on descendants
+    for el in container.find_all(True):
+        for attr in ("data-change", "data-percent", "title", "aria-label"):
             val = el.get(attr)
             if not val:
                 continue
@@ -158,17 +140,107 @@ def _percent_in_container(container: Tag) -> Optional[float]:
                     return float(m.group(1))
                 except Exception:
                     continue
-
-    # 3) Nothing found
     return None
 
-def _extract_items(html: str) -> List[dict]:
+# ---------- NEW: parse __NEXT_DATA__ ----------
+def _extract_items_from_nextdata(html: str) -> List[dict]:
+    """
+    FUT.GG is a Next.js app. Most pages embed a big JSON blob in <script id="__NEXT_DATA__">.
+    We recursively scan for dicts that look like player cards with an id and a percent/ change field.
+    """
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        s = soup.find("script", id="__NEXT_DATA__")
+        if not s or not s.string:
+            return []
+        data = json.loads(s.string)
+    except Exception as e:
+        logging.info("Trending: no __NEXT_DATA__ or unparsable: %s", e)
+        return []
+
+    results: Dict[int, float] = {}
+
+    def maybe_number(x: Any) -> Optional[float]:
+        try:
+            if isinstance(x, (int, float)):
+                return float(x)
+            if isinstance(x, str):
+                m = PCT_RE.search(x)
+                if m:
+                    return float(m.group(1))
+        except Exception:
+            return None
+        return None
+
+    def walk(node: Any):
+        # dict: look for card id and percent-ish fields
+        if isinstance(node, dict):
+            keys = set(k.lower() for k in node.keys())
+            # common id keys FUT.GG might use
+            id_key = None
+            for cand in ("cardid", "playercardid", "id", "playerid"):
+                if cand in keys:
+                    id_key = cand
+                    break
+            # common percent/change keys
+            pct_key = None
+            for cand in (
+                "percent", "percentage", "change", "changepercent", "changepercentage",
+                "pricechangepercent", "pricechangepercentage", "momentumpercent",
+                "pct"
+            ):
+                if cand in keys:
+                    pct_key = cand
+                    break
+            if id_key and pct_key:
+                try:
+                    cid_raw = node.get(id_key)
+                    cid = int(str(cid_raw))
+                    pct_val = maybe_number(node.get(pct_key))
+                    if pct_val is not None:
+                        results[cid] = pct_val
+                except Exception:
+                    pass
+            # also: nested momentum object
+            if "momentum" in keys and isinstance(node.get("momentum"), dict):
+                m = node["momentum"]
+                pct_val = None
+                for cand in ("percent", "percentage", "changePercent", "changePercentage"):
+                    if cand in m:
+                        pct_val = maybe_number(m.get(cand))
+                        break
+                cid = None
+                for cand in ("cardId", "playerCardId", "id", "playerId"):
+                    if cand in node:
+                        try:
+                            cid = int(str(node[cand]))
+                            break
+                        except Exception:
+                            pass
+                if cid and pct_val is not None:
+                    results[cid] = pct_val
+
+            # recurse
+            for v in node.values():
+                walk(v)
+
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    walk(data)
+
+    items = [{"card_id": cid, "percent": pct} for cid, pct in results.items()]
+    logging.info(f"[TRENDING][NEXT] Extracted {len(items)} items from __NEXT_DATA__")
+    return items
+
+def _extract_items_from_dom(html: str) -> List[dict]:
+    """Previous DOM/tile method, kept as a fallback."""
     try:
         soup = BeautifulSoup(html, "html.parser")
         items: List[dict] = []
         seen: set[int] = set()
 
-        # Only consider anchors that go to a player page
         for a in soup.find_all("a", href=True):
             href = a["href"]
             if "/players/" not in href:
@@ -187,12 +259,12 @@ def _extract_items(html: str) -> List[dict]:
             container = _closest_card_container(a) or a
             pct = _percent_in_container(container)
 
-            # DEBUG LOGGING
+            snippet = ""
             try:
                 snippet = (container.get_text(" ", strip=True) or "")[:120]
             except Exception:
-                snippet = ""
-            logging.info(f"[TRENDING] href={href} cid={cid} pct={pct} snippet='{snippet}'")
+                pass
+            logging.info(f"[TRENDING][DOM] href={href} cid={cid} pct={pct} snippet='{snippet}'")
 
             if pct is None:
                 continue
@@ -200,11 +272,18 @@ def _extract_items(html: str) -> List[dict]:
             items.append({"card_id": cid, "percent": pct})
             seen.add(cid)
 
-        logging.info(f"[TRENDING] Extracted {len(items)} items")
+        logging.info(f"[TRENDING][DOM] Extracted {len(items)} items")
         return items
     except Exception as e:
-        logging.warning("Trending: extract error: %s", e)
+        logging.warning("Trending: DOM extract error: %s", e)
         return []
+
+def _extract_items(html: str) -> List[dict]:
+    # Prefer Next.js data; fallback to DOM
+    nx = _extract_items_from_nextdata(html)
+    if nx:
+        return nx
+    return _extract_items_from_dom(html)
 
 async def _page_items(tf: str, page: int) -> List[dict]:
     html = await _momentum_page(tf, page)
@@ -213,10 +292,7 @@ async def _page_items(tf: str, page: int) -> List[dict]:
     return _extract_items(html)
 
 async def _get_console_price(card_id: int, platform: str = "ps") -> Optional[int]:
-    """
-    Return a price or None. Tries price → lowestBin → LCPrice.
-    If PS is missing it tries Xbox once. Never raises.
-    """
+    """Return a price or None. Tries price → lowestBin → LCPrice. PS first, then Xbox."""
     url = FUTGG_PRICE_URL.format(card_id=card_id)
     timeout = aiohttp.ClientTimeout(total=10)
     data = None
@@ -287,7 +363,6 @@ async def _enrich_meta(req: Request, rows: List[dict]) -> List[dict]:
 
 async def _attach_prices(items: List[dict]) -> List[dict]:
     sem = asyncio.Semaphore(16)
-
     async def one(it: dict) -> dict:
         async with sem:
             try:
@@ -297,7 +372,6 @@ async def _attach_prices(items: List[dict]) -> List[dict]:
                 logging.warning("Trending: price attach failed for %s: %s", it.get("card_id"), e)
                 it["prices"] = {"console": None, "pc": None}
             return it
-
     results = await asyncio.gather(*(one(i) for i in items), return_exceptions=True)
     out: List[dict] = []
     for r in results:
@@ -309,9 +383,7 @@ async def _attach_prices(items: List[dict]) -> List[dict]:
 
 async def _fetch_trending(kind: Literal["risers", "fallers"], tf: str, limit: int) -> List[dict]:
     """
-    Robust fetch:
-    - Fallers: first page; Risers: last page.
-    - If <limit, sample the opposite end and merge.
+    Fallers: first page; Risers: last page. If fewer than limit, sample both ends.
     """
     try:
         first_html = await _momentum_page(tf, 1)
@@ -351,19 +423,13 @@ async def trending(
     /api/trending?type=fallers&tf=24h
     Tolerates bad inputs: unknown type -> fallers, 'tf=today' -> 24h.
     """
-    # Be lenient with 'type'
     t = (type_raw or "fallers").lower()
-    type_: Literal["risers", "fallers", "smart"]
-    if t not in {"risers", "fallers", "smart"}:
-        type_ = "fallers"
-    else:
-        type_ = t  # type: ignore
+    type_: Literal["risers", "fallers", "smart"] = "fallers" if t not in {"risers", "fallers", "smart"} else t  # type: ignore
 
     ent = await compute_entitlements(req)
     limits = ent.get("limits", {}).get("trending", {"timeframes": ["24h"], "limit": 5})
     limited = False
 
-    # Premium gate for Smart
     if type_ == "smart" and not ent.get("is_premium", False):
         raise HTTPException(
             status_code=402,
@@ -404,11 +470,11 @@ async def trending(
             smart_map: Dict[int, Dict[str, float]] = {}
 
             for cid, p6 in r6m.items():
-                if cid in f24m:  # up on 6h, down on 24h
+                if cid in f24m:
                     smart_ids.add(cid)
                     smart_map[cid] = {"chg6hPct": p6, "chg24hPct": f24m[cid]}
             for cid, p6 in f6m.items():
-                if cid in r24m:  # down on 6h, up on 24h
+                if cid in r24m:
                     smart_ids.add(cid)
                     smart_map[cid] = {"chg6hPct": p6, "chg24hPct": r24m[cid]}
 
