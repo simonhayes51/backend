@@ -114,7 +114,7 @@ def _parse_last_page_num(html: str) -> int:
 
 def _closest_card_container(node: Tag) -> Optional[Tag]:
     """
-    Walk up until we hit a tile-like wrapper. We keep scope tight so we don't
+    Walk up until we hit a tile-like wrapper. Keep scope tight so we don't
     pick % from headers/ads. If not found, return parent.
     """
     cur = node
@@ -131,27 +131,35 @@ def _closest_card_container(node: Tag) -> Optional[Tag]:
 
 def _percent_in_container(container: Tag) -> Optional[float]:
     """
-    Find a percentage inside the given container. Looser match but scoped to the tile.
+    Find a percentage inside the given container.
+    Looks at visible text first, then common attributes (data-change, title, aria-label).
     """
     if not container:
         return None
-    # 1) Look for spans/divs with % first (fast path)
-    for el in container.find_all(["span", "div", "strong", "p"], limit=10):
-        txt = (el.get_text(" ", strip=True) or "")
-        m = PCT_RE.search(txt)
-        if m:
-            try:
-                return float(m.group(1))
-            except Exception:
-                continue
-    # 2) Fallback: any % within the container's text
-    txt = container.get_text(" ", strip=True)
+
+    # 1) Visible text within the tile
+    txt = container.get_text(" ", strip=True) or ""
     m = PCT_RE.search(txt)
     if m:
         try:
             return float(m.group(1))
         except Exception:
-            return None
+            pass
+
+    # 2) Attributes on descendants
+    for el in container.find_all(True):  # all tags within container
+        for attr in ("data-change", "title", "aria-label"):
+            val = el.get(attr)
+            if not val:
+                continue
+            m = PCT_RE.search(val)
+            if m:
+                try:
+                    return float(m.group(1))
+                except Exception:
+                    continue
+
+    # 3) Nothing found
     return None
 
 def _extract_items(html: str) -> List[dict]:
@@ -178,12 +186,21 @@ def _extract_items(html: str) -> List[dict]:
 
             container = _closest_card_container(a) or a
             pct = _percent_in_container(container)
+
+            # DEBUG LOGGING
+            try:
+                snippet = (container.get_text(" ", strip=True) or "")[:120]
+            except Exception:
+                snippet = ""
+            logging.info(f"[TRENDING] href={href} cid={cid} pct={pct} snippet='{snippet}'")
+
             if pct is None:
                 continue
 
             items.append({"card_id": cid, "percent": pct})
             seen.add(cid)
 
+        logging.info(f"[TRENDING] Extracted {len(items)} items")
         return items
     except Exception as e:
         logging.warning("Trending: extract error: %s", e)
@@ -338,7 +355,7 @@ async def trending(
     t = (type_raw or "fallers").lower()
     type_: Literal["risers", "fallers", "smart"]
     if t not in {"risers", "fallers", "smart"}:
-        type_ = "fallers"  # default
+        type_ = "fallers"
     else:
         type_ = t  # type: ignore
 
@@ -386,14 +403,12 @@ async def trending(
             smart_ids: set[int] = set()
             smart_map: Dict[int, Dict[str, float]] = {}
 
-            # Up on 6h, down on 24h
             for cid, p6 in r6m.items():
-                if cid in f24m:
+                if cid in f24m:  # up on 6h, down on 24h
                     smart_ids.add(cid)
                     smart_map[cid] = {"chg6hPct": p6, "chg24hPct": f24m[cid]}
-            # Down on 6h, up on 24h
             for cid, p6 in f6m.items():
-                if cid in r24m:
+                if cid in r24m:  # down on 6h, up on 24h
                     smart_ids.add(cid)
                     smart_map[cid] = {"chg6hPct": p6, "chg24hPct": r24m[cid]}
 
