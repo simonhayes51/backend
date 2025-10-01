@@ -90,6 +90,21 @@ def _name_from_context(anchor) -> Optional[str]:
         pass
     return None
 
+# normalize FUT.GG extras like "Rare 84 OVR" appended in slugs
+_NAME_SUFFIX_CLEAN_RE = re.compile(
+    r"\s+(?:rare|non[- ]?rare|common)(?:\s+\d+\s*ovr)?$",
+    re.IGNORECASE,
+)
+_TRAILING_OVR_RE = re.compile(r"\s+\d+\s*ovr\b.*$", re.IGNORECASE)
+
+def _normalize_name(n: Optional[str]) -> Optional[str]:
+    if not n:
+        return n
+    s = n.strip()
+    s = _NAME_SUFFIX_CLEAN_RE.sub("", s)
+    s = _TRAILING_OVR_RE.sub("", s)
+    return re.sub(r"\s{2,}", " ", s).strip()
+
 # ------------------ Models ------------------
 class TrendingOut(BaseModel):
     type: Literal["risers", "fallers", "smart"]
@@ -184,12 +199,12 @@ def _nearest_percent_text(node) -> Optional[float]:
 def _extract_items(html: str) -> List[dict]:
     soup = BeautifulSoup(html, "html.parser")
     items: List[dict] = []
-    seen: set[int] = set()
+    seen_ids: set[int] = set()  # de-dupe by card_id only
 
     for a in soup.find_all("a", href=True):
         href = a["href"]
         cid = _cid_from_href(href)
-        if not cid or cid in seen:
+        if not cid or cid in seen_ids:
             continue
 
         pct = _nearest_percent_text(a)
@@ -197,20 +212,16 @@ def _extract_items(html: str) -> List[dict]:
             continue
 
         # name priority: nearby <img alt="Name - ..."> > slug from href > "Card {cid}"
-        name_hint_img = _name_from_context(a)
-        name_hint_slug = _name_hint_from_href(href)
-        name_hint = (
-            name_hint_img
-            or (name_hint_slug if (name_hint_slug and name_hint_slug.lower() != "momentum") else None)
-            or f"Card {cid}"
-        )
+        name_hint_img = _normalize_name(_name_from_context(a))
+        name_hint_slug = _normalize_name(_name_hint_from_href(href))
+        name_hint = name_hint_img or (name_hint_slug if (name_hint_slug and name_hint_slug.lower() != "momentum") else None) or f"Card {cid}"
 
         items.append({
             "card_id": cid,
             "percent": pct,
             "name_hint": name_hint,
         })
-        seen.add(cid)
+        seen_ids.add(cid)
 
     return items
 
@@ -308,7 +319,13 @@ async def _fetch_trending(kind: Literal["risers", "fallers"], tf: str, limit: in
     return out
 
 # ------------------ Route ------------------
-@router.get("/trending", response_model=TrendingOut)
+class _TrendingOut(BaseModel):
+    type: Literal["risers", "fallers", "smart"]
+    timeframe: Literal["6h", "12h", "24h"]
+    items: List[dict]
+    limited: bool = False
+
+@router.get("/trending", response_model=_TrendingOut)
 async def trending(
     req: Request,
     type_: Literal["risers", "fallers", "smart"] = Query("risers", alias="type"),
