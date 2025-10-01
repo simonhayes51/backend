@@ -5,15 +5,15 @@
 from __future__ import annotations
 
 import aiohttp
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Any
 from datetime import datetime, timezone
 from collections import defaultdict
 
-FUTGG_PRICE_URL = "https://www.fut.gg/api/fut/player-prices/25/{card_id}"
+# ✅ Use v26 to match the rest of the app
+FUTGG_PRICE_URL = "https://www.fut.gg/api/fut/player-prices/26/{card_id}"
 TIMEOUT_SECS = 12
 CACHE_TTL_SECS = 120  # short cache; we're showing recent trends
 
-# How far back each pill goes, and how coarse to bucket the points
 TF_TO_WINDOW_HOURS = {
     "today": 24,
     "3d": 72,
@@ -23,11 +23,11 @@ TF_TO_WINDOW_HOURS = {
 }
 
 TF_TO_BUCKET_SECONDS = {
-    "today": 30 * 60,      # 30 minutes
-    "3d":    60 * 60,      # 1 hour
-    "week":  2 * 60 * 60,  # 2 hours
-    "month": 6 * 60 * 60,  # 6 hours
-    "year":  24 * 60 * 60, # 1 day
+    "today": 30 * 60,       # 30 minutes
+    "3d":    60 * 60,       # 1 hour
+    "week":  2 * 60 * 60,   # 2 hours
+    "month": 6 * 60 * 60,   # 6 hours
+    "year":  24 * 60 * 60,  # 1 day
 }
 
 GG_HEADERS = {
@@ -75,44 +75,57 @@ def _median(nums: List[int]) -> int:
     return nums[mid] if len(nums) % 2 else (nums[mid - 1] + nums[mid]) // 2
 
 # -------- FUT.GG fetch --------
-async def _fetch_futgg_data(card_id: int) -> Dict:
+async def _fetch_futgg_data(card_id: int) -> Dict[str, Any]:
     url = FUTGG_PRICE_URL.format(card_id=card_id)
     timeout = aiohttp.ClientTimeout(total=TIMEOUT_SECS)
     async with aiohttp.ClientSession(timeout=timeout, headers=GG_HEADERS) as sess:
         async with sess.get(url) as r:
+            # If FUT.GG blocks or has no data, return empty rather than raise
             if r.status != 200:
-                raise RuntimeError(f"FUT.GG status {r.status}")
-            return await r.json()
+                return {}
+            try:
+                return await r.json()
+            except Exception:
+                return {}
 
 # -------- public API --------
-async def get_price_history(card_id: int, platform: str = "ps", tf: str = "today") -> Dict:
+async def get_price_history(card_id: int, platform: str = "ps", tf: str = "today") -> Dict[str, List[Dict[str, int]]]:
     """
     Build history from FUT.GG completed auctions, bucketed per timeframe.
     Shape: {"points":[{"t": ISO_UTC, "price": int}, ...]}
     """
-    cache_key = f"{card_id}|{tf}"
+    cache_key = f"{card_id}|{platform}|{tf}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return {"points": cached}
 
     data = await _fetch_futgg_data(card_id)
-    auctions = (data.get("data") or {}).get("completedAuctions") or []
+    if not data:
+        _cache_set(cache_key, [])
+        return {"points": []}
+
+    # FUT.GG sometimes nests auctions under data.completedAuctions
+    auctions = data.get("completedAuctions") or (data.get("data") or {}).get("completedAuctions") or []
 
     # Parse auctions -> (ts_ms, price)
     pairs: List[Tuple[int, int]] = []
     for a in auctions:
-        price = a.get("soldPrice")
-        sd = a.get("soldDate")
+        price = a.get("soldPrice") or a.get("price")
+        sd = a.get("soldDate") or a.get("date")
         if not price or not sd:
             continue
         try:
-            dt = datetime.fromisoformat(sd.replace("Z", "+00:00"))
-            ts_ms = int(dt.timestamp() * 1000)
+            # FUT.GG uses ISO strings with 'Z'; guard both second + ms formats
+            if isinstance(sd, str):
+                dt = datetime.fromisoformat(sd.replace("Z", "+00:00"))
+                ts_ms = int(dt.timestamp() * 1000)
+            else:
+                # if already ms epoch
+                ts_ms = int(sd)
             pairs.append((ts_ms, int(price)))
         except Exception:
             continue
 
-    # If nothing to show, return empty
     if not pairs:
         _cache_set(cache_key, [])
         return {"points": []}
