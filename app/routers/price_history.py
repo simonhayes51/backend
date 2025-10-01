@@ -1,9 +1,8 @@
-# app/routers/price_history.py
 from typing import Literal
 from fastapi import APIRouter, Query, Request
 from app.services.price_history import get_price_history
 
-router = APIRouter()  # mounted under "/api"
+router = APIRouter()  # mounted under "/api" in main.py
 
 Timeframe = Literal["today", "3d", "week", "month", "year"]
 
@@ -15,17 +14,16 @@ async def price_history(
     tf: Timeframe = Query("today", description="today | 3d | week | month | year"),
 ):
     """
-    Returns:
-      { "points": [ { "t": ISO_8601_UTC, "price": int }, ... ] }
-    Always 200; on errors returns empty series.
+    Always 200. On errors returns {"points": []} so the chart doesn't crash.
     """
     if playerId <= 0:
         return {"points": []}
-
     try:
-        data = await get_price_history(card_id=playerId, platform=platform, tf=tf)
-        return data
+        return await get_price_history(card_id=playerId, platform=platform, tf=tf)
     except Exception as e:
-        # Don't break the chart
-        req.app.logger.warning(f"/price-history failed for {playerId}: {e}")
+        # log and fall back to empty data instead of 502
+        try:
+            req.app.logger.warning(f"/price-history failed for {playerId}: {e}")
+        except Exception:
+            pass
         return {"points": []}
