@@ -1,3 +1,4 @@
+# app/routers/trending.py
 from __future__ import annotations
 
 import asyncio
@@ -30,7 +31,6 @@ CACHE_TTL = 120  # seconds
 # Prefer explicit "26-<id>" segment; otherwise take the last number after /players/
 _26_SEGMENT_RE = re.compile(r"/players/[^?#]*/26-(\d+)(?:[/?#]|$)", re.IGNORECASE)
 _LAST_NUM_AFTER_PLAYERS_RE = re.compile(r"/players/[^?#]*?(\d+)(?:[/?#]|$)", re.IGNORECASE)
-
 PCT_RE = re.compile(r"([+\-]?\s?\d+(?:\.\d+)?)\s*%")
 
 def _cid_from_href(href: str) -> Optional[int]:
@@ -67,6 +67,28 @@ def _name_hint_from_href(href: str) -> Optional[str]:
         return " ".join(w.capitalize() for w in words) if words else None
     except Exception:
         return None
+
+def _name_from_context(anchor) -> Optional[str]:
+    """
+    Try to pull a readable player name from nearby markup
+    (e.g., <img alt="Name - 85 - Something">).
+    """
+    try:
+        cur = anchor
+        for _ in range(6):
+            if not cur:
+                break
+            img = getattr(cur, "find", lambda *a, **k: None)("img", alt=True)
+            if img and isinstance(img.get("alt"), str):
+                alt = img["alt"].strip()
+                # "Karim Adeyemi - 81 - XYZ" -> "Karim Adeyemi"
+                name = alt.split(" - ", 1)[0].strip()
+                if name and name.lower() != "momentum":
+                    return name
+            cur = getattr(cur, "parent", None)
+    except Exception:
+        pass
+    return None
 
 # ------------------ Models ------------------
 class TrendingOut(BaseModel):
@@ -167,16 +189,27 @@ def _extract_items(html: str) -> List[dict]:
     for a in soup.find_all("a", href=True):
         href = a["href"]
         cid = _cid_from_href(href)
-        if not cid:
-            continue
-        if cid in seen:
+        if not cid or cid in seen:
             continue
 
         pct = _nearest_percent_text(a)
         if pct is None:
             continue
 
-        items.append({"card_id": cid, "percent": pct, "name_hint": _name_hint_from_href(href)})
+        # name priority: nearby <img alt="Name - ..."> > slug from href > "Card {cid}"
+        name_hint_img = _name_from_context(a)
+        name_hint_slug = _name_hint_from_href(href)
+        name_hint = (
+            name_hint_img
+            or (name_hint_slug if (name_hint_slug and name_hint_slug.lower() != "momentum") else None)
+            or f"Card {cid}"
+        )
+
+        items.append({
+            "card_id": cid,
+            "percent": pct,
+            "name_hint": name_hint,
+        })
         seen.add(cid)
 
     return items
@@ -208,21 +241,23 @@ async def _enrich_meta(req: Request, rows: List[dict]) -> List[dict]:
     if not rows:
         return []
     ids = [int(x["card_id"]) for x in rows]  # bigint lookup
-    async with req.app.state.player_pool.acquire() as conn:
-        dbrows = await conn.fetch(
-            """
-            SELECT card_id, name, rating, position, league, nation, club, image_url
-            FROM fut_players
-            WHERE card_id = ANY($1::bigint[])
-            """,
-            ids,
-        )
+    try:
+        async with req.app.state.player_pool.acquire() as conn:
+            dbrows = await conn.fetch(
+                """
+                SELECT card_id, name, rating, position, league, nation, club, image_url
+                FROM fut_players
+                WHERE card_id = ANY($1::bigint[])
+                """,
+                ids,
+            )
+    except Exception:
+        dbrows = []
     meta = {int(r["card_id"]): dict(r) for r in dbrows}
     out: List[dict] = []
     for r in rows:
         cid = int(r["card_id"])
         m = meta.get(cid, {})
-        # fall back to name_hint if DB missing
         name = m.get("name") or r.get("name_hint") or f"Card {cid}"
         out.append({
             "card_id": cid,
