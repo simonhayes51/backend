@@ -204,8 +204,10 @@ def _extract_items(html: str) -> List[dict]:
     for a in soup.find_all("a", href=True):
         href = a["href"]
         cid = _cid_from_href(href)
-        if not cid or cid in seen_ids:
+        if not cid:
             continue
+        if cid in seen_ids:
+            continue  # keep only the first occurrence
 
         pct = _nearest_percent_text(a)
         if pct is None:
@@ -214,7 +216,9 @@ def _extract_items(html: str) -> List[dict]:
         # name priority: nearby <img alt="Name - ..."> > slug from href > "Card {cid}"
         name_hint_img = _normalize_name(_name_from_context(a))
         name_hint_slug = _normalize_name(_name_hint_from_href(href))
-        name_hint = name_hint_img or (name_hint_slug if (name_hint_slug and name_hint_slug.lower() != "momentum") else None) or f"Card {cid}"
+        name_hint = name_hint_img or (
+            name_hint_slug if (name_hint_slug and name_hint_slug.lower() != "momentum") else None
+        ) or f"Card {cid}"
 
         items.append({
             "card_id": cid,
