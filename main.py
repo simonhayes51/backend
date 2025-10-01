@@ -1278,7 +1278,13 @@ async def price_history(playerId: int, platform: str = "ps", tf: str = "today"):
     if playerId <= 0:
         raise HTTPException(status_code=400, detail="playerId must be a positive integer")
     try:
-        return await get_price_history(playerId, platform, tf)
+        hist = await get_price_history(playerId, platform, tf)
+        # Fallback if DB is stale
+        if not hist or len(hist) < 2:
+            from app.services.pricehistory_futgg_bridge import fetch_futgg_history
+            futgg_series = await fetch_futgg_history(playerId, platform, "3d")
+            return {"history": futgg_series}
+        return hist
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Upstream error: {e}")
 
