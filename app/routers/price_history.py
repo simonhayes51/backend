@@ -1,37 +1,31 @@
 # app/routers/price_history.py
-from fastapi import APIRouter, Query, HTTPException
 from typing import Literal
+from fastapi import APIRouter, Query, Request
 from app.services.price_history import get_price_history
 
-router = APIRouter()  # no prefix here; we add "/api" when mounting in main.py
+router = APIRouter()  # mounted under "/api"
 
-# Allowed timeframes to mirror the frontend pills
 Timeframe = Literal["today", "3d", "week", "month", "year"]
 
 @router.get("/price-history")
 async def price_history(
-    playerId: int = Query(..., alias="playerId", description="FUT card ID (same one your UI uses)"),
-    platform: str = Query("ps", description="Platform hint (kept for API parity)"),
-    tf: Timeframe = Query("today", description="Timeframe: today | 3d | week | month | year"),
+    req: Request,
+    playerId: int = Query(..., alias="playerId", description="FUT card ID"),
+    platform: str = Query("ps", description="ps | xbox | pc"),
+    tf: Timeframe = Query("today", description="today | 3d | week | month | year"),
 ):
     """
-    Returns price history points for the chart.
-
-    Response shape:
-      {
-        "points": [
-          { "t": ISO_8601_UTC, "price": int },
-          ...
-        ]
-      }
+    Returns:
+      { "points": [ { "t": ISO_8601_UTC, "price": int }, ... ] }
+    Always 200; on errors returns empty series.
     """
     if playerId <= 0:
-        raise HTTPException(status_code=400, detail="playerId must be a positive integer")
+        return {"points": []}
 
     try:
-        data = await get_price_history(playerId, platform, tf)
+        data = await get_price_history(card_id=playerId, platform=platform, tf=tf)
+        return data
     except Exception as e:
-        # Surface a clean 502 if upstream (FUTBIN) fails
-        raise HTTPException(status_code=502, detail=f"Upstream error: {e}") from e
-
-    return data
+        # Don't break the chart
+        req.app.logger.warning(f"/price-history failed for {playerId}: {e}")
+        return {"points": []}
