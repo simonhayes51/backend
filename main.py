@@ -45,6 +45,7 @@ from app.routers.players import router as players_router
 from app.routes_ea import router as ea_router
 from app.routes_ingest_sets import router as ingest_router
 from app.routes_sbc_read import router as sbc_read_router
+from app.services.futgg_history import fetch_futgg_history
 
 
 # ----------------- BOOTSTRAP -----------------
@@ -1278,13 +1279,22 @@ async def price_history(playerId: int, platform: str = "ps", tf: str = "today"):
     if playerId <= 0:
         raise HTTPException(status_code=400, detail="playerId must be a positive integer")
     try:
-        hist = await get_price_history(playerId, platform, tf)
-        # Fallback if DB is stale
-        if not hist or len(hist) < 2:
-            from app.services.pricehistory_futgg_bridge import fetch_futgg_history
-            futgg_series = await fetch_futgg_history(playerId, platform, "3d")
-            return {"history": futgg_series}
-        return hist
+        base = await get_price_history(playerId, platform, tf)  # existing flow (DB / internal)  
+
+        # Normalize to list for safety
+        history = base if isinstance(base, list) else (base.get("history") or [])
+
+        # Fallback: if stale/sparse, use Fut.GG's 3-day series
+        if not history or len(history) < 2:
+            try:
+                history = await fetch_futgg_history(playerId, platform, "3d")
+                return {"history": history}
+            except Exception:
+                # If Fut.GG fails too, return whatever we had (even empty) to keep contract
+                return {"history": history}
+
+        # Your existing shape sometimes returns list directly; wrap consistently
+        return {"history": history}
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Upstream error: {e}")
 
