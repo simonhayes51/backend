@@ -127,3 +127,140 @@ async def get_indicators(
     out["atr14"] = atr(highs, lows, closes, 14)
     out["count"] = len(closes)
     return out
+
+@router.get("/sentiment")
+async def get_market_sentiment(
+    timeframe: str = "24h",
+    db=Depends(get_db),
+) -> Dict[str, Any]:
+    """
+    Aggregate sentiment scores from social sources and trading activity.
+    Return trending topics, top players from recent trades, and AI market insights.
+    """
+    try:
+        from datetime import datetime, timedelta
+
+        # Map timeframe to hours
+        timeframe_hours = {
+            "1h": 1,
+            "6h": 6,
+            "24h": 24,
+            "7d": 168
+        }.get(timeframe, 24)
+
+        cutoff = datetime.utcnow() - timedelta(hours=timeframe_hours)
+
+        # Get top trending players from recent trades (proxy for market activity)
+        trending_players = await db.fetch(
+            """
+            SELECT
+                player,
+                COUNT(*) as trade_count,
+                SUM(quantity) as total_volume,
+                AVG(profit) as avg_profit,
+                SUM(CASE WHEN profit > 0 THEN 1 ELSE 0 END)::FLOAT / COUNT(*)::FLOAT as win_rate
+            FROM trades
+            WHERE timestamp >= $1
+            GROUP BY player
+            ORDER BY trade_count DESC
+            LIMIT 10
+            """,
+            cutoff
+        )
+
+        # Calculate overall market sentiment
+        total_trades = await db.fetchval(
+            "SELECT COUNT(*) FROM trades WHERE timestamp >= $1",
+            cutoff
+        ) or 0
+
+        profitable_trades = await db.fetchval(
+            "SELECT COUNT(*) FROM trades WHERE timestamp >= $1 AND profit > 0",
+            cutoff
+        ) or 0
+
+        # Sentiment score (0-100)
+        if total_trades > 0:
+            profit_ratio = profitable_trades / total_trades
+            sentiment_score = int(profit_ratio * 100)
+        else:
+            sentiment_score = 50  # Neutral
+
+        # Determine sentiment label
+        if sentiment_score >= 70:
+            sentiment_label = "Bullish"
+            sentiment_icon = "🚀"
+        elif sentiment_score >= 55:
+            sentiment_label = "Positive"
+            sentiment_icon = "📈"
+        elif sentiment_score >= 45:
+            sentiment_label = "Neutral"
+            sentiment_icon = "➖"
+        elif sentiment_score >= 30:
+            sentiment_label = "Negative"
+            sentiment_icon = "📉"
+        else:
+            sentiment_label = "Bearish"
+            sentiment_icon = "🔻"
+
+        # Generate AI insights based on data
+        insights = []
+
+        if total_trades > 100:
+            insights.append(f"High trading activity detected ({total_trades} trades in {timeframe})")
+        elif total_trades < 20:
+            insights.append(f"Low market activity - consider waiting for better opportunities")
+
+        if sentiment_score >= 65:
+            insights.append("Strong buyer confidence. Good time to sell into demand.")
+        elif sentiment_score <= 35:
+            insights.append("Weak market conditions. Look for value buys or stay liquid.")
+
+        # Top 3 trending players
+        top_players = []
+        for idx, p in enumerate(trending_players[:3]):
+            win_rate = (p["win_rate"] or 0) * 100
+            top_players.append({
+                "rank": idx + 1,
+                "player": p["player"],
+                "trade_count": p["trade_count"],
+                "volume": p["total_volume"],
+                "avg_profit": int(p["avg_profit"] or 0),
+                "win_rate": round(win_rate, 1)
+            })
+
+            if idx == 0:  # Top player insight
+                if win_rate > 60:
+                    insights.append(f"{p['player']} showing strong profit potential ({win_rate:.0f}% win rate)")
+                elif win_rate < 40:
+                    insights.append(f"{p['player']} is risky - only {win_rate:.0f}% of traders profiting")
+
+        # Market timing insight
+        hour = datetime.utcnow().hour
+        if 18 <= hour <= 22:
+            insights.append("Peak trading hours - high liquidity and faster sales")
+        elif 2 <= hour <= 8:
+            insights.append("Off-peak hours - fewer buyers, better deals available")
+
+        return {
+            "ok": True,
+            "timeframe": timeframe,
+            "sentiment": {
+                "score": sentiment_score,
+                "label": sentiment_label,
+                "icon": sentiment_icon
+            },
+            "market_stats": {
+                "total_trades": total_trades,
+                "profitable_trades": profitable_trades,
+                "win_rate": round(profit_ratio * 100, 1) if total_trades > 0 else 0
+            },
+            "trending_players": top_players,
+            "insights": insights,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+
+    except Exception as e:
+        import logging
+        logging.error(f"market-sentiment error: {e}")
+        raise HTTPException(status_code=500, detail=f"Market sentiment failed: {str(e)}")

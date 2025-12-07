@@ -16,30 +16,64 @@ Feature = Literal[
     "deal_confidence",
     "backtest",
     "smart_trending",
+    "portfolio_optimizer",
+    "ai_copilot",
+    "market_sentiment",
+    "leaderboard",
+    "referrals",
+    "bulk_trades",
 ]
 
-# ---- Config (overridable via env) -------------------------------------------
-FREE_WATCHLIST_MAX = int(os.getenv("WATCHLIST_FREE_MAX", "3"))
-PREMIUM_WATCHLIST_MAX = int(os.getenv("WATCHLIST_PREMIUM_MAX", "500"))
+# 3-tier subscription system
+Tier = Literal["basic", "pro", "elite"]
 
-FREE_TRENDING = {
-    "timeframes": {"24h"},  # free users only see 24h
+# ---- Config (overridable via env) -------------------------------------------
+# Watchlist limits by tier
+BASIC_WATCHLIST_MAX = int(os.getenv("WATCHLIST_BASIC_MAX", "3"))
+PRO_WATCHLIST_MAX = int(os.getenv("WATCHLIST_PRO_MAX", "25"))
+ELITE_WATCHLIST_MAX = int(os.getenv("WATCHLIST_ELITE_MAX", "500"))
+
+# Legacy support
+FREE_WATCHLIST_MAX = BASIC_WATCHLIST_MAX
+PREMIUM_WATCHLIST_MAX = ELITE_WATCHLIST_MAX
+
+# Trending limits by tier
+BASIC_TRENDING = {
+    "timeframes": {"24h"},
     "limit": 5,
     "smart": False,
 }
-PREMIUM_TRENDING = {
+PRO_TRENDING = {
+    "timeframes": {"6h", "24h"},
+    "limit": 15,
+    "smart": True,
+}
+ELITE_TRENDING = {
     "timeframes": {"4h", "6h", "24h"},
-    "limit": 20,
+    "limit": 50,
     "smart": True,
 }
 
+# Legacy support
+FREE_TRENDING = BASIC_TRENDING
+PREMIUM_TRENDING = ELITE_TRENDING
+
+# Feature matrix: defines which tiers can access which features
 FEATURE_MATRIX: Dict[Feature, Dict[str, Any]] = {
-    "smart_buy":       {"roles": {"Premium"}, "plans": {"pro", "premium"}},
-    "trade_finder":    {"roles": {"Premium"}, "plans": {"pro", "premium"}},
-    "deal_confidence": {"roles": {"Premium"}, "plans": {"pro", "premium"}},
-    "backtest":        {"roles": {"Premium"}, "plans": {"pro", "premium"}},
-    "smart_trending":  {"roles": {"Premium"}, "plans": {"pro", "premium"}},
-    # "watchlist" is treated via limits instead of a hard block
+    # Legacy features (Pro and Elite)
+    "smart_buy":       {"roles": {"Premium"}, "plans": {"pro", "premium", "elite"}},
+    "trade_finder":    {"roles": {"Premium"}, "plans": {"pro", "premium", "elite"}},
+    "deal_confidence": {"roles": {"Premium"}, "plans": {"pro", "premium", "elite"}},
+    "backtest":        {"roles": {"Premium"}, "plans": {"pro", "premium", "elite"}},
+    "smart_trending":  {"roles": {"Premium"}, "plans": {"pro", "premium", "elite"}},
+
+    # New tier-specific features
+    "portfolio_optimizer": {"roles": {"Premium"}, "plans": {"pro", "premium", "elite"}},  # Pro+
+    "ai_copilot":          {"roles": set(), "plans": {"basic", "pro", "premium", "elite"}},  # All tiers
+    "market_sentiment":    {"roles": set(), "plans": {"basic", "pro", "premium", "elite"}},  # All tiers
+    "leaderboard":         {"roles": set(), "plans": {"basic", "pro", "premium", "elite"}},  # All tiers
+    "referrals":           {"roles": set(), "plans": {"basic", "pro", "premium", "elite"}},  # All tiers
+    "bulk_trades":         {"roles": {"Premium"}, "plans": {"elite"}},  # Elite only
 }
 
 # ---- Env needed to query Discord (optional; if missing we just skip) --------
@@ -57,13 +91,28 @@ def _now() -> datetime:
 
 
 def _is_premium(plan: Optional[str], premium_until: Optional[datetime], roles: Set[str]) -> bool:
-    if plan and plan.lower() in {"pro", "premium"}:
+    if plan and plan.lower() in {"pro", "premium", "elite"}:
         return True
     if premium_until and premium_until > _now():
         return True
     if "Premium" in roles:
         return True
     return False
+
+def _get_tier(plan: Optional[str], premium_until: Optional[datetime], roles: Set[str]) -> Tier:
+    """Determine user's subscription tier"""
+    if not plan:
+        plan_lower = "basic"
+    else:
+        plan_lower = plan.lower()
+
+    # Map plans to tiers
+    if plan_lower in {"elite"}:
+        return "elite"
+    elif plan_lower in {"pro", "premium"}:
+        return "pro"
+    else:
+        return "basic"
 
 
 async def _load_user_row(pool: asyncpg.Pool, user_id: str) -> Optional[asyncpg.Record]:
@@ -141,19 +190,41 @@ async def compute_entitlements(req: Request) -> Dict[str, Any]:
             pass
 
     premium = _is_premium(plan, premium_until, roles)
+    tier = _get_tier(plan, premium_until, roles)
+
+    # Set limits based on tier
+    if tier == "elite":
+        watchlist_max = ELITE_WATCHLIST_MAX
+        trending = ELITE_TRENDING
+    elif tier == "pro":
+        watchlist_max = PRO_WATCHLIST_MAX
+        trending = PRO_TRENDING
+    else:  # basic
+        watchlist_max = BASIC_WATCHLIST_MAX
+        trending = BASIC_TRENDING
 
     limits = {
-        "watchlist_max": PREMIUM_WATCHLIST_MAX if premium else FREE_WATCHLIST_MAX,
-        "trending": PREMIUM_TRENDING if premium else FREE_TRENDING,
+        "watchlist_max": watchlist_max,
+        "trending": trending,
+        "bulk_trades_max": 100 if tier == "elite" else (25 if tier == "pro" else 10),
     }
 
+    # Determine available features based on tier
     features: Set[Feature] = set()
-    if premium:
-        features = {"smart_buy", "trade_finder", "deal_confidence", "backtest", "smart_trending"}
+    plan_lower = (plan or "basic").lower()
+
+    for feature, conf in FEATURE_MATRIX.items():
+        # Check if user's plan is in allowed plans
+        if plan_lower in conf.get("plans", set()):
+            features.add(feature)
+        # Check if user has required role
+        elif set(roles) & conf.get("roles", set()):
+            features.add(feature)
 
     return {
         "user_id": user_id,
         "plan": plan,
+        "tier": tier,
         "premium_until": premium_until,
         "roles": list(roles),
         "is_premium": premium,
