@@ -1542,9 +1542,48 @@ async def add_trade(request: Request, user_id: str = Depends(get_current_user), 
     return {"message": "Trade added successfully!", "trade": dict(row)}
 
 @app.get("/api/trades")
-async def get_all_trades(user_id: str = Depends(get_current_user), conn=Depends(get_db)):
-    rows = await conn.fetch("SELECT * FROM trades WHERE user_id=$1 ORDER BY timestamp DESC", user_id)
-    return {"trades": [dict(r) for r in rows]}
+async def get_all_trades(
+    page: int = Query(1, ge=1, description="Page number (1-indexed)"),
+    limit: int = Query(100, ge=1, le=500, description="Items per page"),
+    user_id: str = Depends(get_current_user),
+    conn=Depends(get_db)
+):
+    """
+    Get user's trades with pagination.
+    Returns trades ordered by timestamp DESC with pagination metadata.
+    """
+    offset = (page - 1) * limit
+
+    # Get total count
+    total = await conn.fetchval(
+        "SELECT COUNT(*) FROM trades WHERE user_id=$1",
+        user_id
+    )
+
+    # Get paginated trades
+    rows = await conn.fetch(
+        """
+        SELECT * FROM trades
+        WHERE user_id=$1
+        ORDER BY timestamp DESC
+        LIMIT $2 OFFSET $3
+        """,
+        user_id, limit, offset
+    )
+
+    total_pages = (total + limit - 1) // limit if total > 0 else 1
+
+    return {
+        "trades": [dict(r) for r in rows],
+        "pagination": {
+            "page": page,
+            "limit": limit,
+            "total": total,
+            "total_pages": total_pages,
+            "has_next": page < total_pages,
+            "has_prev": page > 1
+        }
+    }
 
 @app.put("/api/trades/{trade_id}")
 async def update_trade(
