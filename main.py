@@ -46,6 +46,10 @@ from app.routes_ea import router as ea_router
 from app.routes_ingest_sets import router as ingest_router
 from app.routes_sbc_read import router as sbc_read_router
 from app.services.futgg_history import fetch_futgg_history
+from app.routers.portfolio import router as portfolio_router
+from app.routers.leaderboard import router as leaderboard_router
+from app.routers.referrals import router as referrals_router
+from app.routers.trades import router as trades_router
 
 
 # ----------------- BOOTSTRAP -----------------
@@ -1238,6 +1242,12 @@ app.include_router(market_summary_router)   # /api/market/summary
 # AI Engine
 app.include_router(ai_router)               # /api/ai/*
 app.include_router(players_router)
+
+# New monetization features
+app.include_router(portfolio_router)        # /api/ai/optimize-portfolio
+app.include_router(leaderboard_router)      # /api/leaderboard/*
+app.include_router(referrals_router)        # /api/referrals/*
+app.include_router(trades_router)           # /api/trades/*
 
 # Premium-only — mount at /api/smart-buy
 app.include_router(
