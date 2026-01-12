@@ -10,6 +10,7 @@ import logging
 import secrets
 import aiohttp
 import asyncpg
+from asyncpg import exceptions as asyncpg_exceptions
 import stripe
 
 from bs4 import BeautifulSoup
@@ -29,6 +30,7 @@ from fastapi.responses import RedirectResponse, JSONResponse, StreamingResponse,
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from starlette.middleware.sessions import SessionMiddleware
+import inspect
 from pydantic import BaseModel, Field
 
 from app.auth.entitlements import compute_entitlements, require_feature
@@ -51,11 +53,14 @@ from app.routers.leaderboard import router as leaderboard_router
 from app.routers.referrals import router as referrals_router
 from app.routers.trades import router as trades_router
 from app.routers.social_feed import router as social_feed_router
+from app.routers.social_feed import social_router as social_feed_social_router
 from app.routers.subscriptions import router as subscriptions_router
 from app.routers.interactions import router as interactions_router
 from app.routers.messaging import router as messaging_router
 from app.routers.ratings import router as ratings_router
+from app.routers.traders import admin_router as traders_admin_router
 from app.routers.traders import router as traders_router
+from app.routers.traders import social_router as traders_social_router
 from app.routers.notifications import router as notifications_router
 
 
@@ -894,6 +899,14 @@ async def lifespan(app: FastAPI):
 # --- FastAPI app ---
 app = FastAPI(lifespan=lifespan)
 
+
+@app.exception_handler(asyncpg_exceptions.UndefinedTableError)
+async def handle_undefined_table_error(request: Request, exc: Exception):
+    return JSONResponse(
+        status_code=200,
+        content={"detail": "Database tables not initialized"}
+    )
+
 from app.routers.watchlist import router as watchlist_router
 app.include_router(watchlist_router)
 app.include_router(ea_router)
@@ -1046,11 +1059,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def _session_middleware_kwargs() -> dict:
+    kwargs = {
+        "secret_key": SECRET_KEY,
+        "same_site": "none" if IS_PROD else "lax",
+        "https_only": IS_PROD,
+    }
+    session_domain = os.getenv("SESSION_COOKIE_DOMAIN")
+    if session_domain:
+        kwargs["domain"] = session_domain
+    supported_params = inspect.signature(SessionMiddleware.__init__).parameters
+    return {key: value for key, value in kwargs.items() if key in supported_params}
+
 app.add_middleware(
     SessionMiddleware,
-    secret_key=SECRET_KEY,
-    same_site="none" if IS_PROD else "lax",
-    https_only=IS_PROD,
+    **_session_middleware_kwargs(),
 )
 
     
@@ -1258,11 +1281,14 @@ app.include_router(trades_router)           # /api/trades/*
 
 # Social trading feed features
 app.include_router(social_feed_router)      # /api/feed/*
+app.include_router(social_feed_social_router)  # /api/social/feed, /api/social/posts
 app.include_router(subscriptions_router)    # /api/subscriptions/*
 app.include_router(interactions_router)     # /api/interactions/*
 app.include_router(messaging_router)        # /api/messages/*
 app.include_router(ratings_router)          # /api/ratings/*
 app.include_router(traders_router)          # /api/traders/*
+app.include_router(traders_admin_router)    # /api/admin/traders/*
+app.include_router(traders_social_router)   # /api/social/traders/*
 app.include_router(notifications_router)    # /api/notifications/*
 
 # Premium-only — mount at /api/smart-buy
