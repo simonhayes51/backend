@@ -406,3 +406,27 @@ async def search_users_for_messaging(
     )
 
     return [dict(row) for row in rows]
+
+
+@router.get("/users/search")
+async def search_users_for_messaging_alias(
+    request: Request,
+    query: str = Query(..., min_length=1),
+    db: asyncpg.Connection = Depends(get_db)
+):
+    """
+    Alias: Search for users to start a conversation with
+    """
+    return await search_users_for_messaging(request=request, query=query, db=db)
+
+
+@router.get("/search/users")
+async def search_users_for_messaging_alt_alias(
+    request: Request,
+    query: str = Query(..., min_length=1),
+    db: asyncpg.Connection = Depends(get_db)
+):
+    """
+    Alias: Search for users to start a conversation with
+    """
+    return await search_users_for_messaging(request=request, query=query, db=db)
