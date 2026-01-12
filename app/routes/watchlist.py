@@ -11,17 +11,20 @@ def _pool(request):
     return pool
 
 @router.get("/api/watchlist")
-async def list_watchlist(request, player_id: Optional[int] = None) -> List[Dict[str,Any]]:
+async def list_watchlist(request: Request, card_id: Optional[int] = None) -> List[Dict[str,Any]]:
     pool = _pool(request)
-    uid = request.session.get("user_id") or request.headers.get("X-User-Id")
-    if not uid: raise HTTPException(401, "No user")
-    q = "SELECT * FROM watchlist_items WHERE user_id=$1 ORDER BY created_at DESC"
-    params = [uid]
-    if player_id:
-        q = "SELECT * FROM watchlist_items WHERE user_id=$1 AND player_id=$2 ORDER BY created_at DESC"
-        params.append(player_id)
+    uid = _uid_int(request)
+
+    q = "SELECT * FROM watchlist WHERE user_id=$1 ORDER BY started_at DESC"
+    params: List[Any] = [uid]
+
+    if card_id is not None:
+        q = "SELECT * FROM watchlist WHERE user_id=$1 AND card_id=$2 ORDER BY started_at DESC"
+        params.append(int(card_id))
+
     async with pool.acquire() as con:
         rows = await con.fetch(q, *params)
+
     return [dict(r) for r in rows]
 
 @router.post("/api/watchlist")
