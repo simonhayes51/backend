@@ -35,21 +35,23 @@ async def get_db():
 
 
 class TraderAssignRequest(BaseModel):
-    user_id: int
+    user_id: str   # was int
     profile: Optional[TraderProfileCreate] = None
 
 
 async def grant_trader_role(
     db: asyncpg.Connection,
-    user_id: int,
+    user_id: str,  # was int
     profile: Optional[TraderProfileCreate] = None
 ) -> dict:
     profile = profile or TraderProfileCreate()
+    user_id = str(user_id)  # safety
 
     existing_user = await db.fetchrow(
         "SELECT id, account_type FROM users WHERE id = $1",
         user_id
     )
+
     if not existing_user:
         raise HTTPException(status_code=404, detail="User not found")
 
