@@ -28,6 +28,7 @@ from app.routers.auth_me import router as auth_me_router
 from fastapi.responses import RedirectResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
+import inspect
 from pydantic import BaseModel, Field
 from app.auth.entitlements import compute_entitlements, require_feature
 from app.services.price_history import get_price_history
@@ -673,11 +674,21 @@ app.add_middleware(
     max_age=600,
 )
 
+def _session_middleware_kwargs() -> dict:
+    kwargs = {
+        "secret_key": SECRET_KEY,
+        "same_site": "none" if IS_PROD else "lax",
+        "https_only": IS_PROD,
+    }
+    session_domain = os.getenv("SESSION_COOKIE_DOMAIN")
+    if session_domain:
+        kwargs["domain"] = session_domain
+    supported_params = inspect.signature(SessionMiddleware.__init__).parameters
+    return {key: value for key, value in kwargs.items() if key in supported_params}
+
 app.add_middleware(
     SessionMiddleware,
-    secret_key=SECRET_KEY,
-    same_site="none" if IS_PROD else "lax",
-    https_only=IS_PROD,
+    **_session_middleware_kwargs(),
 )
 
 # Routers
