@@ -34,6 +34,17 @@ async def get_db():
         yield conn
 
 
+async def table_exists(db: asyncpg.Connection, table_name: str) -> bool:
+    return await db.fetchval("SELECT to_regclass($1)", table_name) is not None
+
+
+async def ensure_tables_exist(db: asyncpg.Connection, table_names: List[str]) -> bool:
+    for table_name in table_names:
+        if not await table_exists(db, table_name):
+            return False
+    return True
+
+
 @router.post("/posts", response_model=SocialPost)
 async def create_post(
     post: SocialPostCreate,
@@ -134,6 +145,24 @@ async def get_feed(
         user_id = None
         is_authenticated = False
 
+    base_tables = [
+        "public.social_posts",
+        "public.user_profiles",
+        "public.trader_profiles",
+    ]
+    if not await ensure_tables_exist(db, base_tables):
+        return {
+            "posts": [],
+            "total": 0,
+            "has_more": False,
+            "offset": offset,
+            "limit": limit
+        }
+
+    if is_authenticated and not await table_exists(db, "public.trader_subscriptions"):
+        is_authenticated = False
+        user_id = None
+
     try:
         # Build the query based on filters
         conditions = []
@@ -225,12 +254,16 @@ async def get_feed(
             "limit": limit
         }
 
+    can_read_reactions = is_authenticated and await table_exists(
+        db,
+        "public.post_reactions"
+    )
     posts = []
     for row in rows:
         post_dict = dict(row)
 
         # Get user's reaction to this post if authenticated
-        if is_authenticated:
+        if can_read_reactions:
             reaction = await db.fetchval(
                 "SELECT reaction_type FROM post_reactions WHERE user_id = $1 AND post_id = $2",
                 user_id,
