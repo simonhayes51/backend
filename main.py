@@ -53,6 +53,7 @@ from app.routers.trades import router as trades_router
 from app.routers.social_feed import router as social_feed_router
 from app.routers.social_feed import social_router as social_feed_social_router
 from app.routers.subscriptions import router as subscriptions_router
+from app.routers.subscriptions import social_router as subscriptions_social_router
 from app.routers.interactions import router as interactions_router
 from app.routers.messaging import router as messaging_router
 from app.routers.ratings import router as ratings_router
@@ -1263,6 +1264,7 @@ app.include_router(trades_router)           # /api/trades/*
 app.include_router(social_feed_router)      # /api/feed/*
 app.include_router(social_feed_social_router)  # /api/social/feed, /api/social/posts
 app.include_router(subscriptions_router)    # /api/subscriptions/*
+app.include_router(subscriptions_social_router)  # /api/social/subscriptions/*
 app.include_router(interactions_router)     # /api/interactions/*
 app.include_router(messaging_router)        # /api/messages/*
 app.include_router(ratings_router)          # /api/ratings/*
