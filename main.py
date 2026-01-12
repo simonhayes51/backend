@@ -1454,60 +1454,56 @@ async def callback(request: Request):
                # discord_user_id is the snowflake you already have in `user_id` here
         discord_user_id = int(user_id)
         
-                # Ensure user exists + get UUID (use the same pool/conn you already have)
+                        # --- Upsert user + profile, then set session ---
         async with request.app.state.pool.acquire() as conn:
+            # Ensure users row exists (core DB uses TEXT ids; simplest is discord_id as string id)
             user_row = await conn.fetchrow(
                 """
                 INSERT INTO public.users (id, discord_id)
                 VALUES ($1, $2)
-                ON CONFLICT (discord_id) DO UPDATE
-                    SET discord_id = EXCLUDED.discord_id
-                RETURNING id, discord_id, account_type, tier, plan, premium_until, roles
+                ON CONFLICT (discord_id) DO UPDATE SET discord_id = EXCLUDED.discord_id
+                RETURNING id, discord_id, tier, plan, premium_until, roles
                 """,
-                str(discord_id),   # id as TEXT
-                discord_id         # discord_id as BIGINT
+                str(discord_id),   # users.id is TEXT
+                discord_id         # users.discord_id is BIGINT
             )
-        
-        app_user_id = str(user_row["id"])  # TEXT/VARCHAR id
 
+            app_user_id = str(user_row["id"])
 
-            # Store/update user profile (NOTE: user_profiles.user_id is UUID)
+            # Upsert user profile (user_profiles.user_id is VARCHAR in your core DB)
             await conn.execute(
                 """
-                INSERT INTO user_profiles (user_id, username, avatar_url, global_name, updated_at)
+                INSERT INTO public.user_profiles (user_id, username, avatar_url, global_name, updated_at)
                 VALUES ($1, $2, $3, $4, NOW())
-                ON CONFLICT (user_id)
-                DO UPDATE SET
+                ON CONFLICT (user_id) DO UPDATE SET
                     username = EXCLUDED.username,
                     avatar_url = EXCLUDED.avatar_url,
                     global_name = EXCLUDED.global_name,
                     updated_at = NOW()
                 """,
-                user_uuid, username, avatar_url, global_name
+                app_user_id, username, avatar_url, global_name
             )
 
-        # Session: UUID is canonical
-        request.session["user_id"] = user_uuid
+        # Session
+        request.session["user_id"] = app_user_id
         request.session["discord_id"] = discord_id
         request.session["username"] = username
         request.session["avatar_url"] = avatar_url
         request.session["global_name"] = global_name
-
-        # Routers that expect request.session["user"]
         request.session["user"] = {
-            "id": user_uuid,          # UUID
-            "discord_id": discord_id, # BIGINT
+            "id": app_user_id,
+            "discord_id": discord_id,
             "username": username,
             "avatar_url": avatar_url,
             "global_name": global_name,
-            "account_type": user_row["account_type"],
-            "tier": user_row["tier"],
+            "tier": user_row.get("tier") if isinstance(user_row, dict) else user_row["tier"],
         }
 
-        # Discord roles call uses discord_id (snowflake)
+        # Discord roles lookup uses discord_id
         request.session["roles"] = await get_member_role_names(discord_id)
 
         return RedirectResponse(f"{FRONTEND_URL}/#/")
+
 
 
     except HTTPException:
