@@ -2,7 +2,7 @@
 Pydantic models for social trading feed features
 """
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, Field, validator
 from decimal import Decimal
 
@@ -24,7 +24,7 @@ class TraderProfileUpdate(BaseModel):
 
 
 class TraderProfile(BaseModel):
-    user_id: int
+    user_id: str
     bio: Optional[str]
     specialties: List[str]
     verified: bool
@@ -39,7 +39,7 @@ class TraderProfile(BaseModel):
 
 
 class TraderPublicProfile(BaseModel):
-    id: int
+    id: str
     username: str
     avatar_url: Optional[str]
     bio: Optional[str]
@@ -87,7 +87,7 @@ class SocialPostUpdate(BaseModel):
 
 class SocialPost(BaseModel):
     id: int
-    user_id: int
+    user_id: str
     post_type: str
     content: str
     player_name: Optional[str]
@@ -110,10 +110,13 @@ class SocialPostWithAuthor(SocialPost):
     username: str
     avatar_url: Optional[str]
     verified: bool
-    avg_rating: Optional[Decimal]
-    total_followers: Optional[int]
+    avg_rating: Optional[Decimal] = None
+    total_followers: Optional[int] = None
     user_reaction: Optional[str] = None  # 'like', 'dislike', or None
     is_author: bool = False  # True if current user is the author
+    title: Optional[str] = None
+    author: Optional[Dict[str, Any]] = None
+    stats: Optional[Dict[str, Any]] = None
 
 
 class FeedResponse(BaseModel):
@@ -129,13 +132,13 @@ class FeedResponse(BaseModel):
 # ============================================================================
 
 class SubscriptionCreate(BaseModel):
-    trader_id: int
+    trader_id: str
 
 
 class Subscription(BaseModel):
     id: int
-    subscriber_id: int
-    trader_id: int
+    subscriber_id: str
+    trader_id: str
     is_active: bool
     subscription_type: str
     stripe_subscription_id: Optional[str]
@@ -147,7 +150,7 @@ class Subscription(BaseModel):
 
 class SubscriptionWithTrader(BaseModel):
     id: int
-    trader_id: int
+    trader_id: str
     trader_username: str
     trader_avatar: Optional[str]
     verified: bool
@@ -173,7 +176,7 @@ class PostReactionCreate(BaseModel):
 
 class PostReaction(BaseModel):
     id: int
-    user_id: int
+    user_id: str
     post_id: int
     reaction_type: str
     created_at: datetime
@@ -192,7 +195,7 @@ class CommentUpdate(BaseModel):
 class Comment(BaseModel):
     id: int
     post_id: int
-    user_id: int
+    user_id: str
     parent_comment_id: Optional[int]
     content: str
     likes_count: int
@@ -207,6 +210,8 @@ class CommentWithAuthor(Comment):
     verified: Optional[bool]
     user_has_liked: bool = False
     is_author: bool = False
+    author: Optional[Dict[str, Any]] = None
+    likes: Optional[int] = None
 
 
 class CommentLikeCreate(BaseModel):
@@ -218,7 +223,7 @@ class CommentLikeCreate(BaseModel):
 # ============================================================================
 
 class RatingCreate(BaseModel):
-    trader_id: int
+    trader_id: str
     rating: int = Field(..., ge=1, le=5, description="Rating from 1 to 5 stars")
     review: Optional[str] = Field(None, max_length=1000)
 
@@ -230,8 +235,8 @@ class RatingUpdate(BaseModel):
 
 class Rating(BaseModel):
     id: int
-    trader_id: int
-    rater_id: int
+    trader_id: str
+    rater_id: str
     rating: int
     review: Optional[str]
     created_at: datetime
@@ -248,15 +253,15 @@ class RatingWithAuthor(Rating):
 # ============================================================================
 
 class MessageCreate(BaseModel):
-    recipient_id: int
+    recipient_id: str
     content: str = Field(..., min_length=1, max_length=5000)
 
 
 class Message(BaseModel):
     id: int
     conversation_id: int
-    sender_id: int
-    recipient_id: int
+    sender_id: str
+    recipient_id: str
     content: str
     read_at: Optional[datetime]
     created_at: datetime
@@ -268,23 +273,27 @@ class MessageWithUser(Message):
     sender_avatar: Optional[str]
     recipient_username: str
     recipient_avatar: Optional[str]
+    is_sender: bool = False
 
 
 class Conversation(BaseModel):
     id: int
-    user1_id: int
-    user2_id: int
+    user1_id: str
+    user2_id: str
     last_message_id: Optional[int]
     last_message_at: Optional[datetime]
     created_at: datetime
 
 
 class ConversationWithDetails(Conversation):
-    other_user_id: int
+    other_user_id: str
     other_user_username: str
     other_user_avatar: Optional[str]
     last_message_content: Optional[str]
     unread_count: int
+    title: Optional[str] = None
+    participant: Optional[Dict[str, Any]] = None
+    last_message: Optional[Dict[str, Any]] = None
 
 
 # ============================================================================
@@ -293,11 +302,11 @@ class ConversationWithDetails(Conversation):
 
 class Notification(BaseModel):
     id: int
-    user_id: int
+    user_id: str
     notification_type: str
     title: str
     message: str
-    related_user_id: Optional[int]
+    related_user_id: Optional[str]
     related_post_id: Optional[int]
     related_comment_id: Optional[int]
     related_message_id: Optional[int]

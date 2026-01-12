@@ -3,9 +3,10 @@ Social Feed Router - Trading tips, predictions, and social posts
 """
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from typing import Optional, List
-from datetime import datetime
+from datetime import datetime, timedelta
 import asyncpg
 from asyncpg import exceptions as asyncpg_exceptions
+from pydantic import BaseModel, Field
 
 from app.models.social import (
     SocialPostCreate,
@@ -14,7 +15,7 @@ from app.models.social import (
     SocialPostWithAuthor,
     FeedResponse,
 )
-from app.db import get_pool
+from app.db import get_db
 
 router = APIRouter(prefix="/api/feed", tags=["Social Feed"])
 social_router = APIRouter(prefix="/api/social", tags=["Social Feed"])
@@ -25,13 +26,6 @@ def get_current_user(request: Request):
     if "user" not in request.session:
         raise HTTPException(status_code=401, detail="Not authenticated")
     return request.session["user"]
-
-
-async def get_db():
-    """Database connection dependency"""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        yield conn
 
 
 async def table_exists(db: asyncpg.Connection, table_name: str) -> bool:
@@ -45,7 +39,82 @@ async def ensure_tables_exist(db: asyncpg.Connection, table_names: List[str]) ->
     return True
 
 
-@router.post("/posts", response_model=SocialPost)
+class FeedPostCreatePayload(BaseModel):
+    title: Optional[str] = None
+    content: str = Field(..., min_length=1, max_length=5000)
+    post_type: str
+    premium: bool = False
+    expires_in_hours: Optional[int] = None
+
+
+class FeedPostUpdatePayload(BaseModel):
+    title: Optional[str] = None
+    content: Optional[str] = Field(None, min_length=1, max_length=5000)
+    post_type: Optional[str] = None
+    premium: Optional[bool] = None
+    expires_in_hours: Optional[int] = None
+
+
+def _expires_at_from_hours(expires_in_hours: Optional[int]) -> Optional[datetime]:
+    if expires_in_hours is None:
+        return None
+    try:
+        hours = int(expires_in_hours)
+    except (TypeError, ValueError):
+        return None
+    if hours <= 0:
+        return None
+    return datetime.utcnow() + timedelta(hours=hours)
+
+
+def _format_post(row: dict) -> dict:
+    post = dict(row)
+    author_snapshot = {
+        "id": post.get("user_id"),
+        "username": post.get("username"),
+        "avatar_url": post.get("avatar_url"),
+        "is_verified": post.get("verified"),
+        "bio": post.get("trader_bio"),
+        "specialties": post.get("trader_specialties"),
+        "subscription_price": post.get("trader_subscription_price"),
+    }
+    post["title"] = post.get("title")
+    post["author"] = author_snapshot
+    post["stats"] = {
+        "likes": post.get("likes_count"),
+        "dislikes": post.get("dislikes_count"),
+        "comments": post.get("comments_count"),
+    }
+    return post
+
+
+async def _attach_author(db: asyncpg.Connection, post: dict) -> dict:
+    author = await db.fetchrow(
+        """
+        SELECT
+            up.username,
+            up.avatar_url,
+            COALESCE(tp.verified, FALSE) as verified,
+            tp.bio as trader_bio,
+            tp.specialties as trader_specialties,
+            tp.subscription_price as trader_subscription_price
+        FROM user_profiles up
+        LEFT JOIN trader_profiles tp ON up.user_id = tp.user_id
+        WHERE up.user_id = $1
+        """,
+        post.get("user_id"),
+    )
+    if author:
+        post["username"] = author["username"]
+        post["avatar_url"] = author["avatar_url"]
+        post["verified"] = author["verified"]
+        post["trader_bio"] = author["trader_bio"]
+        post["trader_specialties"] = author["trader_specialties"]
+        post["trader_subscription_price"] = author["trader_subscription_price"]
+    return post
+
+
+@router.post("/posts", response_model=SocialPostWithAuthor)
 async def create_post(
     post: SocialPostCreate,
     request: Request,
@@ -59,11 +128,17 @@ async def create_post(
 
     # Check if user is a trader
     account_type = await db.fetchval(
-        "SELECT account_type FROM users WHERE discord_id = $1",
+        "SELECT account_type FROM users WHERE id = $1",
         user_id
     )
+    is_trader = account_type == "trader"
+    if not is_trader:
+        is_trader = await db.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM trader_profiles WHERE user_id = $1)",
+            user_id
+        )
 
-    if account_type != "trader":
+    if not is_trader:
         raise HTTPException(
             status_code=403,
             detail="Only traders can create posts. Upgrade to a trader account."
@@ -96,14 +171,31 @@ async def create_post(
         post.expires_at,
     )
 
-    return dict(row)
+    post_dict = dict(row)
+    post_dict = await _attach_author(db, post_dict)
+    return _format_post(post_dict)
+
+
+@router.post("", response_model=SocialPostWithAuthor)
+async def create_post_root(
+    payload: FeedPostCreatePayload,
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db)
+):
+    social_post = SocialPostCreate(
+        post_type=payload.post_type,
+        content=payload.content,
+        is_premium=payload.premium,
+        expires_at=_expires_at_from_hours(payload.expires_in_hours),
+    )
+    return await create_post(post=social_post, request=request, db=db)
 
 
 @router.get("", response_model=FeedResponse)
 async def get_feed_root(
     request: Request,
     feed_type: str = Query("all", description="all, trades, predictions"),
-    trader_id: Optional[int] = Query(None, description="Filter by specific trader"),
+    trader_id: Optional[str] = Query(None, description="Filter by specific trader"),
     offset: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
     db: asyncpg.Connection = Depends(get_db)
@@ -125,7 +217,7 @@ async def get_feed_root(
 async def get_feed(
     request: Request,
     feed_type: str = Query("all", description="all, trades, predictions"),
-    trader_id: Optional[int] = Query(None, description="Filter by specific trader"),
+    trader_id: Optional[str] = Query(None, description="Filter by specific trader"),
     offset: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
     db: asyncpg.Connection = Depends(get_db)
@@ -214,27 +306,17 @@ async def get_feed(
                 COALESCE(tp.verified, FALSE) as verified,
                 tp.avg_rating,
                 tp.total_followers,
+                tp.bio as trader_bio,
+                tp.specialties as trader_specialties,
+                tp.subscription_price as trader_subscription_price,
                 CASE WHEN sp.user_id = ${param_idx + 2} THEN TRUE ELSE FALSE END as is_author
             FROM social_posts sp
-            JOIN user_profiles up ON sp.discord_id = up.discord_id
-            LEFT JOIN trader_profiles tp ON sp.discord_id = tp.discord_id
+            JOIN user_profiles up ON sp.user_id = up.user_id
+            LEFT JOIN trader_profiles tp ON sp.user_id = tp.user_id
             WHERE {where_clause}
             ORDER BY sp.created_at DESC
             LIMIT ${param_idx} OFFSET ${param_idx + 1}
         """
-
-        # Add user_id for is_author check (or NULL if not authenticated)
-        query_params = params + [user_id if is_authenticated else None]
-
-        rows = await db.fetch(query, *query_params)
-    except asyncpg_exceptions.UndefinedTableError:
-        return {
-            "posts": [],
-            "total": 0,
-            "has_more": False,
-            "offset": offset,
-            "limit": limit
-        }
 
         # Add user_id for is_author check (or NULL if not authenticated)
         query_params = params + [user_id if is_authenticated else None]
@@ -268,7 +350,7 @@ async def get_feed(
         else:
             post_dict["user_reaction"] = None
 
-        posts.append(post_dict)
+        posts.append(_format_post(post_dict))
 
     return {
         "posts": posts,
@@ -283,7 +365,7 @@ async def get_feed(
 async def get_social_feed(
     request: Request,
     feed_type: str = Query("all", description="all, trades, predictions"),
-    trader_id: Optional[int] = Query(None, description="Filter by specific trader"),
+    trader_id: Optional[str] = Query(None, description="Filter by specific trader"),
     offset: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
     db: asyncpg.Connection = Depends(get_db)
@@ -305,7 +387,7 @@ async def get_social_feed(
 async def get_social_posts(
     request: Request,
     feed_type: str = Query("all", description="all, trades, predictions"),
-    trader_id: Optional[int] = Query(None, description="Filter by specific trader"),
+    trader_id: Optional[str] = Query(None, description="Filter by specific trader"),
     offset: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
     db: asyncpg.Connection = Depends(get_db)
@@ -323,7 +405,7 @@ async def get_social_posts(
     )
 
 
-@social_router.post("/posts", response_model=SocialPost)
+@social_router.post("/posts", response_model=SocialPostWithAuthor)
 async def create_social_post(
     post: SocialPostCreate,
     request: Request,
@@ -333,6 +415,15 @@ async def create_social_post(
     Create a new social post (social alias)
     """
     return await create_post(post=post, request=request, db=db)
+
+
+@social_router.post("/feed", response_model=SocialPostWithAuthor)
+async def create_social_post_feed(
+    payload: FeedPostCreatePayload,
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db),
+):
+    return await create_post_root(payload=payload, request=request, db=db)
 
 
 @router.get("/posts/{post_id}", response_model=SocialPostWithAuthor)
@@ -410,10 +501,10 @@ async def get_post(
         post_dict["user_reaction"] = None
         post_dict["is_author"] = False
 
-    return post_dict
+    return _format_post(post_dict)
 
 
-@router.patch("/posts/{post_id}", response_model=SocialPost)
+@router.patch("/posts/{post_id}", response_model=SocialPostWithAuthor)
 async def update_post(
     post_id: int,
     post_update: SocialPostUpdate,
@@ -472,7 +563,88 @@ async def update_post(
     """
 
     row = await db.fetchrow(query, *params)
-    return dict(row)
+    post_dict = dict(row)
+    post_dict = await _attach_author(db, post_dict)
+    return _format_post(post_dict)
+
+
+@router.post("/{post_id}")
+async def update_post_root(
+    post_id: int,
+    payload: FeedPostUpdatePayload,
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db),
+):
+    user = get_current_user(request)
+    user_id = user["id"]
+
+    post_owner = await db.fetchval(
+        "SELECT user_id FROM social_posts WHERE id = $1",
+        post_id
+    )
+
+    if not post_owner:
+        raise HTTPException(status_code=404, detail="Post not found")
+
+    if post_owner != user_id:
+        raise HTTPException(status_code=403, detail="Not authorized to edit this post")
+
+    updates = []
+    params = []
+    param_idx = 1
+
+    if payload.content is not None:
+        updates.append(f"content = ${param_idx}")
+        params.append(payload.content)
+        param_idx += 1
+
+    if payload.post_type is not None:
+        updates.append(f"post_type = ${param_idx}")
+        params.append(payload.post_type)
+        param_idx += 1
+
+    if payload.premium is not None:
+        updates.append(f"is_premium = ${param_idx}")
+        params.append(payload.premium)
+        param_idx += 1
+
+    if payload.expires_in_hours is not None:
+        updates.append(f"expires_at = ${param_idx}")
+        params.append(_expires_at_from_hours(payload.expires_in_hours))
+        param_idx += 1
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="No updates provided")
+
+    updates.append("updated_at = NOW()")
+    params.append(post_id)
+
+    query = f"""
+        UPDATE social_posts
+        SET {', '.join(updates)}
+        WHERE id = ${param_idx}
+        RETURNING *
+    """
+
+    row = await db.fetchrow(query, *params)
+    post_dict = dict(row)
+    post_dict = await _attach_author(db, post_dict)
+    return _format_post(post_dict)
+
+
+@social_router.post("/posts/{post_id}")
+async def update_post_social_alias(
+    post_id: int,
+    payload: FeedPostUpdatePayload,
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db),
+):
+    return await update_post_root(
+        post_id=post_id,
+        payload=payload,
+        request=request,
+        db=db,
+    )
 
 
 @router.delete("/posts/{post_id}")
@@ -503,6 +675,15 @@ async def delete_post(
     await db.execute("DELETE FROM social_posts WHERE id = $1", post_id)
 
     return {"message": "Post deleted successfully"}
+
+
+@router.delete("/{post_id}")
+async def delete_post_root(
+    post_id: int,
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db)
+):
+    return await delete_post(post_id=post_id, request=request, db=db)
 
 
 @router.get("/posts/{post_id}/stats")
