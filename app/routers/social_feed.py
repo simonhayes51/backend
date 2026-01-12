@@ -216,8 +216,8 @@ async def get_feed(
                 tp.total_followers,
                 CASE WHEN sp.user_id = ${param_idx + 2} THEN TRUE ELSE FALSE END as is_author
             FROM social_posts sp
-            JOIN user_profiles up ON sp.user_id = up.user_id
-            LEFT JOIN trader_profiles tp ON sp.user_id = tp.user_id
+            JOIN user_profiles up ON sp.discord_id = up.discord_id
+            LEFT JOIN trader_profiles tp ON sp.discord_id = tp.discord_id
             WHERE {where_clause}
             ORDER BY sp.created_at DESC
             LIMIT ${param_idx} OFFSET ${param_idx + 1}
