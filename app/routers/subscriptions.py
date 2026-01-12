@@ -1,9 +1,10 @@
 """
 Trader Subscriptions Router - Follow and subscribe to traders
 """
-from fastapi import APIRouter, Depends, HTTPException, Request, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from typing import List
 import asyncpg
+from asyncpg import exceptions as asyncpg_exceptions
 
 from app.models.social import (
     SubscriptionCreate,
@@ -13,6 +14,7 @@ from app.models.social import (
 from app.db import get_pool
 
 router = APIRouter(prefix="/api/subscriptions", tags=["Subscriptions"])
+social_router = APIRouter(prefix="/api/social/subscriptions", tags=["Subscriptions"])
 
 
 def get_current_user(request: Request):
@@ -27,6 +29,17 @@ async def get_db():
     pool = await get_pool()
     async with pool.acquire() as conn:
         yield conn
+
+
+async def table_exists(db: asyncpg.Connection, table_name: str) -> bool:
+    return await db.fetchval("SELECT to_regclass($1)", table_name) is not None
+
+
+async def ensure_tables_exist(db: asyncpg.Connection, table_names: List[str]) -> bool:
+    for table_name in table_names:
+        if not await table_exists(db, table_name):
+            return False
+    return True
 
 
 @router.post("/subscribe", response_model=Subscription)
@@ -303,6 +316,18 @@ async def get_recommended_traders(
         user_id = None
         is_authenticated = False
 
+    required_tables = [
+        "public.users",
+        "public.user_profiles",
+        "public.trader_profiles",
+    ]
+    if not await ensure_tables_exist(db, required_tables):
+        return []
+
+    if is_authenticated and not await table_exists(db, "public.trader_subscriptions"):
+        is_authenticated = False
+        user_id = None
+
     # Get traders user is not following yet (or all if not authenticated)
     if is_authenticated:
         query = """
@@ -334,7 +359,10 @@ async def get_recommended_traders(
                 tp.total_posts DESC
             LIMIT $2
         """
-        rows = await db.fetch(query, user_id, limit)
+        try:
+            rows = await db.fetch(query, user_id, limit)
+        except asyncpg_exceptions.UndefinedTableError:
+            return []
     else:
         query = """
             SELECT
@@ -360,6 +388,33 @@ async def get_recommended_traders(
                 tp.total_posts DESC
             LIMIT $1
         """
-        rows = await db.fetch(query, limit)
+        try:
+            rows = await db.fetch(query, limit)
+        except asyncpg_exceptions.UndefinedTableError:
+            return []
 
     return [dict(row) for row in rows]
+
+
+@router.get("/recommended")
+async def get_recommended_traders_alias(
+    request: Request,
+    limit: int = Query(10, ge=1, le=50),
+    db: asyncpg.Connection = Depends(get_db)
+):
+    """
+    Alias: Get recommended traders to follow
+    """
+    return await get_recommended_traders(request=request, limit=limit, db=db)
+
+
+@social_router.get("/recommended")
+async def get_social_recommended_traders(
+    request: Request,
+    limit: int = Query(10, ge=1, le=50),
+    db: asyncpg.Connection = Depends(get_db)
+):
+    """
+    Social alias: Get recommended traders to follow
+    """
+    return await get_recommended_traders(request=request, limit=limit, db=db)

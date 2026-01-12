@@ -4,6 +4,7 @@ Trader Ratings Router - Rate and review traders
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from typing import List
 import asyncpg
+from asyncpg import exceptions as asyncpg_exceptions
 
 from app.models.social import (
     RatingCreate,
@@ -28,6 +29,17 @@ async def get_db():
     pool = await get_pool()
     async with pool.acquire() as conn:
         yield conn
+
+
+async def table_exists(db: asyncpg.Connection, table_name: str) -> bool:
+    return await db.fetchval("SELECT to_regclass($1)", table_name) is not None
+
+
+async def ensure_tables_exist(db: asyncpg.Connection, table_names: List[str]) -> bool:
+    for table_name in table_names:
+        if not await table_exists(db, table_name):
+            return False
+    return True
 
 
 @router.post("/rate", response_model=Rating)
@@ -273,5 +285,16 @@ async def get_top_rated_traders(
         LIMIT $2
     """
 
-    rows = await db.fetch(query, min_ratings, limit)
+    required_tables = [
+        "public.users",
+        "public.user_profiles",
+        "public.trader_profiles",
+    ]
+    if not await ensure_tables_exist(db, required_tables):
+        return []
+
+    try:
+        rows = await db.fetch(query, min_ratings, limit)
+    except asyncpg_exceptions.UndefinedTableError:
+        return []
     return [dict(row) for row in rows]
