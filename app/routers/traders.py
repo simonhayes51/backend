@@ -3,6 +3,7 @@ Traders Router - Discover, browse, and manage trader profiles
 """
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from typing import List, Optional
+from pydantic import BaseModel
 import asyncpg
 
 from app.models.social import (
@@ -15,6 +16,8 @@ from app.models.social import (
 from app.db import get_pool
 
 router = APIRouter(prefix="/api/traders", tags=["Traders"])
+admin_router = APIRouter(prefix="/api/admin/traders", tags=["Traders"])
+social_router = APIRouter(prefix="/api/social/traders", tags=["Traders"])
 
 
 def get_current_user(request):
@@ -29,6 +32,50 @@ async def get_db():
     pool = await get_pool()
     async with pool.acquire() as conn:
         yield conn
+
+
+class TraderAssignRequest(BaseModel):
+    user_id: int
+    profile: Optional[TraderProfileCreate] = None
+
+
+async def grant_trader_role(
+    db: asyncpg.Connection,
+    user_id: int,
+    profile: Optional[TraderProfileCreate] = None
+) -> dict:
+    profile = profile or TraderProfileCreate()
+
+    existing_user = await db.fetchrow(
+        "SELECT id, account_type FROM users WHERE id = $1",
+        user_id
+    )
+    if not existing_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    async with db.transaction():
+        await db.execute(
+            "UPDATE users SET account_type = 'trader' WHERE id = $1",
+            user_id
+        )
+        await db.execute(
+            """
+            INSERT INTO trader_profiles (user_id, bio, specialties, subscription_price)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (user_id)
+            DO UPDATE SET
+                bio = EXCLUDED.bio,
+                specialties = EXCLUDED.specialties,
+                subscription_price = EXCLUDED.subscription_price,
+                updated_at = NOW()
+            """,
+            user_id,
+            profile.bio,
+            profile.specialties or [],
+            profile.subscription_price or 0
+        )
+
+    return {"message": "Trader role granted", "user_id": user_id}
 
 
 @router.post("/upgrade-to-trader")
@@ -79,6 +126,88 @@ async def upgrade_to_trader(
         "message": "Successfully upgraded to trader account",
         "profile": dict(row)
     }
+
+
+@router.post("/upgrade")
+async def upgrade_to_trader_alias(
+    profile: TraderProfileCreate,
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db)
+):
+    """
+    Alias: Upgrade user account to trader account
+    """
+    return await upgrade_to_trader(profile=profile, request=request, db=db)
+
+
+@router.post("/request")
+async def request_trader_upgrade(
+    profile: TraderProfileCreate,
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db)
+):
+    """
+    Alias: Request trader upgrade
+    """
+    return await upgrade_to_trader(profile=profile, request=request, db=db)
+
+
+@router.post("/apply")
+async def apply_for_trader_upgrade(
+    profile: TraderProfileCreate,
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db)
+):
+    """
+    Alias: Apply for trader upgrade
+    """
+    return await upgrade_to_trader(profile=profile, request=request, db=db)
+
+
+@router.get("/requests")
+async def list_trader_requests(
+    db: asyncpg.Connection = Depends(get_db)
+):
+    """
+    List pending trader requests (placeholder)
+    """
+    return []
+
+
+@router.post("/requests/{request_id}/approve")
+async def approve_trader_request(
+    request_id: int,
+    db: asyncpg.Connection = Depends(get_db)
+):
+    """
+    Approve a trader request by user id
+    """
+    return await grant_trader_role(db=db, user_id=request_id)
+
+
+@router.post("/requests/{request_id}/reject")
+async def reject_trader_request(
+    request_id: int
+):
+    """
+    Reject a trader request by user id
+    """
+    return {"message": "Trader request rejected", "user_id": request_id}
+
+
+@router.post("/assign")
+async def assign_trader_role(
+    payload: TraderAssignRequest,
+    db: asyncpg.Connection = Depends(get_db)
+):
+    """
+    Assign trader role to a user
+    """
+    return await grant_trader_role(
+        db=db,
+        user_id=payload.user_id,
+        profile=payload.profile
+    )
 
 
 @router.patch("/profile")
@@ -472,3 +601,107 @@ async def get_available_specialties(
             specialties.append(specialty)
 
     return {"specialties": sorted(specialties)}
+
+
+@admin_router.get("/requests")
+async def list_trader_requests_admin(
+    db: asyncpg.Connection = Depends(get_db)
+):
+    """
+    Admin: List pending trader requests (placeholder)
+    """
+    return await list_trader_requests(db=db)
+
+
+@admin_router.post("/requests/{request_id}/approve")
+async def approve_trader_request_admin(
+    request_id: int,
+    db: asyncpg.Connection = Depends(get_db)
+):
+    """
+    Admin: Approve trader request
+    """
+    return await grant_trader_role(db=db, user_id=request_id)
+
+
+@admin_router.post("/requests/{request_id}/reject")
+async def reject_trader_request_admin(
+    request_id: int
+):
+    """
+    Admin: Reject trader request
+    """
+    return {"message": "Trader request rejected", "user_id": request_id}
+
+
+@admin_router.post("/assign")
+async def assign_trader_role_admin(
+    payload: TraderAssignRequest,
+    db: asyncpg.Connection = Depends(get_db)
+):
+    """
+    Admin: Assign trader role to a user
+    """
+    return await grant_trader_role(
+        db=db,
+        user_id=payload.user_id,
+        profile=payload.profile
+    )
+
+
+@social_router.get("/requests")
+async def list_trader_requests_social(
+    db: asyncpg.Connection = Depends(get_db)
+):
+    """
+    Social: List pending trader requests (placeholder)
+    """
+    return await list_trader_requests(db=db)
+
+
+@social_router.post("/requests/{request_id}/approve")
+async def approve_trader_request_social(
+    request_id: int,
+    db: asyncpg.Connection = Depends(get_db)
+):
+    """
+    Social: Approve trader request
+    """
+    return await grant_trader_role(db=db, user_id=request_id)
+
+
+@social_router.post("/requests/{request_id}/reject")
+async def reject_trader_request_social(
+    request_id: int
+):
+    """
+    Social: Reject trader request
+    """
+    return {"message": "Trader request rejected", "user_id": request_id}
+
+
+@social_router.post("/assign")
+async def assign_trader_role_social(
+    payload: TraderAssignRequest,
+    db: asyncpg.Connection = Depends(get_db)
+):
+    """
+    Social: Assign trader role to a user
+    """
+    return await grant_trader_role(
+        db=db,
+        user_id=payload.user_id,
+        profile=payload.profile
+    )
+
+
+@social_router.post("")
+async def social_trader_upgrade(
+    profile: TraderProfileCreate,
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db)
+):
+    """
+    Social: Upgrade user account to trader account
+    """
+    return await upgrade_to_trader(profile=profile, request=request, db=db)
