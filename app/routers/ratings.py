@@ -125,7 +125,7 @@ async def rate_trader(
 
 @router.get("/trader/{trader_id}", response_model=List[RatingWithAuthor])
 async def get_trader_ratings(
-    trader_id: int,
+    trader_id: str,
     offset: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
     db: asyncpg.Connection = Depends(get_db)
@@ -160,7 +160,7 @@ async def get_trader_ratings(
 
 @router.get("/trader/{trader_id}/summary")
 async def get_trader_rating_summary(
-    trader_id: int,
+    trader_id: str,
     db: asyncpg.Connection = Depends(get_db)
 ):
     """
@@ -197,7 +197,7 @@ async def get_trader_rating_summary(
 
 @router.get("/my-rating/{trader_id}")
 async def get_my_rating(
-    trader_id: int,
+    trader_id: str,
     request: Request,
     db: asyncpg.Connection = Depends(get_db)
 ):
@@ -227,7 +227,7 @@ async def get_my_rating(
 
 @router.delete("/rating/{trader_id}")
 async def delete_rating(
-    trader_id: int,
+    trader_id: str,
     request: Request,
     db: asyncpg.Connection = Depends(get_db)
 ):

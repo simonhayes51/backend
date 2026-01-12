@@ -14,7 +14,7 @@ from app.models.social import (
     SocialPostWithAuthor,
     FeedResponse,
 )
-from app.db import get_pool
+from app.db import get_db
 
 router = APIRouter(prefix="/api/feed", tags=["Social Feed"])
 social_router = APIRouter(prefix="/api/social", tags=["Social Feed"])
@@ -25,13 +25,6 @@ def get_current_user(request: Request):
     if "user" not in request.session:
         raise HTTPException(status_code=401, detail="Not authenticated")
     return request.session["user"]
-
-
-async def get_db():
-    """Database connection dependency"""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        yield conn
 
 
 async def table_exists(db: asyncpg.Connection, table_name: str) -> bool:
@@ -59,7 +52,7 @@ async def create_post(
 
     # Check if user is a trader
     account_type = await db.fetchval(
-        "SELECT account_type FROM users WHERE discord_id = $1",
+        "SELECT account_type FROM users WHERE id = $1",
         user_id
     )
 
@@ -103,7 +96,7 @@ async def create_post(
 async def get_feed_root(
     request: Request,
     feed_type: str = Query("all", description="all, trades, predictions"),
-    trader_id: Optional[int] = Query(None, description="Filter by specific trader"),
+    trader_id: Optional[str] = Query(None, description="Filter by specific trader"),
     offset: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
     db: asyncpg.Connection = Depends(get_db)
@@ -125,7 +118,7 @@ async def get_feed_root(
 async def get_feed(
     request: Request,
     feed_type: str = Query("all", description="all, trades, predictions"),
-    trader_id: Optional[int] = Query(None, description="Filter by specific trader"),
+    trader_id: Optional[str] = Query(None, description="Filter by specific trader"),
     offset: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
     db: asyncpg.Connection = Depends(get_db)
@@ -216,8 +209,8 @@ async def get_feed(
                 tp.total_followers,
                 CASE WHEN sp.user_id = ${param_idx + 2} THEN TRUE ELSE FALSE END as is_author
             FROM social_posts sp
-            JOIN user_profiles up ON sp.discord_id = up.discord_id
-            LEFT JOIN trader_profiles tp ON sp.discord_id = tp.discord_id
+            JOIN user_profiles up ON sp.user_id = up.user_id
+            LEFT JOIN trader_profiles tp ON sp.user_id = tp.user_id
             WHERE {where_clause}
             ORDER BY sp.created_at DESC
             LIMIT ${param_idx} OFFSET ${param_idx + 1}
@@ -283,7 +276,7 @@ async def get_feed(
 async def get_social_feed(
     request: Request,
     feed_type: str = Query("all", description="all, trades, predictions"),
-    trader_id: Optional[int] = Query(None, description="Filter by specific trader"),
+    trader_id: Optional[str] = Query(None, description="Filter by specific trader"),
     offset: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
     db: asyncpg.Connection = Depends(get_db)
@@ -305,7 +298,7 @@ async def get_social_feed(
 async def get_social_posts(
     request: Request,
     feed_type: str = Query("all", description="all, trades, predictions"),
-    trader_id: Optional[int] = Query(None, description="Filter by specific trader"),
+    trader_id: Optional[str] = Query(None, description="Filter by specific trader"),
     offset: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
     db: asyncpg.Connection = Depends(get_db)

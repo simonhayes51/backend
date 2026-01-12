@@ -125,7 +125,7 @@ async def subscribe_to_trader(
 
 @router.delete("/unsubscribe/{trader_id}")
 async def unsubscribe_from_trader(
-    trader_id: int,
+    trader_id: str,
     request: Request,
     db: asyncpg.Connection = Depends(get_db)
 ):
@@ -231,7 +231,7 @@ async def get_my_followers(
 
 @router.get("/check/{trader_id}")
 async def check_subscription(
-    trader_id: int,
+    trader_id: str,
     request: Request,
     db: asyncpg.Connection = Depends(get_db)
 ):
