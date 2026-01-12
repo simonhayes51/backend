@@ -1458,15 +1458,18 @@ async def callback(request: Request):
         async with request.app.state.pool.acquire() as conn:
             user_row = await conn.fetchrow(
                 """
-                INSERT INTO users (discord_id)
-                VALUES ($1)
-                ON CONFLICT (discord_id) DO UPDATE SET discord_id = EXCLUDED.discord_id
+                INSERT INTO public.users (id, discord_id)
+                VALUES ($1, $2)
+                ON CONFLICT (discord_id) DO UPDATE
+                    SET discord_id = EXCLUDED.discord_id
                 RETURNING id, discord_id, account_type, tier, plan, premium_until, roles
                 """,
-                discord_id
+                str(discord_id),   # id as TEXT
+                discord_id         # discord_id as BIGINT
             )
+        
+        app_user_id = str(user_row["id"])  # TEXT/VARCHAR id
 
-            user_uuid = str(user_row["id"])
 
             # Store/update user profile (NOTE: user_profiles.user_id is UUID)
             await conn.execute(
