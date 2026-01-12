@@ -12,7 +12,7 @@ from app.models.social import (
     Conversation,
     ConversationWithDetails,
 )
-from app.db import get_pool
+from app.db import get_db
 
 router = APIRouter(prefix="/api/messages", tags=["Messaging"])
 
@@ -24,25 +24,16 @@ def get_current_user(request):
     return request.session["user"]
 
 
-async def get_db():
-    """Database connection dependency"""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        yield conn
-
-
 async def get_or_create_conversation(
     db: asyncpg.Connection,
-    user1_id: int,
-    user2_id: int
+    user1_id: str,
+    user2_id: str
 ) -> int:
     """
     Get or create a conversation between two users
     Always stores user IDs with smaller ID first (user1_id < user2_id)
     """
-    # Ensure user1_id < user2_id
-    if user1_id > user2_id:
-        user1_id, user2_id = user2_id, user1_id
+    user1_id, user2_id = sorted([user1_id, user2_id])
 
     # Check if conversation exists
     conversation_id = await db.fetchval(
@@ -200,7 +191,7 @@ async def get_conversations(
 
 @router.get("/conversations/{other_user_id}/messages", response_model=List[MessageWithUser])
 async def get_conversation_messages(
-    other_user_id: int,
+    other_user_id: str,
     request: Request,
     offset: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=100),
@@ -213,8 +204,7 @@ async def get_conversation_messages(
     user_id = user["id"]
 
     # Get conversation ID
-    user1_id = min(user_id, other_user_id)
-    user2_id = max(user_id, other_user_id)
+    user1_id, user2_id = sorted([user_id, other_user_id])
 
     conversation = await db.fetchrow(
         "SELECT * FROM conversations WHERE user1_id = $1 AND user2_id = $2",

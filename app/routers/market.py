@@ -1,7 +1,7 @@
 # app/routers/market.py 
 from fastapi import APIRouter, Depends, HTTPException
 from typing import List, Dict, Any
-from app.db import get_db
+from app.db import get_player_db
 from app.services.indicators import ema, rsi, bollinger, atr
 
 router = APIRouter(prefix="/api/market", tags=["Market"])
@@ -12,35 +12,32 @@ router = APIRouter(prefix="/api/market", tags=["Market"])
 async def get_current_price(
     player_card_id: str,
     platform: str = "ps",
-    db=Depends(get_db),
+    db=Depends(get_player_db),
 ) -> Dict[str, Any]:
     """Get current market price for a player"""
     try:
-        from main import app
-        
         # Get from fut_players table
-        async with app.state.player_pool.acquire() as pconn:
-            player_row = await pconn.fetchrow(
-                "SELECT price_num, price, name FROM fut_players WHERE card_id=$1",
-                player_card_id
-            )
-            
-            if player_row:
-                price = None
-                if player_row["price_num"]:
-                    price = int(player_row["price_num"])
-                elif player_row["price"] and str(player_row["price"]).isdigit():
-                    price = int(player_row["price"])
-                
-                if price:
-                    from datetime import datetime
-                    return {
-                        "player_card_id": player_card_id,
-                        "platform": platform,
-                        "price": price,
-                        "player_name": player_row["name"],
-                        "timestamp": datetime.now().isoformat()
-                    }
+        player_row = await db.fetchrow(
+            "SELECT price_num, price, name FROM fut_players WHERE card_id=$1",
+            player_card_id
+        )
+
+        if player_row:
+            price = None
+            if player_row["price_num"]:
+                price = int(player_row["price_num"])
+            elif player_row["price"] and str(player_row["price"]).isdigit():
+                price = int(player_row["price"])
+
+            if price:
+                from datetime import datetime
+                return {
+                    "player_card_id": player_card_id,
+                    "platform": platform,
+                    "price": price,
+                    "player_name": player_row["name"],
+                    "timestamp": datetime.now().isoformat()
+                }
         
         # Fallback: try candle data
         candle_row = await db.fetchrow(
@@ -77,7 +74,7 @@ async def get_candles(
     platform: str = "ps",
     timeframe: str = "15m",
     limit: int = 300,
-    db=Depends(get_db),
+    db=Depends(get_player_db),
 ) -> List[Dict[str, Any]]:
     try:
         rows = await db.fetch(
@@ -99,7 +96,7 @@ async def get_indicators(
     player_card_id: str,
     platform: str = "ps",
     timeframe: str = "15m",
-    db=Depends(get_db),
+    db=Depends(get_player_db),
 ) -> Dict[str, Any]:
     rows = await db.fetch(
         """
@@ -131,7 +128,7 @@ async def get_indicators(
 @router.get("/sentiment")
 async def get_market_sentiment(
     timeframe: str = "24h",
-    db=Depends(get_db),
+    db=Depends(get_player_db),
 ) -> Dict[str, Any]:
     """
     Aggregate sentiment scores from social sources and trading activity.

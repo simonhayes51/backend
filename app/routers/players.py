@@ -3,28 +3,15 @@
 from __future__ import annotations
 
 import aiohttp
-from typing import AsyncGenerator, Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 # If you already have this service, it's safe to import (it doesn't import main)
 from app.services.price_history import get_price_history
+from app.db import get_player_db
 
 router = APIRouter(prefix="/api/players", tags=["players"])
-
-# ------------------------------
-# DB dependency (NO import from main.py)
-# ------------------------------
-async def get_player_db(request: Request) -> AsyncGenerator:
-    """
-    Use the player pool attached on app.state in main.lifespan.
-    Avoids importing from main and prevents circular imports.
-    """
-    pool = getattr(request.app.state, "player_pool", None)
-    if pool is None:
-        raise HTTPException(status_code=503, detail="player_pool not initialized")
-    async with pool.acquire() as conn:
-        yield conn
 
 # ------------------------------
 # Helpers
