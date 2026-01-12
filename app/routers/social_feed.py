@@ -59,7 +59,7 @@ async def create_post(
 
     # Check if user is a trader
     account_type = await db.fetchval(
-        "SELECT account_type FROM users WHERE id = $1",
+        "SELECT account_type FROM users WHERE discord_id = $1",
         user_id
     )
 
