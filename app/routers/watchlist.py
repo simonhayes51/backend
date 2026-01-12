@@ -29,14 +29,23 @@ async def get_player_db(request: Request) -> AsyncGenerator:
     async with pool.acquire() as conn:
         yield conn
 
-def _uid(request: Request) -> int:
+async def _uid(request: Request, wdb: asyncpg.Connection) -> str | int:
     uid = request.session.get("user_id")
     if not uid:
         raise HTTPException(401, "Not authenticated")
-    try:
-        return int(uid)
-    except (TypeError, ValueError):
-        raise HTTPException(400, "Invalid user id")
+    column_type = await wdb.fetchval(
+        """
+        SELECT data_type
+        FROM information_schema.columns
+        WHERE table_name = 'watchlist' AND column_name = 'user_id'
+        """
+    )
+    if column_type in ("bigint", "integer", "smallint"):
+        try:
+            return int(uid)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "Invalid user id")
+    return str(uid)
 
 # ------------ FUT.GG price fetch (self-contained; no import from main) --------
 FUTGG_BASE = "https://www.fut.gg/api/fut/player-prices/26"
@@ -110,7 +119,7 @@ async def list_watch_items(
     wdb = Depends(get_watch_db),
     pdb = Depends(get_player_db),
 ):
-    uid = _uid(request)
+    uid = await _uid(request, wdb)
     rows = await wdb.fetch(
         "SELECT * FROM watchlist WHERE user_id=$1 ORDER BY started_at DESC NULLS LAST",
         uid,
@@ -183,7 +192,7 @@ async def list_watch_items(
 @router.get("/usage")
 async def usage(request: Request, wdb = Depends(get_watch_db)):
     ent = await compute_entitlements(request)
-    uid = _uid(request)
+    uid = await _uid(request, wdb)
     used = await wdb.fetchval("SELECT COUNT(*) FROM watchlist WHERE user_id=$1", uid)
     return {
         "used": int(used or 0),
@@ -194,7 +203,7 @@ async def usage(request: Request, wdb = Depends(get_watch_db)):
 @router.post("")
 async def add_watch_item(payload: WatchlistCreate, request: Request, wdb = Depends(get_watch_db)):
     ent = await compute_entitlements(request)
-    uid = _uid(request)
+    uid = await _uid(request, wdb)
 
     used = await wdb.fetchval("SELECT COUNT(*) FROM watchlist WHERE user_id=$1", uid)
     max_allowed = int(ent["limits"]["watchlist_max"])
@@ -249,7 +258,7 @@ async def add_watch_item(payload: WatchlistCreate, request: Request, wdb = Depen
 
 @router.delete("/{watch_id}")
 async def delete_watch_item(watch_id: int, request: Request, wdb = Depends(get_watch_db)):
-    uid = _uid(request)
+    uid = await _uid(request, wdb)
     res = await wdb.execute("DELETE FROM watchlist WHERE id=$1 AND user_id=$2", watch_id, uid)
     if res == "DELETE 0":
         raise HTTPException(404, "Watch item not found")
@@ -262,7 +271,7 @@ async def refresh_watch_item(
     wdb = Depends(get_watch_db),
     pdb = Depends(get_player_db),
 ):
-    uid = _uid(request)
+    uid = await _uid(request, wdb)
     w = await wdb.fetchrow("SELECT * FROM watchlist WHERE id=$1 AND user_id=$2", watch_id, uid)
     if not w:
         raise HTTPException(404, "Watch item not found")

@@ -87,6 +87,7 @@ PORT = int(os.getenv("PORT", 8000))
 
 ENV = os.getenv("ENV", "production").lower()
 IS_PROD = ENV in ("prod", "production")
+COOKIE_DOMAIN = os.getenv("COOKIE_DOMAIN") or (".futhub.co.uk" if IS_PROD else None)
 
 # JWT / Discord
 JWT_PRIVATE_KEY = os.getenv("JWT_PRIVATE_KEY", "dev-secret-change-me")
@@ -1055,6 +1056,7 @@ app.add_middleware(
     secret_key=SECRET_KEY,
     same_site="none" if IS_PROD else "lax",
     https_only=IS_PROD,
+    domain=COOKIE_DOMAIN,
 )
 
     
