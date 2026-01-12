@@ -12,9 +12,10 @@ from app.models.social import (
     Rating,
     RatingWithAuthor,
 )
-from app.db import get_pool
+from app.db import get_db
 
 router = APIRouter(prefix="/api/ratings", tags=["Ratings"])
+social_router = APIRouter(prefix="/api/social/ratings", tags=["Ratings"])
 
 
 def get_current_user(request):
@@ -22,13 +23,6 @@ def get_current_user(request):
     if "user" not in request.session:
         raise HTTPException(status_code=401, detail="Not authenticated")
     return request.session["user"]
-
-
-async def get_db():
-    """Database connection dependency"""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        yield conn
 
 
 async def table_exists(db: asyncpg.Connection, table_name: str) -> bool:
@@ -123,9 +117,25 @@ async def rate_trader(
     return dict(row)
 
 
+@router.post("/{trader_id}", response_model=Rating)
+@social_router.post("/{trader_id}", response_model=Rating)
+async def rate_trader_by_id(
+    trader_id: str,
+    rating: RatingCreate,
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db),
+):
+    payload = RatingCreate(
+        trader_id=trader_id,
+        rating=rating.rating,
+        review=rating.review,
+    )
+    return await rate_trader(rating=payload, request=request, db=db)
+
+
 @router.get("/trader/{trader_id}", response_model=List[RatingWithAuthor])
 async def get_trader_ratings(
-    trader_id: int,
+    trader_id: str,
     offset: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
     db: asyncpg.Connection = Depends(get_db)
@@ -158,9 +168,16 @@ async def get_trader_ratings(
     return [dict(row) for row in rows]
 
 
+
+
+
+
+
+
+
 @router.get("/trader/{trader_id}/summary")
 async def get_trader_rating_summary(
-    trader_id: int,
+    trader_id: str,
     db: asyncpg.Connection = Depends(get_db)
 ):
     """
@@ -197,7 +214,7 @@ async def get_trader_rating_summary(
 
 @router.get("/my-rating/{trader_id}")
 async def get_my_rating(
-    trader_id: int,
+    trader_id: str,
     request: Request,
     db: asyncpg.Connection = Depends(get_db)
 ):
@@ -227,7 +244,7 @@ async def get_my_rating(
 
 @router.delete("/rating/{trader_id}")
 async def delete_rating(
-    trader_id: int,
+    trader_id: str,
     request: Request,
     db: asyncpg.Connection = Depends(get_db)
 ):
@@ -253,6 +270,7 @@ async def delete_rating(
 
 
 @router.get("/leaderboard")
+@social_router.get("/leaderboard")
 async def get_top_rated_traders(
     limit: int = Query(20, ge=1, le=100),
     min_ratings: int = Query(5, ge=1),
@@ -290,3 +308,19 @@ async def get_top_rated_traders(
     except asyncpg_exceptions.UndefinedTableError:
         return []
     return [dict(row) for row in rows]
+
+
+@router.get("/{trader_id}", response_model=List[RatingWithAuthor])
+@social_router.get("/{trader_id}", response_model=List[RatingWithAuthor])
+async def get_trader_ratings_by_id(
+    trader_id: str,
+    offset: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
+    db: asyncpg.Connection = Depends(get_db),
+):
+    return await get_trader_ratings(
+        trader_id=trader_id,
+        offset=offset,
+        limit=limit,
+        db=db,
+    )

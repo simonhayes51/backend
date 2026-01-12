@@ -57,8 +57,11 @@ from app.routers.social_feed import social_router as social_feed_social_router
 from app.routers.subscriptions import router as subscriptions_router
 from app.routers.subscriptions import social_router as subscriptions_social_router
 from app.routers.interactions import router as interactions_router
+from app.routers.interactions import social_router as interactions_social_router
 from app.routers.messaging import router as messaging_router
+from app.routers.messaging import social_router as messaging_social_router
 from app.routers.ratings import router as ratings_router
+from app.routers.ratings import social_router as ratings_social_router
 from app.routers.traders import admin_router as traders_admin_router
 from app.routers.traders import router as traders_router
 from app.routers.traders import social_router as traders_social_router
@@ -1289,8 +1292,11 @@ app.include_router(social_feed_social_router)  # /api/social/feed, /api/social/p
 app.include_router(subscriptions_router)    # /api/subscriptions/*
 app.include_router(subscriptions_social_router)  # /api/social/subscriptions/*
 app.include_router(interactions_router)     # /api/interactions/*
+app.include_router(interactions_social_router)  # /api/social/interactions/*
 app.include_router(messaging_router)        # /api/messages/*
+app.include_router(messaging_social_router)  # /api/social/messages/*
 app.include_router(ratings_router)          # /api/ratings/*
+app.include_router(ratings_social_router)    # /api/social/ratings/*
 app.include_router(traders_router)          # /api/traders/*
 app.include_router(traders_admin_router)    # /api/admin/traders/*
 app.include_router(traders_social_router)   # /api/social/traders/*

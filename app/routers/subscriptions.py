@@ -11,7 +11,7 @@ from app.models.social import (
     Subscription,
     SubscriptionWithTrader,
 )
-from app.db import get_pool
+from app.db import get_db
 
 router = APIRouter(prefix="/api/subscriptions", tags=["Subscriptions"])
 social_router = APIRouter(prefix="/api/social/subscriptions", tags=["Subscriptions"])
@@ -22,13 +22,6 @@ def get_current_user(request: Request):
     if "user" not in request.session:
         raise HTTPException(status_code=401, detail="Not authenticated")
     return request.session["user"]
-
-
-async def get_db():
-    """Database connection dependency"""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        yield conn
 
 
 async def table_exists(db: asyncpg.Connection, table_name: str) -> bool:
@@ -123,9 +116,25 @@ async def subscribe_to_trader(
     return dict(row)
 
 
+@router.post("/{trader_id}/subscribe", response_model=Subscription)
+@social_router.post("/{trader_id}/subscribe", response_model=Subscription)
+async def subscribe_to_trader_by_id(
+    trader_id: str,
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db),
+):
+    subscription = SubscriptionCreate(trader_id=trader_id)
+    return await subscribe_to_trader(
+        subscription=subscription,
+        request=request,
+        db=db,
+    )
+
+
 @router.delete("/unsubscribe/{trader_id}")
+@social_router.delete("/unsubscribe/{trader_id}")
 async def unsubscribe_from_trader(
-    trader_id: int,
+    trader_id: str,
     request: Request,
     db: asyncpg.Connection = Depends(get_db)
 ):
@@ -151,6 +160,20 @@ async def unsubscribe_from_trader(
         raise HTTPException(status_code=404, detail="Subscription not found")
 
     return {"message": "Successfully unsubscribed"}
+
+
+@router.post("/{trader_id}/unsubscribe")
+@social_router.post("/{trader_id}/unsubscribe")
+async def unsubscribe_from_trader_by_id(
+    trader_id: str,
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db),
+):
+    return await unsubscribe_from_trader(
+        trader_id=trader_id,
+        request=request,
+        db=db,
+    )
 
 
 @router.get("/my-subscriptions", response_model=List[SubscriptionWithTrader])
@@ -231,7 +254,7 @@ async def get_my_followers(
 
 @router.get("/check/{trader_id}")
 async def check_subscription(
-    trader_id: int,
+    trader_id: str,
     request: Request,
     db: asyncpg.Connection = Depends(get_db)
 ):
