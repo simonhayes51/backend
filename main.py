@@ -1408,18 +1408,20 @@ async def callback(request: Request):
         if state:
             OAUTH_STATE.pop(state, None)
 
-               discord_id = int(user_id)  # user_id coming from Discord OAuth profile
-        
+        # Discord OAuth user id (snowflake)
+        discord_id = int(user_id)
+
         # CHECK MEMBERSHIP BEFORE SETTING SESSION DATA
         print(f"🔍 Checking membership for discord_id {discord_id}")
         is_member = await check_server_membership(discord_id)
         print(f"🔍 Membership result: {is_member}")
-        
+
         if not is_member:
             print(f"❌ Discord user {discord_id} is NOT a member - clearing session")
             request.session.clear()
             print(f"🔍 Redirecting to: {FRONTEND_URL}/#/access-denied")
             return RedirectResponse(f"{FRONTEND_URL}/#/access-denied")
+
         
         print(f"✅ Discord user {discord_id} is a member - proceeding with login")
 
@@ -1452,43 +1454,58 @@ async def callback(request: Request):
                # discord_user_id is the snowflake you already have in `user_id` here
         discord_user_id = int(user_id)
         
-        # Ensure user exists + get UUID
-        user_row = await db.fetchrow(
-            """
-            INSERT INTO users (discord_id)
-            VALUES ($1)
-            ON CONFLICT (discord_id) DO UPDATE SET discord_id = EXCLUDED.discord_id
-            RETURNING id, discord_id, account_type, tier, plan, premium_until, roles
-            """,
-            discord_user_id
-        )
-        
-        user_uuid = str(user_row["id"])
-        
-        # Store UUID as the canonical session user_id
+                # Ensure user exists + get UUID (use the same pool/conn you already have)
+        async with request.app.state.pool.acquire() as conn:
+            user_row = await conn.fetchrow(
+                """
+                INSERT INTO users (discord_id)
+                VALUES ($1)
+                ON CONFLICT (discord_id) DO UPDATE SET discord_id = EXCLUDED.discord_id
+                RETURNING id, discord_id, account_type, tier, plan, premium_until, roles
+                """,
+                discord_id
+            )
+
+            user_uuid = str(user_row["id"])
+
+            # Store/update user profile (NOTE: user_profiles.user_id is UUID)
+            await conn.execute(
+                """
+                INSERT INTO user_profiles (user_id, username, avatar_url, global_name, updated_at)
+                VALUES ($1, $2, $3, $4, NOW())
+                ON CONFLICT (user_id)
+                DO UPDATE SET
+                    username = EXCLUDED.username,
+                    avatar_url = EXCLUDED.avatar_url,
+                    global_name = EXCLUDED.global_name,
+                    updated_at = NOW()
+                """,
+                user_uuid, username, avatar_url, global_name
+            )
+
+        # Session: UUID is canonical
         request.session["user_id"] = user_uuid
+        request.session["discord_id"] = discord_id
         request.session["username"] = username
         request.session["avatar_url"] = avatar_url
         request.session["global_name"] = global_name
-        
-        # Keep discord id too (handy for Discord API calls / role sync)
-        request.session["discord_id"] = discord_user_id
-        
-        # Newer routers expect request.session["user"] dict
+
+        # Routers that expect request.session["user"]
         request.session["user"] = {
-            "id": user_uuid,                 # UUID ✅
-            "discord_id": discord_user_id,   # BIGINT ✅
+            "id": user_uuid,          # UUID
+            "discord_id": discord_id, # BIGINT
             "username": username,
             "avatar_url": avatar_url,
             "global_name": global_name,
             "account_type": user_row["account_type"],
             "tier": user_row["tier"],
         }
-        
-        # If get_member_role_names expects Discord ID, pass discord_user_id
-        request.session["roles"] = await get_member_role_names(discord_user_id)
-        
+
+        # Discord roles call uses discord_id (snowflake)
+        request.session["roles"] = await get_member_role_names(discord_id)
+
         return RedirectResponse(f"{FRONTEND_URL}/#/")
+
 
     except HTTPException:
         raise
