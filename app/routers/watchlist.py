@@ -6,49 +6,25 @@ import time
 from typing import Any, Dict, Optional, AsyncGenerator
 
 import aiohttp
-import asyncpg
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from app.auth.entitlements import compute_entitlements
+from app.db import get_watchlist_db
 
 router = APIRouter(prefix="/api/watchlist", tags=["watchlist"])
 
-# ------------ DB deps (use app.state.watchlist_pool / player_pool) ------------
-async def get_watch_db(request: Request) -> AsyncGenerator:
-    pool = getattr(request.app.state, "watchlist_pool", None)
-    if pool is None:
-        raise HTTPException(503, "watchlist_pool not initialized")
-    async with pool.acquire() as conn:
+# ------------ DB deps (WATCHLIST database only) ------------------------------
+async def get_watch_db() -> AsyncGenerator:
+    async for conn in get_watchlist_db():
         yield conn
 
-async def get_player_db(request: Request) -> AsyncGenerator:
-    pool = getattr(request.app.state, "player_pool", None)
-    if pool is None:
-        raise HTTPException(503, "player_pool not initialized")
-    async with pool.acquire() as conn:
-        yield conn
 
-async def _uid_param(request: Request, wdb: asyncpg.Connection) -> tuple[str | int, str]:
+def _uid_param(request: Request) -> str:
     uid = request.session.get("user_id")
     if not uid:
         raise HTTPException(401, "Not authenticated")
-    column_type = await wdb.fetchval(
-        """
-        SELECT data_type
-        FROM information_schema.columns
-        WHERE table_name = 'watchlist'
-          AND column_name = 'user_id'
-        ORDER BY (table_schema = 'public') DESC
-        LIMIT 1
-        """
-    )
-    if column_type in ("bigint", "integer", "smallint"):
-        try:
-            return int(uid), "bigint"
-        except (TypeError, ValueError):
-            raise HTTPException(400, "Invalid user id")
-    return str(uid), "text"
+    return str(uid)
 
 # ------------ FUT.GG price fetch (self-contained; no import from main) --------
 FUTGG_BASE = "https://www.fut.gg/api/fut/player-prices/26"
@@ -120,36 +96,15 @@ class WatchlistCreate(BaseModel):
 async def list_watch_items(
     request: Request,
     wdb = Depends(get_watch_db),
-    pdb = Depends(get_player_db),
 ):
-    uid, uid_cast = await _uid_param(request, wdb)
+    uid = _uid_param(request)
     rows = await wdb.fetch(
-        f"SELECT * FROM watchlist WHERE user_id=$1::{uid_cast} ORDER BY started_at DESC NULLS LAST",
+        "SELECT * FROM watchlist WHERE user_id=$1 ORDER BY started_at DESC NULLS LAST",
         uid,
     )
     items = [dict(r) for r in rows]
     if not items:
         return {"ok": True, "items": []}
-
-    # meta (player DB)
-    card_ids = [str(it["card_id"]) for it in items if it.get("card_id") is not None]
-    meta_rows = await pdb.fetch(
-        """
-        SELECT card_id, name, rating, club, nation
-        FROM fut_players
-        WHERE card_id = ANY($1::text[])
-        """,
-        card_ids,
-    )
-    meta = {
-        str(m["card_id"]): {
-            "name": m["name"],
-            "rating": m["rating"],
-            "club": m["club"],
-            "nation": m["nation"],
-        }
-        for m in meta_rows
-    }
 
     # live prices (console by row platform)
     tasks = [_fetch_price(int(it["card_id"]), _plat(it["platform"])) for it in items]
@@ -169,7 +124,6 @@ async def list_watch_items(
             except Exception:
                 pass
 
-        m = meta.get(str(it["card_id"]), {})
         enriched.append({
             "id": it["id"],
             "card_id": it["card_id"],
@@ -184,10 +138,10 @@ async def list_watch_items(
             "change": change,
             "change_pct": change_pct,
             "notes": it["notes"],
-            "name": m.get("name"),
-            "rating": m.get("rating"),
-            "club": m.get("club"),
-            "nation": m.get("nation"),
+            "name": None,
+            "rating": None,
+            "club": None,
+            "nation": None,
         })
 
     return {"ok": True, "items": enriched}
@@ -195,9 +149,9 @@ async def list_watch_items(
 @router.get("/usage")
 async def usage(request: Request, wdb = Depends(get_watch_db)):
     ent = await compute_entitlements(request)
-    uid, uid_cast = await _uid_param(request, wdb)
+    uid = _uid_param(request)
     used = await wdb.fetchval(
-        f"SELECT COUNT(*) FROM watchlist WHERE user_id=$1::{uid_cast}",
+        "SELECT COUNT(*) FROM watchlist WHERE user_id=$1",
         uid,
     )
     return {
@@ -209,10 +163,10 @@ async def usage(request: Request, wdb = Depends(get_watch_db)):
 @router.post("")
 async def add_watch_item(payload: WatchlistCreate, request: Request, wdb = Depends(get_watch_db)):
     ent = await compute_entitlements(request)
-    uid, uid_cast = await _uid_param(request, wdb)
+    uid = _uid_param(request)
 
     used = await wdb.fetchval(
-        f"SELECT COUNT(*) FROM watchlist WHERE user_id=$1::{uid_cast}",
+        "SELECT COUNT(*) FROM watchlist WHERE user_id=$1",
         uid,
     )
     max_allowed = int(ent["limits"]["watchlist_max"])
@@ -239,7 +193,7 @@ async def add_watch_item(payload: WatchlistCreate, request: Request, wdb = Depen
             user_id, card_id, player_name, version, platform,
             started_price, last_price, last_checked, notes
         )
-        VALUES ($1::{uid_cast},$2,$3,$4,$5,$6,$7,NOW(),$8)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,NOW(),$8)
         ON CONFLICT (user_id, card_id, platform) DO UPDATE
           SET player_name = EXCLUDED.player_name,
               version     = EXCLUDED.version,
@@ -267,9 +221,9 @@ async def add_watch_item(payload: WatchlistCreate, request: Request, wdb = Depen
 
 @router.delete("/{watch_id}")
 async def delete_watch_item(watch_id: int, request: Request, wdb = Depends(get_watch_db)):
-    uid, uid_cast = await _uid_param(request, wdb)
+    uid = _uid_param(request)
     res = await wdb.execute(
-        f"DELETE FROM watchlist WHERE id=$1 AND user_id=$2::{uid_cast}",
+        "DELETE FROM watchlist WHERE id=$1 AND user_id=$2",
         watch_id,
         uid,
     )
@@ -282,11 +236,10 @@ async def refresh_watch_item(
     watch_id: int,
     request: Request,
     wdb = Depends(get_watch_db),
-    pdb = Depends(get_player_db),
 ):
-    uid, uid_cast = await _uid_param(request, wdb)
+    uid = _uid_param(request)
     w = await wdb.fetchrow(
-        f"SELECT * FROM watchlist WHERE id=$1 AND user_id=$2::{uid_cast}",
+        "SELECT * FROM watchlist WHERE id=$1 AND user_id=$2",
         watch_id,
         uid,
     )
@@ -309,12 +262,6 @@ async def refresh_watch_item(
         change = int(live_price) - int(w["started_price"])
         change_pct = round((change / int(w["started_price"])) * 100, 2)
 
-    meta = await pdb.fetchrow(
-        "SELECT card_id, name, rating, club, nation FROM fut_players WHERE card_id=$1::text",
-        str(w["card_id"]),
-    )
-    md = dict(meta) if meta else {}
-
     return {
         "ok": True,
         "item": {
@@ -331,9 +278,9 @@ async def refresh_watch_item(
             "change": change,
             "change_pct": change_pct,
             "notes": w["notes"],
-            "name": md.get("name"),
-            "rating": md.get("rating"),
-            "club": md.get("club"),
-            "nation": md.get("nation"),
+            "name": None,
+            "rating": None,
+            "club": None,
+            "nation": None,
         },
     }

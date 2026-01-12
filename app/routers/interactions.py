@@ -2,8 +2,9 @@
 Post Interactions Router - Likes, dislikes, comments
 """
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
-from typing import List
+from typing import List, Optional
 import asyncpg
+from pydantic import BaseModel
 
 from app.models.social import (
     PostReactionCreate,
@@ -14,9 +15,10 @@ from app.models.social import (
     CommentWithAuthor,
     CommentLikeCreate,
 )
-from app.db import get_pool
+from app.db import get_db
 
 router = APIRouter(prefix="/api/interactions", tags=["Post Interactions"])
+social_router = APIRouter(prefix="/api/social/interactions", tags=["Post Interactions"])
 
 
 def get_current_user(request):
@@ -26,16 +28,41 @@ def get_current_user(request):
     return request.session["user"]
 
 
-async def get_db():
-    """Database connection dependency"""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        yield conn
-
-
 # ============================================================================
 # POST REACTIONS (Likes/Dislikes)
 # ============================================================================
+
+class ReactionPayload(BaseModel):
+    reaction: str
+
+
+class CommentPayload(BaseModel):
+    content: str
+    parent_comment_id: Optional[int] = None
+
+
+def _format_comment_with_author(comment: dict) -> dict:
+    likes_count = comment.get("likes_count")
+    author = {
+        "username": comment.get("username"),
+        "avatar_url": comment.get("avatar_url"),
+        "is_verified": comment.get("verified"),
+    }
+    comment["author"] = author
+    if likes_count is not None:
+        comment["likes"] = likes_count
+    return comment
+
+
+async def _add_or_update_reaction(
+    post_id: int,
+    reaction_type: str,
+    request: Request,
+    db: asyncpg.Connection,
+) -> dict:
+    reaction = PostReactionCreate(post_id=post_id, reaction_type=reaction_type)
+    return await add_reaction(reaction=reaction, request=request, db=db)
+
 
 @router.post("/reactions", response_model=PostReaction)
 async def add_reaction(
@@ -117,6 +144,24 @@ async def add_reaction(
             )
 
     return dict(row)
+
+
+@router.post("/posts/{post_id}/reactions")
+@social_router.post("/posts/{post_id}/reactions")
+async def add_reaction_for_post(
+    post_id: int,
+    payload: ReactionPayload,
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db),
+):
+    if payload.reaction not in {"like", "dislike"}:
+        raise HTTPException(status_code=400, detail="Invalid reaction type")
+    return await _add_or_update_reaction(
+        post_id=post_id,
+        reaction_type=payload.reaction,
+        request=request,
+        db=db,
+    )
 
 
 @router.delete("/reactions/{post_id}")
@@ -270,7 +315,23 @@ async def add_comment(
     comment_dict["user_has_liked"] = False
     comment_dict["is_author"] = True
 
-    return comment_dict
+    return _format_comment_with_author(comment_dict)
+
+
+@router.post("/posts/{post_id}/comments")
+@social_router.post("/posts/{post_id}/comments")
+async def add_comment_for_post(
+    post_id: int,
+    payload: CommentPayload,
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db),
+):
+    comment = CommentCreate(
+        post_id=post_id,
+        content=payload.content,
+        parent_comment_id=payload.parent_comment_id,
+    )
+    return await add_comment(comment=comment, request=request, db=db)
 
 
 @router.get("/comments/{post_id}", response_model=List[CommentWithAuthor])
@@ -326,9 +387,27 @@ async def get_comments(
             comment_dict["user_has_liked"] = False
             comment_dict["is_author"] = False
 
-        comments.append(comment_dict)
+        comments.append(_format_comment_with_author(comment_dict))
 
     return comments
+
+
+@router.get("/posts/{post_id}/comments", response_model=List[CommentWithAuthor])
+@social_router.get("/posts/{post_id}/comments", response_model=List[CommentWithAuthor])
+async def get_comments_for_post(
+    post_id: int,
+    request: Request,
+    offset: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=100),
+    db: asyncpg.Connection = Depends(get_db),
+):
+    return await get_comments(
+        post_id=post_id,
+        request=request,
+        offset=offset,
+        limit=limit,
+        db=db,
+    )
 
 
 @router.patch("/comments/{comment_id}", response_model=Comment)
@@ -371,7 +450,24 @@ async def update_comment(
     return dict(row)
 
 
+@router.post("/comments/{comment_id}")
+@social_router.post("/comments/{comment_id}")
+async def update_comment_alias(
+    comment_id: int,
+    comment_update: CommentUpdate,
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db),
+):
+    return await update_comment(
+        comment_id=comment_id,
+        comment_update=comment_update,
+        request=request,
+        db=db,
+    )
+
+
 @router.delete("/comments/{comment_id}")
+@social_router.delete("/comments/{comment_id}")
 async def delete_comment(
     comment_id: int,
     request: Request,
@@ -447,6 +543,17 @@ async def like_comment(
     )
 
     return {"message": "Comment liked"}
+
+
+@router.post("/comments/{comment_id}/like")
+@social_router.post("/comments/{comment_id}/like")
+async def like_comment_by_id(
+    comment_id: int,
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db),
+):
+    like = CommentLikeCreate(comment_id=comment_id)
+    return await like_comment(like=like, request=request, db=db)
 
 
 @router.delete("/comments/like/{comment_id}")

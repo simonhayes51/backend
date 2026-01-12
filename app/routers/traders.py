@@ -13,7 +13,7 @@ from app.models.social import (
     TraderPublicProfile,
     TraderStats,
 )
-from app.db import get_pool
+from app.db import get_db
 
 router = APIRouter(prefix="/api/traders", tags=["Traders"])
 admin_router = APIRouter(prefix="/api/admin/traders", tags=["Traders"])
@@ -25,13 +25,6 @@ def get_current_user(request):
     if "user" not in request.session:
         raise HTTPException(status_code=401, detail="Not authenticated")
     return request.session["user"]
-
-
-async def get_db():
-    """Database connection dependency"""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        yield conn
 
 
 class TraderAssignRequest(BaseModel):
@@ -178,7 +171,7 @@ async def list_trader_requests(
 
 @router.post("/requests/{request_id}/approve")
 async def approve_trader_request(
-    request_id: int,
+    request_id: str,
     db: asyncpg.Connection = Depends(get_db)
 ):
     """
@@ -189,7 +182,7 @@ async def approve_trader_request(
 
 @router.post("/requests/{request_id}/reject")
 async def reject_trader_request(
-    request_id: int
+    request_id: str
 ):
     """
     Reject a trader request by user id
@@ -276,7 +269,7 @@ async def update_trader_profile(
 
 @router.get("/profile/{trader_id}", response_model=TraderPublicProfile)
 async def get_trader_profile(
-    trader_id: int,
+    trader_id: str,
     request: Request,
     db: asyncpg.Connection = Depends(get_db)
 ):
@@ -457,9 +450,33 @@ async def browse_traders(
     }
 
 
+@router.get("")
+@social_router.get("")
+async def browse_traders_root(
+    request: Request,
+    search: Optional[str] = Query(None, description="Search by username or bio"),
+    specialty: Optional[str] = Query(None, description="Filter by specialty"),
+    verified_only: bool = Query(False),
+    sort_by: str = Query("followers", description="followers, rating, posts, recent"),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
+    db: asyncpg.Connection = Depends(get_db),
+):
+    return await browse_traders(
+        request=request,
+        search=search,
+        specialty=specialty,
+        verified_only=verified_only,
+        sort_by=sort_by,
+        offset=offset,
+        limit=limit,
+        db=db,
+    )
+
+
 @router.get("/stats/{trader_id}", response_model=TraderStats)
 async def get_trader_stats(
-    trader_id: int,
+    trader_id: str,
     db: asyncpg.Connection = Depends(get_db)
 ):
     """
@@ -617,7 +634,7 @@ async def list_trader_requests_admin(
 
 @admin_router.post("/requests/{request_id}/approve")
 async def approve_trader_request_admin(
-    request_id: int,
+    request_id: str,
     db: asyncpg.Connection = Depends(get_db)
 ):
     """
@@ -628,7 +645,7 @@ async def approve_trader_request_admin(
 
 @admin_router.post("/requests/{request_id}/reject")
 async def reject_trader_request_admin(
-    request_id: int
+    request_id: str
 ):
     """
     Admin: Reject trader request
@@ -663,7 +680,7 @@ async def list_trader_requests_social(
 
 @social_router.post("/requests/{request_id}/approve")
 async def approve_trader_request_social(
-    request_id: int,
+    request_id: str,
     db: asyncpg.Connection = Depends(get_db)
 ):
     """
@@ -674,7 +691,7 @@ async def approve_trader_request_social(
 
 @social_router.post("/requests/{request_id}/reject")
 async def reject_trader_request_social(
-    request_id: int
+    request_id: str
 ):
     """
     Social: Reject trader request
