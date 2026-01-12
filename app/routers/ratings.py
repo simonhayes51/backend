@@ -31,6 +31,17 @@ async def get_db():
         yield conn
 
 
+async def table_exists(db: asyncpg.Connection, table_name: str) -> bool:
+    return await db.fetchval("SELECT to_regclass($1)", table_name) is not None
+
+
+async def ensure_tables_exist(db: asyncpg.Connection, table_names: List[str]) -> bool:
+    for table_name in table_names:
+        if not await table_exists(db, table_name):
+            return False
+    return True
+
+
 @router.post("/rate", response_model=Rating)
 async def rate_trader(
     rating: RatingCreate,
