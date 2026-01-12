@@ -1168,13 +1168,15 @@ async def user_has_premium_role(user_id: str) -> bool:
     return ok
 
 
-async def check_server_membership(user_id: str) -> bool:
+async def check_server_membership(discord_id: int | str) -> bool:
     if not (DISCORD_BOT_TOKEN and DISCORD_SERVER_ID):
         return True
+
     try:
+        discord_id = str(discord_id)  # ensure URL-safe
         async with aiohttp.ClientSession() as session:
             async with session.get(
-                f"https://discord.com/api/guilds/{DISCORD_SERVER_ID}/members/{user_id}",
+                f"https://discord.com/api/guilds/{DISCORD_SERVER_ID}/members/{discord_id}",
                 headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"}
             ) as resp:
                 return resp.status == 200
@@ -1406,19 +1408,21 @@ async def callback(request: Request):
         if state:
             OAUTH_STATE.pop(state, None)
 
+               discord_id = int(user_id)  # user_id coming from Discord OAuth profile
+        
         # CHECK MEMBERSHIP BEFORE SETTING SESSION DATA
-        print(f"🔍 Checking membership for user {user_id}")
-        is_member = await check_server_membership(user_id)
+        print(f"🔍 Checking membership for discord_id {discord_id}")
+        is_member = await check_server_membership(discord_id)
         print(f"🔍 Membership result: {is_member}")
         
         if not is_member:
-            print(f"❌ User {user_id} is NOT a member - clearing session")
+            print(f"❌ Discord user {discord_id} is NOT a member - clearing session")
             request.session.clear()
             print(f"🔍 Redirecting to: {FRONTEND_URL}/#/access-denied")
-            # FIXED: Add hash routing for your frontend
             return RedirectResponse(f"{FRONTEND_URL}/#/access-denied")
+        
+        print(f"✅ Discord user {discord_id} is a member - proceeding with login")
 
-        print(f"✅ User {user_id} is a member - proceeding with login")
 
         # ONLY set session data for verified members
         username = f"{user_data.get('username','user')}#{user_data.get('discriminator', '0000')}"
@@ -2276,41 +2280,46 @@ async def test_alert_endpoint(
 
 @app.get("/api/me")
 async def get_current_user_info(request: Request, conn=Depends(get_db)):
-    uid = request.session.get("user_id")
-    print(f"🔍 /api/me called - user_id from session: {uid}")
-    
-    if not uid:
-        print("❌ No user_id in session")
+    user_id = request.session.get("user_id")      # UUID
+    discord_id = request.session.get("discord_id")  # BIGINT
+
+    print(f"🔍 /api/me called - user_id(UUID): {user_id} | discord_id: {discord_id}")
+
+    if not user_id or not discord_id:
+        print("❌ Missing user_id or discord_id in session")
         return {"authenticated": False}
 
-    # RE-CHECK membership for authenticated users
-    print(f"🔍 Re-checking membership for authenticated user {uid}")
-    is_member = await check_server_membership(uid)
+    # RE-CHECK membership using DISCORD ID (NOT UUID)
+    print(f"🔍 Re-checking membership for discord user {discord_id}")
+    is_member = await check_server_membership(int(discord_id))
     if not is_member:
-        print(f"❌ User {uid} no longer a member - clearing session")
+        print(f"❌ Discord user {discord_id} no longer a member - clearing session")
         request.session.clear()
         return {
-            "authenticated": False, 
+            "authenticated": False,
             "error": "membership_revoked",
             "message": "Discord server membership required"
         }
 
-    # Get user profile
+    # Get user profile using UUID
     profile = await conn.fetchrow(
-        "SELECT username, avatar_url, global_name, is_premium, premium_until FROM user_profiles WHERE user_id = $1",
-        uid
+        """
+        SELECT username, avatar_url, global_name, is_premium, premium_until
+        FROM user_profiles
+        WHERE user_id = $1
+        """,
+        user_id
     )
 
     if not profile:
-        print(f"❌ No profile found for user {uid}")
+        print(f"❌ No profile found for user_id(UUID) {user_id}")
         request.session.clear()
         return {"authenticated": False}
 
-    # REAL-TIME PREMIUM VALIDATION
+    # REAL-TIME PREMIUM VALIDATION (UUID)
     is_premium = False
     premium_until = None
 
-    # Check active subscription in real-time
     active_subscription = await conn.fetchrow(
         """
         SELECT current_period_end, status, cancel_at_period_end
@@ -2320,7 +2329,7 @@ async def get_current_user_info(request: Request, conn=Depends(get_db)):
         ORDER BY created_at DESC
         LIMIT 1
         """,
-        uid
+        user_id
     )
 
     if active_subscription:
@@ -2337,22 +2346,23 @@ async def get_current_user_info(request: Request, conn=Depends(get_db)):
                 SET is_premium = FALSE, premium_until = NULL, updated_at = NOW()
                 WHERE user_id = $1
                 """,
-                uid
+                user_id
             )
             try:
-                await discord_manager.remove_premium_role(uid)
+                # Remove premium role using DISCORD ID
+                await discord_manager.remove_premium_role(int(discord_id))
             except Exception as e:
-                logging.warning(f"Failed to remove Discord role for expired user {uid}: {e}")
+                logging.warning(f"Failed to remove Discord role for expired discord_id {discord_id}: {e}")
 
     return {
         "authenticated": True,
-        "user_id": uid,
+        "user_id": user_id,                 # UUID
+        "discord_id": int(discord_id),       # BIGINT
         "username": profile["username"],
         "avatar_url": profile["avatar_url"],
         "global_name": profile["global_name"],
         "is_premium": is_premium,
         "premium_until": premium_until.isoformat() if premium_until else None,
-        "discord_id": uid,
         "last_validated": datetime.now(timezone.utc).isoformat(),
         "features": ["smart_buy", "trade_finder", "advanced_analytics"] if is_premium else [],
         "limits": {
