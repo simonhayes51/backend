@@ -145,24 +145,6 @@ async def get_feed(
         user_id = None
         is_authenticated = False
 
-    base_tables = [
-        "public.social_posts",
-        "public.user_profiles",
-        "public.trader_profiles",
-    ]
-    if not await ensure_tables_exist(db, base_tables):
-        return {
-            "posts": [],
-            "total": 0,
-            "has_more": False,
-            "offset": offset,
-            "limit": limit
-        }
-
-    if is_authenticated and not await table_exists(db, "public.trader_subscriptions"):
-        is_authenticated = False
-        user_id = None
-
     try:
         # Build the query based on filters
         conditions = []
@@ -240,6 +222,19 @@ async def get_feed(
             ORDER BY sp.created_at DESC
             LIMIT ${param_idx} OFFSET ${param_idx + 1}
         """
+
+        # Add user_id for is_author check (or NULL if not authenticated)
+        query_params = params + [user_id if is_authenticated else None]
+
+        rows = await db.fetch(query, *query_params)
+    except asyncpg_exceptions.UndefinedTableError:
+        return {
+            "posts": [],
+            "total": 0,
+            "has_more": False,
+            "offset": offset,
+            "limit": limit
+        }
 
         # Add user_id for is_author check (or NULL if not authenticated)
         query_params = params + [user_id if is_authenticated else None]

@@ -285,14 +285,6 @@ async def get_top_rated_traders(
         LIMIT $2
     """
 
-    required_tables = [
-        "public.users",
-        "public.user_profiles",
-        "public.trader_profiles",
-    ]
-    if not await ensure_tables_exist(db, required_tables):
-        return []
-
     try:
         rows = await db.fetch(query, min_ratings, limit)
     except asyncpg_exceptions.UndefinedTableError:

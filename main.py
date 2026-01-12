@@ -10,6 +10,7 @@ import logging
 import secrets
 import aiohttp
 import asyncpg
+from asyncpg import exceptions as asyncpg_exceptions
 import stripe
 
 from bs4 import BeautifulSoup
@@ -898,6 +899,14 @@ async def lifespan(app: FastAPI):
 
 # --- FastAPI app ---
 app = FastAPI(lifespan=lifespan)
+
+
+@app.exception_handler(asyncpg_exceptions.UndefinedTableError)
+async def handle_undefined_table_error(request: Request, exc: Exception):
+    return JSONResponse(
+        status_code=200,
+        content={"detail": "Database tables not initialized"}
+    )
 
 from app.routers.watchlist import router as watchlist_router
 app.include_router(watchlist_router)
