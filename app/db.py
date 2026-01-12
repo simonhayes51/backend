@@ -49,13 +49,17 @@ async def get_watchlist_pool() -> asyncpg.Pool:
         )
     return _WATCHLIST_POOL
 
-# Default dependency for most routers (CORE DB)
+# ✅ Backwards-compatible name used all over the codebase
+async def get_pool() -> asyncpg.Pool:
+    return await get_core_pool()
+
+# ✅ Default dependency used by routers
 async def get_db():
     pool = await get_core_pool()
     async with pool.acquire() as conn:
         yield conn
 
-# Optional dependencies if you want them explicitly
+# Optional explicit dependencies
 async def get_player_db():
     pool = await get_player_pool()
     async with pool.acquire() as conn:
