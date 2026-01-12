@@ -33,6 +33,7 @@ _26_SEGMENT_RE = re.compile(r"/players/[^?#]*/26-(\d+)(?:[/?#]|$)", re.IGNORECAS
 _LAST_NUM_AFTER_PLAYERS_RE = re.compile(r"/players/[^?#]*?(\d+)(?:[/?#]|$)", re.IGNORECASE)
 PCT_RE = re.compile(r"([+\-]?\s?\d+(?:\.\d+)?)\s*%")
 
+
 def _cid_from_href(href: str) -> Optional[int]:
     """Extract the correct FUT card_id from any /players/... href."""
     if "/players/" not in href:
@@ -51,6 +52,7 @@ def _cid_from_href(href: str) -> Optional[int]:
             pass
     return None
 
+
 def _name_hint_from_href(href: str) -> Optional[str]:
     """
     From /players/<lead>-<slug>/<maybe 26-id>/ -> 'Nice Name'
@@ -62,11 +64,16 @@ def _name_hint_from_href(href: str) -> Optional[str]:
         path = href.split("/players/", 1)[1].strip("/")
         first_seg = path.split("/", 1)[0]
         # drop any leading digits- prefix e.g. "256853-malik-tillman" -> "malik-tillman"
-        slug = first_seg.split("-", 1)[1] if "-" in first_seg and first_seg.split("-", 1)[0].isdigit() else first_seg
+        slug = (
+            first_seg.split("-", 1)[1]
+            if "-" in first_seg and first_seg.split("-", 1)[0].isdigit()
+            else first_seg
+        )
         words = [w for w in slug.replace("-", " ").split() if w]
         return " ".join(w.capitalize() for w in words) if words else None
     except Exception:
         return None
+
 
 def _name_from_context(anchor) -> Optional[str]:
     """
@@ -90,12 +97,14 @@ def _name_from_context(anchor) -> Optional[str]:
         pass
     return None
 
+
 # normalize FUT.GG extras like "Rare 84 OVR" appended in slugs
 _NAME_SUFFIX_CLEAN_RE = re.compile(
     r"\s+(?:rare|non[- ]?rare|common)(?:\s+\d+\s*ovr)?$",
     re.IGNORECASE,
 )
 _TRAILING_OVR_RE = re.compile(r"\s+\d+\s*ovr\b.*$", re.IGNORECASE)
+
 
 def _normalize_name(n: Optional[str]) -> Optional[str]:
     if not n:
@@ -105,12 +114,14 @@ def _normalize_name(n: Optional[str]) -> Optional[str]:
     s = _TRAILING_OVR_RE.sub("", s)
     return re.sub(r"\s{2,}", " ", s).strip()
 
+
 # ------------------ Models ------------------
 class TrendingOut(BaseModel):
     type: Literal["risers", "fallers", "smart"]
     timeframe: Literal["6h", "12h", "24h"]
     items: List[dict]
     limited: bool = False
+
 
 # ------------------ Helpers ------------------
 def _norm_tf(tf: Optional[str]) -> str:
@@ -124,8 +135,10 @@ def _norm_tf(tf: Optional[str]) -> str:
         tf = tf[:-1]
     return tf if tf in {"6", "12", "24"} else "24"
 
+
 def _human_tf(tf_num: str) -> str:
     return f"{tf_num}h"
+
 
 async def _fetch_html(session: aiohttp.ClientSession, url: str) -> str:
     try:
@@ -137,6 +150,7 @@ async def _fetch_html(session: aiohttp.ClientSession, url: str) -> str:
         raise
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Fetch failed: {e}") from e
+
 
 async def _momentum_page(tf: str, page: int) -> str:
     now = time.time()
@@ -152,6 +166,7 @@ async def _momentum_page(tf: str, page: int) -> str:
 
     _CACHE[key] = (now, html)
     return html
+
 
 def _parse_last_page_num(html: str) -> int:
     soup = BeautifulSoup(html, "html.parser")
@@ -169,6 +184,7 @@ def _parse_last_page_num(html: str) -> int:
             if t.isdigit():
                 last = max(last, int(t))
     return last
+
 
 def _nearest_percent_text(node) -> Optional[float]:
     """Find a % near the link: walk up a few ancestors, then scan siblings."""
@@ -196,10 +212,11 @@ def _nearest_percent_text(node) -> Optional[float]:
                 continue
     return None
 
+
 def _extract_items(html: str) -> List[dict]:
     soup = BeautifulSoup(html, "html.parser")
     items: List[dict] = []
-    seen_ids: set[int] = set()  # de-dupe by card_id only
+    seen_ids: set[int] = set()  # de-dupe by card_id only (within page)
 
     for a in soup.find_all("a", href=True):
         href = a["href"]
@@ -216,22 +233,32 @@ def _extract_items(html: str) -> List[dict]:
         # name priority: nearby <img alt="Name - ..."> > slug from href > "Card {cid}"
         name_hint_img = _normalize_name(_name_from_context(a))
         name_hint_slug = _normalize_name(_name_hint_from_href(href))
-        name_hint = name_hint_img or (
-            name_hint_slug if (name_hint_slug and name_hint_slug.lower() != "momentum") else None
-        ) or f"Card {cid}"
+        name_hint = (
+            name_hint_img
+            or (
+                name_hint_slug
+                if (name_hint_slug and name_hint_slug.lower() != "momentum")
+                else None
+            )
+            or f"Card {cid}"
+        )
 
-        items.append({
-            "card_id": cid,
-            "percent": pct,
-            "name_hint": name_hint,
-        })
+        items.append(
+            {
+                "card_id": cid,
+                "percent": pct,
+                "name_hint": name_hint,
+            }
+        )
         seen_ids.add(cid)
 
     return items
 
+
 async def _page_items(tf: str, page: int) -> List[dict]:
     html = await _momentum_page(tf, page)
     return _extract_items(html)
+
 
 async def _get_console_price(card_id: int, platform: str = "ps") -> Optional[int]:
     url = FUTGG_PRICE_URL.format(card_id=card_id)
@@ -244,6 +271,7 @@ async def _get_console_price(card_id: int, platform: str = "ps") -> Optional[int
                 data = await r.json()
     except Exception:
         return None
+
     key = "ps" if platform == "ps" else "xbox"
     try:
         prices = (data or {}).get("prices", {}).get(key, {}) or {}
@@ -251,6 +279,7 @@ async def _get_console_price(card_id: int, platform: str = "ps") -> Optional[int
         return int(val) if isinstance(val, (int, float)) and val > 0 else None
     except Exception:
         return None
+
 
 async def _enrich_meta(req: Request, rows: List[dict]) -> List[dict]:
     if not rows:
@@ -274,53 +303,80 @@ async def _enrich_meta(req: Request, rows: List[dict]) -> List[dict]:
         cid = int(r["card_id"])
         m = meta.get(cid, {})
         name = m.get("name") or r.get("name_hint") or f"Card {cid}"
-        out.append({
-            "card_id": cid,
-            "id": str(cid),
-            "name": name,
-            "rating": m.get("rating"),
-            "position": m.get("position"),
-            "league": m.get("league"),
-            "nation": m.get("nation"),
-            "club": m.get("club"),
-            "image": m.get("image_url"),
-            "percent": float(r["percent"]),
-        })
+        out.append(
+            {
+                "card_id": cid,
+                "id": str(cid),
+                "name": name,
+                "rating": m.get("rating"),
+                "position": m.get("position"),
+                "league": m.get("league"),
+                "nation": m.get("nation"),
+                "club": m.get("club"),
+                "image": m.get("image_url"),
+                "percent": float(r["percent"]),
+            }
+        )
     return out
 
-async def _attach_prices(items: List[dict]) -> List[dict]:
+
+def _dedupe_by_card_id(rows: List[dict]) -> List[dict]:
+    """De-dupe across merged pages (fixes duplicates in UI)."""
+    seen: set[int] = set()
+    out: List[dict] = []
+    for r in rows:
+        try:
+            cid = int(r.get("card_id"))
+        except Exception:
+            continue
+        if cid in seen:
+            continue
+        seen.add(cid)
+        out.append(r)
+    return out
+
+
+async def _attach_prices(items: List[dict], platform: str = "ps") -> List[dict]:
+    """
+    Attach price fields in a UI-friendly shape.
+    - Adds top-level: platform, price_console
+    - Keeps nested: prices.console for backwards compatibility
+    """
+
     async def one(it: dict) -> dict:
-        it["prices"] = {"console": await _get_console_price(int(it["card_id"]), "ps"), "pc": None}
+        console_price = await _get_console_price(int(it["card_id"]), platform)
+        it["platform"] = platform
+        it["price_console"] = console_price  # <-- UI expects this
+        it["prices"] = {"console": console_price, "pc": None}
         return it
+
     results = await asyncio.gather(*(one(i) for i in items), return_exceptions=True)
     return [r for r in results if not isinstance(r, Exception)]
+
 
 async def _fetch_trending(kind: Literal["risers", "fallers"], tf: str, limit: int) -> List[dict]:
     """
     Strategy:
-    - Fallers: first page (lowest % first); if not enough, also sample last page and merge.
-    - Risers : last page (highest % first); if not enough, also sample first page and merge.
+    - Fallers: sample page 1 + last page, merge, dedupe, sort asc
+    - Risers : sample last page + page 1, merge, dedupe, sort desc
     """
     first_html = await _momentum_page(tf, 1)
     last_page = _parse_last_page_num(first_html)
 
     if kind == "fallers":
         base = await _page_items(tf, 1)
-        base.sort(key=lambda x: x["percent"])
-        out = base[:limit]
-        if len(out) < limit and last_page > 1:
-            tail = await _page_items(tf, last_page)
-            tail.sort(key=lambda x: x["percent"])
-            out = (base + tail)[:limit]
-    else:
-        base = await _page_items(tf, last_page)
-        base.sort(key=lambda x: x["percent"], reverse=True)
-        out = base[:limit]
-        if len(out) < limit and last_page > 1:
-            head = await _page_items(tf, 1)
-            head.sort(key=lambda x: x["percent"], reverse=True)
-            out = (base + head)[:limit]
-    return out
+        tail = await _page_items(tf, last_page) if last_page > 1 else []
+        merged = _dedupe_by_card_id(base + tail)
+        merged.sort(key=lambda x: x["percent"])  # most negative first
+        return merged[:limit]
+
+    # risers
+    base = await _page_items(tf, last_page)
+    head = await _page_items(tf, 1) if last_page > 1 else []
+    merged = _dedupe_by_card_id(base + head)
+    merged.sort(key=lambda x: x["percent"], reverse=True)  # most positive first
+    return merged[:limit]
+
 
 # ------------------ Route ------------------
 class _TrendingOut(BaseModel):
@@ -328,6 +384,7 @@ class _TrendingOut(BaseModel):
     timeframe: Literal["6h", "12h", "24h"]
     items: List[dict]
     limited: bool = False
+
 
 @router.get("/trending", response_model=_TrendingOut)
 async def trending(
@@ -369,14 +426,16 @@ async def trending(
         limit = max_items
         limited = True
 
+    # ------------------ SMART ------------------
     if type_ == "smart":
-        f6  = await _fetch_trending("fallers", "6",  limit=50)
-        r6  = await _fetch_trending("risers",  "6",  limit=50)
+        # Always compute smart from 6h vs 24h
+        f6 = await _fetch_trending("fallers", "6", limit=50)
+        r6 = await _fetch_trending("risers", "6", limit=50)
         f24 = await _fetch_trending("fallers", "24", limit=50)
-        r24 = await _fetch_trending("risers",  "24", limit=50)
+        r24 = await _fetch_trending("risers", "24", limit=50)
 
-        f6m  = {int(x["card_id"]): float(x["percent"]) for x in f6}
-        r6m  = {int(x["card_id"]): float(x["percent"]) for x in r6}
+        f6m = {int(x["card_id"]): float(x["percent"]) for x in f6}
+        r6m = {int(x["card_id"]): float(x["percent"]) for x in r6}
         f24m = {int(x["card_id"]): float(x["percent"]) for x in f24}
         r24m = {int(x["card_id"]): float(x["percent"]) for x in r24}
 
@@ -396,28 +455,46 @@ async def trending(
 
         raw = [{"card_id": cid, "percent": smart_map[cid]["chg6hPct"], "name_hint": None} for cid in smart_ids]
         enriched = await _enrich_meta(req, raw)
-        enriched = await _attach_prices(enriched)
+        enriched = await _attach_prices(enriched, platform="ps")
+
         for e in enriched:
             cid = int(e["card_id"])
             pair = smart_map.get(cid, {})
-            e["trend"] = {"chg6hPct": pair.get("chg6hPct"), "chg24hPct": pair.get("chg24hPct")}
-        enriched.sort(key=lambda x: abs(x["trend"].get("chg6hPct") or 0), reverse=True)
+            e["trend"] = {
+                "chg6hPct": pair.get("chg6hPct"),
+                "chg24hPct": pair.get("chg24hPct"),
+            }
+            # UI-friendly fields expected by normaliseSmart()
+            e["percent_6h"] = pair.get("chg6hPct")
+            e["percent_24h"] = pair.get("chg24hPct")
+
+        enriched.sort(key=lambda x: abs(x.get("percent_6h") or 0), reverse=True)
+
         if debug:
             for e in enriched:
                 e["__debug"] = {"smart_map": smart_map.get(int(e["card_id"]))}
+
         return {"type": "smart", "timeframe": tf_human, "items": enriched[:limit], "limited": limited}
 
-    # Simple risers/fallers
+    # ------------------ RISERS / FALLERS ------------------
     raw = await _fetch_trending(kind=type_, tf=tf_num, limit=limit)
     enriched = await _enrich_meta(req, raw)
-    enriched = await _attach_prices(enriched)
+    enriched = await _attach_prices(enriched, platform="ps")
+
     for e in enriched:
+        # Maintain trend object for any client that uses it
         if tf_num == "24":
             e["trend"] = {"chg24hPct": float(e["percent"])}
         elif tf_num == "12":
             e["trend"] = {"chg12hPct": float(e["percent"])}
         else:
             e["trend"] = {"chg6hPct": float(e["percent"])}
+
+        # Optional: also include explicit percent_XXh fields (helps clients)
+        e["percent_24h"] = float(e["percent"]) if tf_num == "24" else None
+        e["percent_12h"] = float(e["percent"]) if tf_num == "12" else None
+        e["percent_6h"] = float(e["percent"]) if tf_num == "6" else None
+
     if debug:
         for e in enriched:
             e["__debug"] = {"percent": e.get("percent")}
