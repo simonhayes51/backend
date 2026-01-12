@@ -29,11 +29,14 @@ async def get_player_db(request: Request) -> AsyncGenerator:
     async with pool.acquire() as conn:
         yield conn
 
-def _uid(request: Request) -> str:
+def _uid(request: Request) -> int:
     uid = request.session.get("user_id")
     if not uid:
         raise HTTPException(401, "Not authenticated")
-    return uid
+    try:
+        return int(uid)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "Invalid user id")
 
 # ------------ FUT.GG price fetch (self-contained; no import from main) --------
 FUTGG_BASE = "https://www.fut.gg/api/fut/player-prices/26"
