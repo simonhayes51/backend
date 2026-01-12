@@ -5,33 +5,26 @@ from fastapi import APIRouter, HTTPException, Request
 
 router = APIRouter()
 
-
 def _pool(request: Request):
     pool = getattr(request.app.state, "pool", None)
     if pool is None:
         raise HTTPException(500, "DB pool not ready")
     return pool
 
-
-def _uid_int(request: Request) -> int:
-    # session/header values are strings -> asyncpg wants int for BIGINT
+def _uid_raw(request: Request) -> str:
     uid = None
     try:
         uid = request.session.get("user_id")  # type: ignore[attr-defined]
     except Exception:
         uid = None
 
-    if uid is None:
+    if not uid:
         uid = request.headers.get("X-User-Id")
 
-    if uid is None:
+    if not uid:
         raise HTTPException(401, "No user")
 
-    try:
-        return int(uid)
-    except (TypeError, ValueError):
-        raise HTTPException(400, f"Invalid user id: {uid}")
-
+    return str(uid)
 
 def _int_or_none(v: Any) -> Optional[int]:
     if v is None:
@@ -46,17 +39,16 @@ def _int_or_none(v: Any) -> Optional[int]:
     except ValueError:
         raise HTTPException(400, f"Invalid integer: {v}")
 
-
 @router.get("/api/watchlist")
 async def list_watchlist(request: Request, card_id: Optional[int] = None) -> List[Dict[str, Any]]:
     pool = _pool(request)
-    uid = _uid_int(request)  # ✅ int, not str
+    uid = _uid_raw(request)  # keep as string; SQL will cast
 
-    q = "SELECT * FROM watchlist WHERE user_id=$1 ORDER BY started_at DESC"
+    q = "SELECT * FROM watchlist WHERE user_id = $1::bigint ORDER BY started_at DESC"
     params: List[Any] = [uid]
 
     if card_id is not None:
-        q = "SELECT * FROM watchlist WHERE user_id=$1 AND card_id=$2 ORDER BY started_at DESC"
+        q = "SELECT * FROM watchlist WHERE user_id = $1::bigint AND card_id = $2 ORDER BY started_at DESC"
         params.append(int(card_id))
 
     async with pool.acquire() as con:
@@ -64,13 +56,11 @@ async def list_watchlist(request: Request, card_id: Optional[int] = None) -> Lis
 
     return [dict(r) for r in rows]
 
-
 @router.post("/api/watchlist")
 async def add_watchlist(request: Request, payload: Dict[str, Any]) -> Dict[str, Any]:
     pool = _pool(request)
-    uid = _uid_int(request)  # ✅ int, not str
+    uid = _uid_raw(request)  # keep as string; SQL will cast
 
-    # Expecting at least card_id + platform based on your table screenshot
     for k in ("card_id", "platform"):
         if k not in payload:
             raise HTTPException(400, f"missing {k}")
@@ -79,8 +69,8 @@ async def add_watchlist(request: Request, payload: Dict[str, Any]) -> Dict[str, 
     if card_id is None:
         raise HTTPException(400, "missing card_id")
 
-    # Optional fields (adjust to your real columns)
     user_discord_id = _int_or_none(payload.get("user_discord_id"))
+    fallback_channel_id = _int_or_none(payload.get("fallback_channel_id"))
 
     async with pool.acquire() as con:
         await con.execute(
@@ -89,7 +79,7 @@ async def add_watchlist(request: Request, payload: Dict[str, Any]) -> Dict[str, 
             (user_id, user_discord_id, card_id, platform, ref_mode, ref_price, rise_pct, fall_pct,
              cooloff_minutes, quiet_start, quiet_end, prefer_dm, fallback_channel_id)
             VALUES
-            ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+            ($1::bigint, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             """,
             uid,
             user_discord_id,
@@ -103,7 +93,7 @@ async def add_watchlist(request: Request, payload: Dict[str, Any]) -> Dict[str, 
             payload.get("quiet_start"),
             payload.get("quiet_end"),
             payload.get("prefer_dm", True),
-            _int_or_none(payload.get("fallback_channel_id")),
+            fallback_channel_id,
         )
 
     return {"ok": True}
