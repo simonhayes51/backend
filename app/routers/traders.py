@@ -450,6 +450,30 @@ async def browse_traders(
     }
 
 
+@router.get("")
+@social_router.get("")
+async def browse_traders_root(
+    request: Request,
+    search: Optional[str] = Query(None, description="Search by username or bio"),
+    specialty: Optional[str] = Query(None, description="Filter by specialty"),
+    verified_only: bool = Query(False),
+    sort_by: str = Query("followers", description="followers, rating, posts, recent"),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
+    db: asyncpg.Connection = Depends(get_db),
+):
+    return await browse_traders(
+        request=request,
+        search=search,
+        specialty=specialty,
+        verified_only=verified_only,
+        sort_by=sort_by,
+        offset=offset,
+        limit=limit,
+        db=db,
+    )
+
+
 @router.get("/stats/{trader_id}", response_model=TraderStats)
 async def get_trader_stats(
     trader_id: str,

@@ -2,7 +2,8 @@
 Instant Messaging Router - Direct messages between users
 """
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
-from typing import List
+from typing import List, Optional
+from pydantic import BaseModel
 import asyncpg
 
 from app.models.social import (
@@ -15,6 +16,7 @@ from app.models.social import (
 from app.db import get_db
 
 router = APIRouter(prefix="/api/messages", tags=["Messaging"])
+social_router = APIRouter(prefix="/api/social/messages", tags=["Messaging"])
 
 
 def get_current_user(request):
@@ -60,6 +62,50 @@ async def get_or_create_conversation(
     )
 
     return conversation_id
+
+
+async def _get_conversation(
+    db: asyncpg.Connection,
+    conversation_id: int,
+    user_id: str,
+) -> asyncpg.Record:
+    conversation = await db.fetchrow(
+        "SELECT * FROM conversations WHERE id = $1",
+        conversation_id,
+    )
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    if conversation["user1_id"] != user_id and conversation["user2_id"] != user_id:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    return conversation
+
+
+def _format_message(row: dict, user_id: str) -> dict:
+    message = dict(row)
+    message["is_sender"] = message.get("sender_id") == user_id
+    return message
+
+
+def _format_conversation(row: dict) -> dict:
+    conversation = dict(row)
+    conversation["title"] = conversation.get("other_user_username")
+    conversation["participant"] = {
+        "id": conversation.get("other_user_id"),
+        "username": conversation.get("other_user_username"),
+        "avatar_url": conversation.get("other_user_avatar"),
+    }
+    conversation["last_message"] = {
+        "content": conversation.get("last_message_content"),
+    }
+    return conversation
+
+
+class StartConversationRequest(BaseModel):
+    recipient_id: str
+
+
+class MessagePayload(BaseModel):
+    content: str
 
 
 @router.post("/send", response_model=MessageWithUser)
@@ -140,10 +186,11 @@ async def send_message(
     msg_dict["recipient_username"] = recipient_info["username"]
     msg_dict["recipient_avatar"] = recipient_info["avatar_url"]
 
-    return msg_dict
+    return _format_message(msg_dict, user_id)
 
 
 @router.get("/conversations", response_model=List[ConversationWithDetails])
+@social_router.get("/conversations", response_model=List[ConversationWithDetails])
 async def get_conversations(
     request: Request,
     db: asyncpg.Connection = Depends(get_db)
@@ -186,7 +233,68 @@ async def get_conversations(
     """
 
     rows = await db.fetch(query, user_id)
-    return [dict(row) for row in rows]
+    return [_format_conversation(dict(row)) for row in rows]
+
+
+@router.post("/conversations")
+@social_router.post("/conversations")
+async def start_conversation(
+    payload: StartConversationRequest,
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db),
+):
+    user = get_current_user(request)
+    user_id = user["id"]
+
+    if user_id == payload.recipient_id:
+        raise HTTPException(status_code=400, detail="Cannot message yourself")
+
+    recipient = await db.fetchval(
+        "SELECT id FROM users WHERE id = $1",
+        payload.recipient_id,
+    )
+    if not recipient:
+        raise HTTPException(status_code=404, detail="Recipient not found")
+
+    conversation_id = await get_or_create_conversation(
+        db, user_id, payload.recipient_id
+    )
+
+    row = await db.fetchrow(
+        """
+        SELECT
+            c.*,
+            CASE
+                WHEN c.user1_id = $1 THEN c.user2_id
+                ELSE c.user1_id
+            END as other_user_id,
+            CASE
+                WHEN c.user1_id = $1 THEN up2.username
+                ELSE up1.username
+            END as other_user_username,
+            CASE
+                WHEN c.user1_id = $1 THEN up2.avatar_url
+                ELSE up1.avatar_url
+            END as other_user_avatar,
+            m.content as last_message_content,
+            (
+                SELECT COUNT(*)
+                FROM messages
+                WHERE conversation_id = c.id
+                    AND recipient_id = $1
+                    AND read_at IS NULL
+            ) as unread_count
+        FROM conversations c
+        LEFT JOIN user_profiles up1 ON c.user1_id = up1.user_id
+        LEFT JOIN user_profiles up2 ON c.user2_id = up2.user_id
+        LEFT JOIN messages m ON c.last_message_id = m.id
+        WHERE c.id = $2
+        """,
+        user_id,
+        conversation_id,
+    )
+
+    return _format_conversation(dict(row))
 
 
 @router.get("/conversations/{other_user_id}/messages", response_model=List[MessageWithUser])
@@ -248,7 +356,117 @@ async def get_conversation_messages(
     """
 
     rows = await db.fetch(query, conversation_id, limit, offset)
-    return [dict(row) for row in rows]
+    return [_format_message(dict(row), user_id) for row in rows]
+
+
+@router.get("/conversations/{conversation_id}/messages")
+@social_router.get("/conversations/{conversation_id}/messages")
+async def get_conversation_messages_by_id(
+    conversation_id: int,
+    request: Request,
+    offset: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=100),
+    db: asyncpg.Connection = Depends(get_db),
+):
+    user = get_current_user(request)
+    user_id = user["id"]
+
+    conversation = await _get_conversation(db, conversation_id, user_id)
+
+    await db.execute(
+        """
+        UPDATE messages
+        SET read_at = NOW()
+        WHERE conversation_id = $1
+            AND recipient_id = $2
+            AND read_at IS NULL
+        """,
+        conversation_id,
+        user_id
+    )
+
+    query = """
+        SELECT
+            m.*,
+            up1.username as sender_username,
+            up1.avatar_url as sender_avatar,
+            up2.username as recipient_username,
+            up2.avatar_url as recipient_avatar
+        FROM messages m
+        JOIN user_profiles up1 ON m.sender_id = up1.user_id
+        JOIN user_profiles up2 ON m.recipient_id = up2.user_id
+        WHERE m.conversation_id = $1 AND m.deleted_at IS NULL
+        ORDER BY m.created_at DESC
+        LIMIT $2 OFFSET $3
+    """
+
+    rows = await db.fetch(query, conversation["id"], limit, offset)
+    return [_format_message(dict(row), user_id) for row in rows]
+
+
+@router.post("/conversations/{conversation_id}/messages")
+@social_router.post("/conversations/{conversation_id}/messages")
+async def send_message_in_conversation(
+    conversation_id: int,
+    payload: MessagePayload,
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db),
+):
+    user = get_current_user(request)
+    user_id = user["id"]
+
+    conversation = await _get_conversation(db, conversation_id, user_id)
+    recipient_id = (
+        conversation["user2_id"]
+        if conversation["user1_id"] == user_id
+        else conversation["user1_id"]
+    )
+
+    msg_row = await db.fetchrow(
+        """
+        INSERT INTO messages (
+            conversation_id, sender_id, recipient_id, content
+        )
+        VALUES ($1, $2, $3, $4)
+        RETURNING *
+        """,
+        conversation_id,
+        user_id,
+        recipient_id,
+        payload.content,
+    )
+
+    sender_info = await db.fetchrow(
+        "SELECT username, avatar_url FROM user_profiles WHERE user_id = $1",
+        user_id
+    )
+
+    recipient_info = await db.fetchrow(
+        "SELECT username, avatar_url FROM user_profiles WHERE user_id = $1",
+        recipient_id
+    )
+
+    await db.execute(
+        """
+        INSERT INTO notifications (
+            user_id, notification_type, title, message,
+            related_user_id, related_message_id
+        )
+        VALUES ($1, 'new_message', 'New Message', $2, $3, $4)
+        """,
+        recipient_id,
+        f"{sender_info['username']} sent you a message",
+        user_id,
+        msg_row["id"]
+    )
+
+    msg_dict = dict(msg_row)
+    msg_dict["sender_username"] = sender_info["username"]
+    msg_dict["sender_avatar"] = sender_info["avatar_url"]
+    msg_dict["recipient_username"] = recipient_info["username"]
+    msg_dict["recipient_avatar"] = recipient_info["avatar_url"]
+
+    return _format_message(msg_dict, user_id)
 
 
 @router.delete("/messages/{message_id}")
@@ -323,6 +541,14 @@ async def get_unread_count(
     }
 
 
+@social_router.get("/unread-count")
+async def get_unread_count_social(
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db),
+):
+    return await get_unread_count(request=request, db=db)
+
+
 @router.post("/mark-read/{conversation_id}")
 async def mark_conversation_read(
     conversation_id: int,
@@ -363,10 +589,26 @@ async def mark_conversation_read(
     return {"message": "Messages marked as read"}
 
 
+@router.post("/conversations/{conversation_id}/read")
+@social_router.post("/conversations/{conversation_id}/read")
+async def mark_conversation_read_alias(
+    conversation_id: int,
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db),
+):
+    return await mark_conversation_read(
+        conversation_id=conversation_id,
+        request=request,
+        db=db,
+    )
+
+
 @router.get("/search")
 async def search_users_for_messaging(
     request: Request,
-    query: str = Query(..., min_length=1),
+    query: Optional[str] = Query(None),
+    q: Optional[str] = Query(None),
+    username: Optional[str] = Query(None),
     db: asyncpg.Connection = Depends(get_db)
 ):
     """
@@ -374,6 +616,10 @@ async def search_users_for_messaging(
     """
     user = get_current_user(request)
     user_id = user["id"]
+
+    search_term = query or q or username
+    if not search_term or not search_term.strip():
+        raise HTTPException(status_code=400, detail="Search query required")
 
     # Search users by username
     rows = await db.fetch(
@@ -392,31 +638,49 @@ async def search_users_for_messaging(
         LIMIT 20
         """,
         user_id,
-        f"%{query}%"
+        f"%{search_term}%"
     )
 
     return [dict(row) for row in rows]
 
 
 @router.get("/users/search")
+@social_router.get("/users/search")
 async def search_users_for_messaging_alias(
     request: Request,
-    query: str = Query(..., min_length=1),
+    query: Optional[str] = Query(None),
+    q: Optional[str] = Query(None),
+    username: Optional[str] = Query(None),
     db: asyncpg.Connection = Depends(get_db)
 ):
     """
     Alias: Search for users to start a conversation with
     """
-    return await search_users_for_messaging(request=request, query=query, db=db)
+    return await search_users_for_messaging(
+        request=request,
+        query=query,
+        q=q,
+        username=username,
+        db=db,
+    )
 
 
 @router.get("/search/users")
+@social_router.get("/search/users")
 async def search_users_for_messaging_alt_alias(
     request: Request,
-    query: str = Query(..., min_length=1),
+    query: Optional[str] = Query(None),
+    q: Optional[str] = Query(None),
+    username: Optional[str] = Query(None),
     db: asyncpg.Connection = Depends(get_db)
 ):
     """
     Alias: Search for users to start a conversation with
     """
-    return await search_users_for_messaging(request=request, query=query, db=db)
+    return await search_users_for_messaging(
+        request=request,
+        query=query,
+        q=q,
+        username=username,
+        db=db,
+    )

@@ -2,7 +2,7 @@
 Pydantic models for social trading feed features
 """
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, Field, validator
 from decimal import Decimal
 
@@ -114,6 +114,9 @@ class SocialPostWithAuthor(SocialPost):
     total_followers: Optional[int]
     user_reaction: Optional[str] = None  # 'like', 'dislike', or None
     is_author: bool = False  # True if current user is the author
+    title: Optional[str] = None
+    author: Optional[Dict[str, Any]] = None
+    stats: Optional[Dict[str, Any]] = None
 
 
 class FeedResponse(BaseModel):
@@ -207,6 +210,8 @@ class CommentWithAuthor(Comment):
     verified: Optional[bool]
     user_has_liked: bool = False
     is_author: bool = False
+    author: Optional[Dict[str, Any]] = None
+    likes: Optional[int] = None
 
 
 class CommentLikeCreate(BaseModel):
@@ -268,6 +273,7 @@ class MessageWithUser(Message):
     sender_avatar: Optional[str]
     recipient_username: str
     recipient_avatar: Optional[str]
+    is_sender: bool = False
 
 
 class Conversation(BaseModel):
@@ -285,6 +291,9 @@ class ConversationWithDetails(Conversation):
     other_user_avatar: Optional[str]
     last_message_content: Optional[str]
     unread_count: int
+    title: Optional[str] = None
+    participant: Optional[Dict[str, Any]] = None
+    last_message: Optional[Dict[str, Any]] = None
 
 
 # ============================================================================
