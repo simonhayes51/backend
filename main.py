@@ -30,6 +30,7 @@ from fastapi.responses import RedirectResponse, JSONResponse, StreamingResponse,
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from starlette.middleware.sessions import SessionMiddleware
+import inspect
 from pydantic import BaseModel, Field
 
 from app.auth.entitlements import compute_entitlements, require_feature
@@ -1059,6 +1060,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+def _session_middleware_kwargs() -> dict:
+    kwargs = {
+        "secret_key": SECRET_KEY,
+        "same_site": "none" if IS_PROD else "lax",
+        "https_only": IS_PROD,
+    }
+    session_domain = os.getenv("SESSION_COOKIE_DOMAIN")
+    if session_domain:
+        kwargs["domain"] = session_domain
+    supported_params = inspect.signature(SessionMiddleware.__init__).parameters
+    return {key: value for key, value in kwargs.items() if key in supported_params}
 
 app.add_middleware(
     SessionMiddleware,
