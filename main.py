@@ -2325,12 +2325,20 @@ async def get_current_user_info(request: Request, conn=Depends(get_db)):
             "message": "Discord server membership required"
         }
 
-    # Get user profile using UUID
+    # Get user profile using UUID (with account_type from users table)
     profile = await conn.fetchrow(
         """
-        SELECT username, avatar_url, global_name, is_premium, premium_until
-        FROM user_profiles
-        WHERE user_id = $1
+        SELECT 
+            up.username, 
+            up.avatar_url, 
+            up.global_name, 
+            up.is_premium, 
+            up.premium_until,
+            u.account_type,
+            u.tier
+        FROM user_profiles up
+        LEFT JOIN users u ON up.user_id = u.id
+        WHERE up.user_id = $1
         """,
         user_id
     )
@@ -2339,6 +2347,19 @@ async def get_current_user_info(request: Request, conn=Depends(get_db)):
         print(f"❌ No profile found for user_id(UUID) {user_id}")
         request.session.clear()
         return {"authenticated": False}
+    
+    # Check if user is a trader
+    is_trader = profile["account_type"] == "trader"
+    trader_profile = None
+    if is_trader:
+        trader_profile = await conn.fetchrow(
+            """
+            SELECT verified, total_followers, total_posts, avg_rating
+            FROM trader_profiles
+            WHERE user_id = $1
+            """,
+            user_id
+        )
 
     # REAL-TIME PREMIUM VALIDATION (UUID)
     is_premium = False
@@ -2378,7 +2399,7 @@ async def get_current_user_info(request: Request, conn=Depends(get_db)):
             except Exception as e:
                 logging.warning(f"Failed to remove Discord role for expired discord_id {discord_id}: {e}")
 
-    return {
+    response_data = {
         "authenticated": True,
         "user_id": user_id,                 # UUID
         "discord_id": int(discord_id),       # BIGINT
@@ -2392,8 +2413,23 @@ async def get_current_user_info(request: Request, conn=Depends(get_db)):
         "limits": {
             "watchlist_max": 500 if is_premium else 3,
             "trending": {"timeframes": ["4h", "6h", "24h"] if is_premium else ["24h"]}
-        }
+        },
+        # Trader information
+        "account_type": profile["account_type"] or "user",
+        "tier": profile["tier"],
+        "is_trader": is_trader
     }
+    
+    # Add trader-specific fields if user is a trader
+    if is_trader and trader_profile:
+        response_data.update({
+            "verified": trader_profile["verified"],
+            "total_followers": trader_profile["total_followers"],
+            "total_posts": trader_profile["total_posts"],
+            "avg_rating": float(trader_profile["avg_rating"]) if trader_profile["avg_rating"] else 0.0
+        })
+    
+    return response_data
 
 @app.get("/api/validate-premium")
 async def validate_premium(user_id: str = Depends(get_current_user), conn=Depends(get_db)):
