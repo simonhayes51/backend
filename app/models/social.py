@@ -110,8 +110,8 @@ class SocialPostWithAuthor(SocialPost):
     username: str
     avatar_url: Optional[str]
     verified: bool
-    avg_rating: Optional[Decimal]
-    total_followers: Optional[int]
+    avg_rating: Optional[Decimal] = None
+    total_followers: Optional[int] = None
     user_reaction: Optional[str] = None  # 'like', 'dislike', or None
     is_author: bool = False  # True if current user is the author
     title: Optional[str] = None

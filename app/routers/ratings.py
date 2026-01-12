@@ -168,20 +168,11 @@ async def get_trader_ratings(
     return [dict(row) for row in rows]
 
 
-@router.get("/{trader_id}", response_model=List[RatingWithAuthor])
-@social_router.get("/{trader_id}", response_model=List[RatingWithAuthor])
-async def get_trader_ratings_by_id(
-    trader_id: str,
-    offset: int = Query(0, ge=0),
-    limit: int = Query(20, ge=1, le=100),
-    db: asyncpg.Connection = Depends(get_db),
-):
-    return await get_trader_ratings(
-        trader_id=trader_id,
-        offset=offset,
-        limit=limit,
-        db=db,
-    )
+
+
+
+
+
 
 
 @router.get("/trader/{trader_id}/summary")
@@ -317,3 +308,19 @@ async def get_top_rated_traders(
     except asyncpg_exceptions.UndefinedTableError:
         return []
     return [dict(row) for row in rows]
+
+
+@router.get("/{trader_id}", response_model=List[RatingWithAuthor])
+@social_router.get("/{trader_id}", response_model=List[RatingWithAuthor])
+async def get_trader_ratings_by_id(
+    trader_id: str,
+    offset: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
+    db: asyncpg.Connection = Depends(get_db),
+):
+    return await get_trader_ratings(
+        trader_id=trader_id,
+        offset=offset,
+        limit=limit,
+        db=db,
+    )
