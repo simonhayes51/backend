@@ -1075,10 +1075,7 @@ def _session_middleware_kwargs() -> dict:
 
 app.add_middleware(
     SessionMiddleware,
-    secret_key=SECRET_KEY,
-    same_site="none" if IS_PROD else "lax",
-    https_only=IS_PROD,
-    domain=COOKIE_DOMAIN,
+    **_session_middleware_kwargs(),
 )
 
     
