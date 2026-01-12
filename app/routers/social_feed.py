@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from typing import Optional, List
 from datetime import datetime
 import asyncpg
+from asyncpg import exceptions as asyncpg_exceptions
 
 from app.models.social import (
     SocialPostCreate,
@@ -16,6 +17,7 @@ from app.models.social import (
 from app.db import get_pool
 
 router = APIRouter(prefix="/api/feed", tags=["Social Feed"])
+social_router = APIRouter(prefix="/api/social", tags=["Social Feed"])
 
 
 def get_current_user(request: Request):
@@ -30,6 +32,17 @@ async def get_db():
     pool = await get_pool()
     async with pool.acquire() as conn:
         yield conn
+
+
+async def table_exists(db: asyncpg.Connection, table_name: str) -> bool:
+    return await db.fetchval("SELECT to_regclass($1)", table_name) is not None
+
+
+async def ensure_tables_exist(db: asyncpg.Connection, table_names: List[str]) -> bool:
+    for table_name in table_names:
+        if not await table_exists(db, table_name):
+            return False
+    return True
 
 
 @router.post("/posts", response_model=SocialPost)
@@ -86,6 +99,28 @@ async def create_post(
     return dict(row)
 
 
+@router.get("", response_model=FeedResponse)
+async def get_feed_root(
+    request: Request,
+    feed_type: str = Query("all", description="all, trades, predictions"),
+    trader_id: Optional[int] = Query(None, description="Filter by specific trader"),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
+    db: asyncpg.Connection = Depends(get_db)
+):
+    """
+    Get social feed posts (root alias)
+    """
+    return await get_feed(
+        request=request,
+        feed_type=feed_type,
+        trader_id=trader_id,
+        offset=offset,
+        limit=limit,
+        db=db,
+    )
+
+
 @router.get("/posts", response_model=FeedResponse)
 async def get_feed(
     request: Request,
@@ -110,94 +145,125 @@ async def get_feed(
         user_id = None
         is_authenticated = False
 
-    # Build the query based on filters
-    conditions = []
-    params = []
-    param_idx = 1
+    base_tables = [
+        "public.social_posts",
+        "public.user_profiles",
+        "public.trader_profiles",
+    ]
+    if not await ensure_tables_exist(db, base_tables):
+        return {
+            "posts": [],
+            "total": 0,
+            "has_more": False,
+            "offset": offset,
+            "limit": limit
+        }
 
-    # Filter by trader if specified
-    if trader_id:
-        conditions.append(f"sp.user_id = ${param_idx}")
-        params.append(trader_id)
-        param_idx += 1
+    if is_authenticated and not await table_exists(db, "public.trader_subscriptions"):
+        is_authenticated = False
+        user_id = None
 
-    # Filter by post type
-    if feed_type == "trades":
-        conditions.append(f"sp.post_type = ${param_idx}")
-        params.append("quick_flip")
-        param_idx += 1
-    elif feed_type == "predictions":
-        conditions.append(f"sp.post_type = ${param_idx}")
-        params.append("prediction")
-        param_idx += 1
+    try:
+        # Build the query based on filters
+        conditions = []
+        params = []
+        param_idx = 1
 
-    # Filter by subscriptions if authenticated and not viewing a specific trader
-    if is_authenticated and not trader_id and feed_type != "all":
-        conditions.append(f"""
-            sp.user_id IN (
-                SELECT trader_id FROM trader_subscriptions
-                WHERE subscriber_id = ${param_idx} AND is_active = TRUE
-            )
-        """)
-        params.append(user_id)
-        param_idx += 1
+        # Filter by trader if specified
+        if trader_id:
+            conditions.append(f"sp.user_id = ${param_idx}")
+            params.append(trader_id)
+            param_idx += 1
 
-    # Only show non-premium posts or posts from traders user is subscribed to
-    if is_authenticated:
-        conditions.append(f"""
-            (sp.is_premium = FALSE OR sp.user_id IN (
-                SELECT trader_id FROM trader_subscriptions
-                WHERE subscriber_id = ${param_idx} AND is_active = TRUE
-            ))
-        """)
-        params.append(user_id)
-        param_idx += 1
-    else:
-        conditions.append("sp.is_premium = FALSE")
+        # Filter by post type
+        if feed_type == "trades":
+            conditions.append(f"sp.post_type = ${param_idx}")
+            params.append("quick_flip")
+            param_idx += 1
+        elif feed_type == "predictions":
+            conditions.append(f"sp.post_type = ${param_idx}")
+            params.append("prediction")
+            param_idx += 1
 
-    # Don't show expired posts
-    conditions.append("(sp.expires_at IS NULL OR sp.expires_at > NOW())")
+        # Filter by subscriptions if authenticated and not viewing a specific trader
+        if is_authenticated and not trader_id and feed_type != "all":
+            conditions.append(f"""
+                sp.user_id IN (
+                    SELECT trader_id FROM trader_subscriptions
+                    WHERE subscriber_id = ${param_idx} AND is_active = TRUE
+                )
+            """)
+            params.append(user_id)
+            param_idx += 1
 
-    where_clause = " AND ".join(conditions) if conditions else "TRUE"
+        # Only show non-premium posts or posts from traders user is subscribed to
+        if is_authenticated:
+            conditions.append(f"""
+                (sp.is_premium = FALSE OR sp.user_id IN (
+                    SELECT trader_id FROM trader_subscriptions
+                    WHERE subscriber_id = ${param_idx} AND is_active = TRUE
+                ))
+            """)
+            params.append(user_id)
+            param_idx += 1
+        else:
+            conditions.append("sp.is_premium = FALSE")
 
-    # Get total count
-    count_query = f"""
-        SELECT COUNT(*)
-        FROM social_posts sp
-        WHERE {where_clause}
-    """
-    total = await db.fetchval(count_query, *params)
+        # Don't show expired posts
+        conditions.append("(sp.expires_at IS NULL OR sp.expires_at > NOW())")
 
-    # Get posts with author info
-    params.extend([limit, offset])
-    query = f"""
-        SELECT
-            sp.*,
-            up.username,
-            up.avatar_url,
-            COALESCE(tp.verified, FALSE) as verified,
-            tp.avg_rating,
-            tp.total_followers,
-            CASE WHEN sp.user_id = ${param_idx + 2} THEN TRUE ELSE FALSE END as is_author
-        FROM social_posts sp
-        JOIN user_profiles up ON sp.user_id = up.user_id
-        LEFT JOIN trader_profiles tp ON sp.user_id = tp.user_id
-        WHERE {where_clause}
-        ORDER BY sp.created_at DESC
-        LIMIT ${param_idx} OFFSET ${param_idx + 1}
-    """
+        where_clause = " AND ".join(conditions) if conditions else "TRUE"
 
-    # Add user_id for is_author check (or NULL if not authenticated)
-    query_params = params + [user_id if is_authenticated else None]
+        # Get total count
+        count_query = f"""
+            SELECT COUNT(*)
+            FROM social_posts sp
+            WHERE {where_clause}
+        """
+        total = await db.fetchval(count_query, *params)
 
-    rows = await db.fetch(query, *query_params)
+        # Get posts with author info
+        params.extend([limit, offset])
+        query = f"""
+            SELECT
+                sp.*,
+                up.username,
+                up.avatar_url,
+                COALESCE(tp.verified, FALSE) as verified,
+                tp.avg_rating,
+                tp.total_followers,
+                CASE WHEN sp.user_id = ${param_idx + 2} THEN TRUE ELSE FALSE END as is_author
+            FROM social_posts sp
+            JOIN user_profiles up ON sp.user_id = up.user_id
+            LEFT JOIN trader_profiles tp ON sp.user_id = tp.user_id
+            WHERE {where_clause}
+            ORDER BY sp.created_at DESC
+            LIMIT ${param_idx} OFFSET ${param_idx + 1}
+        """
 
+        # Add user_id for is_author check (or NULL if not authenticated)
+        query_params = params + [user_id if is_authenticated else None]
+
+        rows = await db.fetch(query, *query_params)
+    except asyncpg_exceptions.UndefinedTableError:
+        return {
+            "posts": [],
+            "total": 0,
+            "has_more": False,
+            "offset": offset,
+            "limit": limit
+        }
+
+    can_read_reactions = is_authenticated and await table_exists(
+        db,
+        "public.post_reactions"
+    )
     posts = []
     for row in rows:
         post_dict = dict(row)
 
         # Get user's reaction to this post if authenticated
-        if is_authenticated:
+        if can_read_reactions:
             reaction = await db.fetchval(
                 "SELECT reaction_type FROM post_reactions WHERE user_id = $1 AND post_id = $2",
                 user_id,
@@ -216,6 +282,62 @@ async def get_feed(
         "offset": offset,
         "limit": limit
     }
+
+
+@social_router.get("/feed", response_model=FeedResponse)
+async def get_social_feed(
+    request: Request,
+    feed_type: str = Query("all", description="all, trades, predictions"),
+    trader_id: Optional[int] = Query(None, description="Filter by specific trader"),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
+    db: asyncpg.Connection = Depends(get_db)
+):
+    """
+    Get social feed posts (social alias)
+    """
+    return await get_feed(
+        request=request,
+        feed_type=feed_type,
+        trader_id=trader_id,
+        offset=offset,
+        limit=limit,
+        db=db,
+    )
+
+
+@social_router.get("/posts", response_model=FeedResponse)
+async def get_social_posts(
+    request: Request,
+    feed_type: str = Query("all", description="all, trades, predictions"),
+    trader_id: Optional[int] = Query(None, description="Filter by specific trader"),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
+    db: asyncpg.Connection = Depends(get_db)
+):
+    """
+    Get social feed posts (posts alias)
+    """
+    return await get_feed(
+        request=request,
+        feed_type=feed_type,
+        trader_id=trader_id,
+        offset=offset,
+        limit=limit,
+        db=db,
+    )
+
+
+@social_router.post("/posts", response_model=SocialPost)
+async def create_social_post(
+    post: SocialPostCreate,
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db)
+):
+    """
+    Create a new social post (social alias)
+    """
+    return await create_post(post=post, request=request, db=db)
 
 
 @router.get("/posts/{post_id}", response_model=SocialPostWithAuthor)
