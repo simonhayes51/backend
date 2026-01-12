@@ -1,7 +1,7 @@
 """
 Trader Subscriptions Router - Follow and subscribe to traders
 """
-from fastapi import APIRouter, Depends, HTTPException, Request, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from typing import List
 import asyncpg
 
@@ -13,6 +13,7 @@ from app.models.social import (
 from app.db import get_pool
 
 router = APIRouter(prefix="/api/subscriptions", tags=["Subscriptions"])
+social_router = APIRouter(prefix="/api/social/subscriptions", tags=["Subscriptions"])
 
 
 def get_current_user(request: Request):
@@ -363,3 +364,27 @@ async def get_recommended_traders(
         rows = await db.fetch(query, limit)
 
     return [dict(row) for row in rows]
+
+
+@router.get("/recommended")
+async def get_recommended_traders_alias(
+    request: Request,
+    limit: int = Query(10, ge=1, le=50),
+    db: asyncpg.Connection = Depends(get_db)
+):
+    """
+    Alias: Get recommended traders to follow
+    """
+    return await get_recommended_traders(request=request, limit=limit, db=db)
+
+
+@social_router.get("/recommended")
+async def get_social_recommended_traders(
+    request: Request,
+    limit: int = Query(10, ge=1, le=50),
+    db: asyncpg.Connection = Depends(get_db)
+):
+    """
+    Social alias: Get recommended traders to follow
+    """
+    return await get_recommended_traders(request=request, limit=limit, db=db)
