@@ -54,6 +54,7 @@ from app.routers.trades import router as trades_router
 from app.routers.social_feed import router as social_feed_router
 from app.routers.social_feed import social_router as social_feed_social_router
 from app.routers.subscriptions import router as subscriptions_router
+from app.routers.subscriptions import social_router as subscriptions_social_router
 from app.routers.interactions import router as interactions_router
 from app.routers.messaging import router as messaging_router
 from app.routers.ratings import router as ratings_router
@@ -87,6 +88,7 @@ PORT = int(os.getenv("PORT", 8000))
 
 ENV = os.getenv("ENV", "production").lower()
 IS_PROD = ENV in ("prod", "production")
+COOKIE_DOMAIN = os.getenv("COOKIE_DOMAIN") or (".futhub.co.uk" if IS_PROD else None)
 
 # JWT / Discord
 JWT_PRIVATE_KEY = os.getenv("JWT_PRIVATE_KEY", "dev-secret-change-me")
@@ -1063,6 +1065,7 @@ app.add_middleware(
     secret_key=SECRET_KEY,
     same_site="none" if IS_PROD else "lax",
     https_only=IS_PROD,
+    domain=COOKIE_DOMAIN,
 )
 
     
@@ -1272,6 +1275,7 @@ app.include_router(trades_router)           # /api/trades/*
 app.include_router(social_feed_router)      # /api/feed/*
 app.include_router(social_feed_social_router)  # /api/social/feed, /api/social/posts
 app.include_router(subscriptions_router)    # /api/subscriptions/*
+app.include_router(subscriptions_social_router)  # /api/social/subscriptions/*
 app.include_router(interactions_router)     # /api/interactions/*
 app.include_router(messaging_router)        # /api/messages/*
 app.include_router(ratings_router)          # /api/ratings/*
@@ -1779,22 +1783,23 @@ async def list_watch_items(request: Request, user_id: str = Depends(get_current_
         if not watches:
             return {"ok": True, "items": []}
 
-        # Batch meta lookup
-        card_ids: list[str] = [
-            str(w["card_id"]) for w in watches if w.get("card_id") is not None
+# Batch meta lookup (card_id is BIGINT)
+        card_ids: list[int] = [
+            int(w["card_id"]) for w in watches if w.get("card_id") is not None
         ]
+        
         async with request.app.state.player_pool.acquire() as pconn:
             meta_rows = await pconn.fetch(
                 """
                 SELECT card_id, name, rating, club, nation
                 FROM fut_players
-                WHERE card_id = ANY($1::text[])
+                WHERE card_id = ANY($1::bigint[])
                 """,
                 card_ids,
             )
-
+        
         meta_map = {
-            str(m["card_id"]): {
+            int(m["card_id"]): {
                 "name": m["name"],
                 "rating": m["rating"],
                 "club": m["club"],
@@ -1802,6 +1807,7 @@ async def list_watch_items(request: Request, user_id: str = Depends(get_current_
             }
             for m in meta_rows
         }
+
 
         # Fetch live prices concurrently
         tasks = [
@@ -1821,7 +1827,7 @@ async def list_watch_items(request: Request, user_id: str = Depends(get_current_
                 change = int(live_price) - int(w["started_price"])
                 change_pct = round((change / int(w["started_price"])) * 100, 2)
 
-            m = meta_map.get(str(w["card_id"]), {})
+            m = meta_map.get(int(w["card_id"]), {})
             enriched.append(
                 {
                     "id": w["id"],
