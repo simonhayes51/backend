@@ -37,9 +37,10 @@ async def _uid_param(request: Request, wdb: asyncpg.Connection) -> tuple[str | i
         """
         SELECT data_type
         FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name = 'watchlist'
+        WHERE table_name = 'watchlist'
           AND column_name = 'user_id'
+        ORDER BY (table_schema = 'public') DESC
+        LIMIT 1
         """
     )
     if column_type in ("bigint", "integer", "smallint"):
