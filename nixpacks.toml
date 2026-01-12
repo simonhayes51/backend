@@ -1,10 +1,14 @@
-python = "3.9"
+python = "3.11"
 
 [phases.setup]
-nixPkgs = ["python39"]
+nixPkgs = ["python311", "python311Packages.virtualenv"]
 
 [phases.install]
-cmds = ["pip install -r requirements.txt"]
+cmds = [
+  "python -m venv /opt/venv",
+  "/opt/venv/bin/python -m pip install --upgrade pip",
+  "/opt/venv/bin/pip install -r requirements.txt"
+]
 
 [start]
-cmd = "uvicorn main:app --host 0.0.0.0 --port $PORT"
+cmd = "/opt/venv/bin/uvicorn main:app --host 0.0.0.0 --port $PORT"
