@@ -16,6 +16,7 @@ from app.models.social import (
 from app.db import get_pool
 
 router = APIRouter(prefix="/api/feed", tags=["Social Feed"])
+social_router = APIRouter(prefix="/api/social", tags=["Social Feed"])
 
 
 def get_current_user(request: Request):
@@ -84,6 +85,28 @@ async def create_post(
     )
 
     return dict(row)
+
+
+@router.get("", response_model=FeedResponse)
+async def get_feed_root(
+    request: Request,
+    feed_type: str = Query("all", description="all, trades, predictions"),
+    trader_id: Optional[int] = Query(None, description="Filter by specific trader"),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
+    db: asyncpg.Connection = Depends(get_db)
+):
+    """
+    Get social feed posts (root alias)
+    """
+    return await get_feed(
+        request=request,
+        feed_type=feed_type,
+        trader_id=trader_id,
+        offset=offset,
+        limit=limit,
+        db=db,
+    )
 
 
 @router.get("/posts", response_model=FeedResponse)
@@ -216,6 +239,62 @@ async def get_feed(
         "offset": offset,
         "limit": limit
     }
+
+
+@social_router.get("/feed", response_model=FeedResponse)
+async def get_social_feed(
+    request: Request,
+    feed_type: str = Query("all", description="all, trades, predictions"),
+    trader_id: Optional[int] = Query(None, description="Filter by specific trader"),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
+    db: asyncpg.Connection = Depends(get_db)
+):
+    """
+    Get social feed posts (social alias)
+    """
+    return await get_feed(
+        request=request,
+        feed_type=feed_type,
+        trader_id=trader_id,
+        offset=offset,
+        limit=limit,
+        db=db,
+    )
+
+
+@social_router.get("/posts", response_model=FeedResponse)
+async def get_social_posts(
+    request: Request,
+    feed_type: str = Query("all", description="all, trades, predictions"),
+    trader_id: Optional[int] = Query(None, description="Filter by specific trader"),
+    offset: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
+    db: asyncpg.Connection = Depends(get_db)
+):
+    """
+    Get social feed posts (posts alias)
+    """
+    return await get_feed(
+        request=request,
+        feed_type=feed_type,
+        trader_id=trader_id,
+        offset=offset,
+        limit=limit,
+        db=db,
+    )
+
+
+@social_router.post("/posts", response_model=SocialPost)
+async def create_social_post(
+    post: SocialPostCreate,
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db)
+):
+    """
+    Create a new social post (social alias)
+    """
+    return await create_post(post=post, request=request, db=db)
 
 
 @router.get("/posts/{post_id}", response_model=SocialPostWithAuthor)
