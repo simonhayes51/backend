@@ -78,7 +78,7 @@ async def process_price_tick(pool: asyncpg.Pool, player_id: int, platform: str, 
             if row["prefer_dm"] and row["user_discord_id"]:
                 ok = await _send_discord_dm(row["user_discord_id"], content)
             if not ok:
-                await _send_channel_fallback(row.get("fallback_channel_id"), content)
+                await _send_channel_fallback(row["fallback_channel_id"], content)
             async with pool.acquire() as con:
                 await con.execute(
                     "INSERT INTO alerts_log (user_id, user_discord_id, player_id, platform, direction, pct, price, ref_mode, ref_price) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
