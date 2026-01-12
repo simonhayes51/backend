@@ -1,7 +1,7 @@
-python = "3.9"
+python = "3.11"
 
 [phases.setup]
-nixPkgs = ["python39", "python39Packages.virtualenv"]
+nixPkgs = ["python311", "python311Packages.virtualenv"]
 
 [phases.install]
 cmds = [
