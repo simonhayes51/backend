@@ -1445,14 +1445,45 @@ async def callback(request: Request):
                 user_id, username, avatar_url, global_name
             )
 
-        # Set session data only after membership verification
-        request.session["user_id"] = user_id
+               # discord_user_id is the snowflake you already have in `user_id` here
+        discord_user_id = int(user_id)
+        
+        # Ensure user exists + get UUID
+        user_row = await db.fetchrow(
+            """
+            INSERT INTO users (discord_id)
+            VALUES ($1)
+            ON CONFLICT (discord_id) DO UPDATE SET discord_id = EXCLUDED.discord_id
+            RETURNING id, discord_id, account_type, tier, plan, premium_until, roles
+            """,
+            discord_user_id
+        )
+        
+        user_uuid = str(user_row["id"])
+        
+        # Store UUID as the canonical session user_id
+        request.session["user_id"] = user_uuid
         request.session["username"] = username
         request.session["avatar_url"] = avatar_url
         request.session["global_name"] = global_name
-        request.session["roles"] = await get_member_role_names(user_id)
-
-        # FIXED: Add hash routing for successful login too
+        
+        # Keep discord id too (handy for Discord API calls / role sync)
+        request.session["discord_id"] = discord_user_id
+        
+        # Newer routers expect request.session["user"] dict
+        request.session["user"] = {
+            "id": user_uuid,                 # UUID ✅
+            "discord_id": discord_user_id,   # BIGINT ✅
+            "username": username,
+            "avatar_url": avatar_url,
+            "global_name": global_name,
+            "account_type": user_row["account_type"],
+            "tier": user_row["tier"],
+        }
+        
+        # If get_member_role_names expects Discord ID, pass discord_user_id
+        request.session["roles"] = await get_member_role_names(discord_user_id)
+        
         return RedirectResponse(f"{FRONTEND_URL}/#/")
 
     except HTTPException:
