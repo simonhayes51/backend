@@ -28,7 +28,7 @@ from fastapi import (
 )
 from fastapi.responses import RedirectResponse, JSONResponse, StreamingResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.exceptions import RequestValidationError
+from fastapi.exceptions import RequestValidationError, ResponseValidationError
 from starlette.middleware.sessions import SessionMiddleware
 import inspect
 from pydantic import BaseModel, Field
@@ -528,6 +528,16 @@ class UserSettings(BaseModel):
     default_chart_range: str = "30d"
     visible_widgets: List[str] = Field(default_factory=lambda: ["profit", "tax", "balance", "trades"])
 
+
+class UserProfileUpdate(BaseModel):
+    bio: Optional[str] = Field(None, max_length=1000)
+    header_image_url: Optional[str] = Field(None, max_length=2000)
+    location: Optional[str] = Field(None, max_length=255)
+    website_url: Optional[str] = Field(None, max_length=2000)
+    twitter_url: Optional[str] = Field(None, max_length=2000)
+    youtube_url: Optional[str] = Field(None, max_length=2000)
+    twitch_url: Optional[str] = Field(None, max_length=2000)
+
 class TradingGoal(BaseModel):
     title: str
     target_amount: int
@@ -663,6 +673,13 @@ async def lifespan(app: FastAPI):
             username VARCHAR(255),
             avatar_url TEXT,
             global_name VARCHAR(255),
+            bio TEXT,
+            header_image_url TEXT,
+            location VARCHAR(255),
+            website_url TEXT,
+            twitter_url TEXT,
+            youtube_url TEXT,
+            twitch_url TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )""")
@@ -674,6 +691,78 @@ async def lifespan(app: FastAPI):
         await conn.execute("""
         ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS premium_until TIMESTAMP WITH TIME ZONE
         """)
+        await conn.execute("""
+        ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS bio TEXT
+        """)
+        await conn.execute("""
+        ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS header_image_url TEXT
+        """)
+        await conn.execute("""
+        ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS location VARCHAR(255)
+        """)
+        await conn.execute("""
+        ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS website_url TEXT
+        """)
+        await conn.execute("""
+        ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS twitter_url TEXT
+        """)
+        await conn.execute("""
+        ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS youtube_url TEXT
+        """)
+        await conn.execute("""
+        ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS twitch_url TEXT
+        """)
+
+        # messaging: conversations/messages/notifications
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS conversations (
+            id BIGSERIAL PRIMARY KEY,
+            user1_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            user2_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            last_message_id BIGINT,
+            last_message_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            CHECK (user1_id < user2_id),
+            UNIQUE(user1_id, user2_id)
+        )""")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_conversations_user1 ON conversations(user1_id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_conversations_user2 ON conversations(user2_id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_conversations_last_message ON conversations(last_message_at DESC)")
+
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id BIGSERIAL PRIMARY KEY,
+            conversation_id BIGINT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+            sender_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            recipient_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            content TEXT NOT NULL,
+            read_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            deleted_at TIMESTAMP
+        )""")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, created_at DESC)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient_id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_unread ON messages(recipient_id, read_at) WHERE read_at IS NULL")
+
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS notifications (
+            id BIGSERIAL PRIMARY KEY,
+            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            notification_type VARCHAR(50) NOT NULL CHECK (notification_type IN (
+                'new_follower', 'post_like', 'post_comment', 'new_message',
+                'new_rating', 'mention', 'subscription'
+            )),
+            title VARCHAR(255) NOT NULL,
+            message TEXT NOT NULL,
+            related_user_id TEXT REFERENCES users(id) ON DELETE CASCADE,
+            related_post_id BIGINT REFERENCES social_posts(id) ON DELETE CASCADE,
+            related_comment_id BIGINT REFERENCES post_comments(id) ON DELETE CASCADE,
+            related_message_id BIGINT REFERENCES messages(id) ON DELETE CASCADE,
+            read_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, created_at DESC)")
 
         # Billing tables
         await conn.execute("""
@@ -1074,12 +1163,31 @@ ALLOWED_ORIGINS = [
     "http://localhost:5173",
     "http://localhost:3000",
 ]
+ALLOWED_ORIGIN_REGEX = r"^https://.*\\.futhub\\.co\\.uk$"
+
+
+def _is_allowed_origin(origin: str | None) -> bool:
+    if not origin:
+        return False
+    if origin in ALLOWED_ORIGINS:
+        return True
+    return re.match(ALLOWED_ORIGIN_REGEX, origin) is not None
+
+
+@app.middleware("http")
+async def add_cors_headers(request: Request, call_next):
+    response = await call_next(request)
+    origin = request.headers.get("origin")
+    if _is_allowed_origin(origin):
+        response.headers.setdefault("Access-Control-Allow-Origin", origin)
+        response.headers.setdefault("Access-Control-Allow-Credentials", "true")
+    return response
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     response = JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
     origin = request.headers.get("origin")
-    if origin in ALLOWED_ORIGINS:
+    if _is_allowed_origin(origin):
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Access-Control-Allow-Credentials"] = "true"
     return response
@@ -1088,7 +1196,17 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     response = JSONResponse(status_code=422, content={"detail": exc.errors()})
     origin = request.headers.get("origin")
-    if origin in ALLOWED_ORIGINS:
+    if _is_allowed_origin(origin):
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+    return response
+
+
+@app.exception_handler(ResponseValidationError)
+async def response_validation_exception_handler(request: Request, exc: ResponseValidationError):
+    response = JSONResponse(status_code=500, content={"detail": exc.errors()})
+    origin = request.headers.get("origin")
+    if _is_allowed_origin(origin):
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Access-Control-Allow-Credentials"] = "true"
     return response
@@ -1097,7 +1215,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 async def unhandled_exception_handler(request: Request, exc: Exception):
     response = JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
     origin = request.headers.get("origin")
-    if origin in ALLOWED_ORIGINS:
+    if _is_allowed_origin(origin):
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Access-Control-Allow-Credentials"] = "true"
     return response
@@ -1105,6 +1223,7 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS + ["https://api.futhub.co.uk"],
+    allow_origin_regex=ALLOWED_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1638,6 +1757,93 @@ async def get_dashboard(user_id: str = Depends(get_current_user), conn=Depends(g
 @app.get("/api/profile")
 async def get_profile(user_id: str = Depends(get_current_user), conn=Depends(get_db)):
     return await fetch_dashboard_data(user_id, conn)
+
+
+@app.get("/api/user-profile")
+async def get_user_profile(user_id: str = Depends(get_current_user), conn=Depends(get_db)):
+    profile = await conn.fetchrow(
+        """
+        SELECT
+            user_id,
+            username,
+            avatar_url,
+            global_name,
+            bio,
+            header_image_url,
+            location,
+            website_url,
+            twitter_url,
+            youtube_url,
+            twitch_url,
+            created_at,
+            updated_at
+        FROM user_profiles
+        WHERE user_id = $1
+        """,
+        user_id,
+    )
+    if not profile:
+        raise HTTPException(status_code=404, detail="User profile not found")
+    return dict(profile)
+
+
+@app.patch("/api/user-profile")
+async def update_user_profile(
+    payload: UserProfileUpdate,
+    user_id: str = Depends(get_current_user),
+    conn=Depends(get_db),
+):
+    updates = []
+    params: list[Any] = []
+    if payload.bio is not None:
+        updates.append(f"bio = ${len(params) + 1}")
+        params.append(payload.bio)
+    if payload.header_image_url is not None:
+        updates.append(f"header_image_url = ${len(params) + 1}")
+        params.append(payload.header_image_url)
+    if payload.location is not None:
+        updates.append(f"location = ${len(params) + 1}")
+        params.append(payload.location)
+    if payload.website_url is not None:
+        updates.append(f"website_url = ${len(params) + 1}")
+        params.append(payload.website_url)
+    if payload.twitter_url is not None:
+        updates.append(f"twitter_url = ${len(params) + 1}")
+        params.append(payload.twitter_url)
+    if payload.youtube_url is not None:
+        updates.append(f"youtube_url = ${len(params) + 1}")
+        params.append(payload.youtube_url)
+    if payload.twitch_url is not None:
+        updates.append(f"twitch_url = ${len(params) + 1}")
+        params.append(payload.twitch_url)
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="No updates provided")
+
+    params.append(user_id)
+    query = f"""
+        UPDATE user_profiles
+        SET {', '.join(updates)}, updated_at = NOW()
+        WHERE user_id = ${len(params)}
+        RETURNING
+            user_id,
+            username,
+            avatar_url,
+            global_name,
+            bio,
+            header_image_url,
+            location,
+            website_url,
+            twitter_url,
+            youtube_url,
+            twitch_url,
+            created_at,
+            updated_at
+    """
+    row = await conn.fetchrow(query, *params)
+    if not row:
+        raise HTTPException(status_code=404, detail="User profile not found")
+    return dict(row)
 
 @app.post("/api/trades")
 async def add_trade(request: Request, user_id: str = Depends(get_current_user), conn=Depends(get_db)):
@@ -2382,6 +2588,13 @@ async def get_current_user_info(request: Request, conn=Depends(get_db)):
             up.username, 
             up.avatar_url, 
             up.global_name, 
+            up.bio,
+            up.header_image_url,
+            up.location,
+            up.website_url,
+            up.twitter_url,
+            up.youtube_url,
+            up.twitch_url,
             up.is_premium, 
             up.premium_until,
             u.account_type,
@@ -2456,6 +2669,13 @@ async def get_current_user_info(request: Request, conn=Depends(get_db)):
         "username": profile["username"],
         "avatar_url": profile["avatar_url"],
         "global_name": profile["global_name"],
+        "bio": profile["bio"],
+        "header_image_url": profile["header_image_url"],
+        "location": profile["location"],
+        "website_url": profile["website_url"],
+        "twitter_url": profile["twitter_url"],
+        "youtube_url": profile["youtube_url"],
+        "twitch_url": profile["twitch_url"],
         "is_premium": is_premium,
         "premium_until": premium_until.isoformat() if premium_until else None,
         "last_validated": datetime.now(timezone.utc).isoformat(),
@@ -3103,6 +3323,16 @@ async def get_data_summary(
             "latest_trade": date_range["latest"].isoformat() if date_range and date_range["latest"] else None,
         }
 
+    except asyncpg_exceptions.UndefinedTableError:
+        return {
+            "trades_count": 0,
+            "goals_count": 0,
+            "starting_balance": 0,
+            "total_profit": 0,
+            "total_tax": 0,
+            "earliest_trade": None,
+            "latest_trade": None,
+        }
     except Exception as e:
         logging.error(f"Data summary error: {e}")
         raise HTTPException(status_code=500, detail="Failed to get data summary")
