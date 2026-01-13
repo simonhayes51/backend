@@ -287,8 +287,8 @@ async def get_trader_profile(
     query = """
         SELECT
             u.id,
-            up.username,
-            up.avatar_url,
+            COALESCE(u.username, up.username, 'Anonymous') as username,
+            COALESCE(u.avatar_url, up.avatar_url) as avatar_url,
             tp.bio,
             tp.specialties,
             tp.verified,
@@ -297,11 +297,11 @@ async def get_trader_profile(
             tp.total_posts,
             tp.avg_rating,
             tp.total_ratings,
-            tp.created_at as trader_since
+            COALESCE(tp.created_at, u.created_at) as trader_since
         FROM users u
-        JOIN user_profiles up ON u.id = up.user_id
-        JOIN trader_profiles tp ON u.id = tp.user_id
-        WHERE u.id = $1 AND u.account_type = 'trader'
+        LEFT JOIN user_profiles up ON u.id = up.user_id
+        LEFT JOIN trader_profiles tp ON u.id::text = tp.user_id::text
+        WHERE u.id = $1
     """
 
     row = await db.fetchrow(query, trader_id)
@@ -724,3 +724,16 @@ async def social_trader_upgrade(
     Social: Upgrade user account to trader account
     """
     return await upgrade_to_trader(profile=profile, request=request, db=db)
+
+
+# Catch-all route for trader ID (must be last to avoid conflicts)
+@router.get("/{trader_id}", response_model=TraderPublicProfile)
+async def get_trader_profile_alias(
+    trader_id: str,
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db)
+):
+    """
+    Get public profile for a trader (alias route matching /api/traders/{id})
+    """
+    return await get_trader_profile(trader_id=trader_id, request=request, db=db)
