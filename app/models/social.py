@@ -31,7 +31,7 @@ class TraderProfile(BaseModel):
     subscription_price: Decimal
     total_followers: int
     total_posts: int
-    avg_rating: Decimal
+    avg_rating: float
     total_ratings: int
     achievements: List[dict]
     created_at: datetime
@@ -48,7 +48,7 @@ class TraderPublicProfile(BaseModel):
     subscription_price: Decimal
     total_followers: int
     total_posts: int
-    avg_rating: Decimal
+    avg_rating: float
     total_ratings: int
     trader_since: datetime
     is_subscribed: Optional[bool] = False  # Will be populated based on current user
