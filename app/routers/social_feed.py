@@ -126,6 +126,19 @@ async def create_post(
     user = get_current_user(request)
     user_id = user["id"]
 
+    # Ensure user has username populated (fallback to discord username or id)
+    username = await db.fetchval("SELECT username FROM users WHERE id = $1", user_id)
+    if not username:
+        # Try to get from user_profiles
+        username = await db.fetchval("SELECT username FROM user_profiles WHERE user_id = $1", user_id)
+        if username:
+            # Copy to users table
+            await db.execute("UPDATE users SET username = $1 WHERE id = $2", username, user_id)
+        else:
+            # Fallback to user ID
+            fallback_username = f"User_{str(user_id)[:8]}"
+            await db.execute("UPDATE users SET username = $1 WHERE id = $2", fallback_username, user_id)
+
     # Check if user is a trader
     account_type = await db.fetchval(
         "SELECT account_type FROM users WHERE id = $1",

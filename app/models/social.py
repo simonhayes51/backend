@@ -109,9 +109,9 @@ class SocialPost(BaseModel):
 
 
 class SocialPostWithAuthor(SocialPost):
-    username: str
-    avatar_url: Optional[str]
-    verified: bool
+    username: Optional[str] = "Anonymous"  # Allow None, default to Anonymous
+    avatar_url: Optional[str] = None
+    verified: bool = False
     avg_rating: Optional[Decimal] = None
     total_followers: Optional[int] = None
     user_reaction: Optional[str] = None  # 'like', 'dislike', or None
