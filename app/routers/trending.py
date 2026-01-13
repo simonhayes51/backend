@@ -59,7 +59,11 @@ def _name_hint_from_href(href: str) -> Optional[str]:
             return None
         path = href.split("/players/", 1)[1].strip("/")
         first_seg = path.split("/", 1)[0]
-        slug = first_seg.split("-", 1)[1] if "-" in first_seg and first_seg.split("-", 1)[0].isdigit() else first_seg
+        slug = (
+            first_seg.split("-", 1)[1]
+            if "-" in first_seg and first_seg.split("-", 1)[0].isdigit()
+            else first_seg
+        )
         words = [w for w in slug.replace("-", " ").split() if w]
         return " ".join(w.capitalize() for w in words) if words else None
     except Exception:
@@ -135,6 +139,24 @@ def _dedupe_by_card_id(rows: List[dict]) -> List[dict]:
             continue
         seen.add(cid)
         out.append(r)
+    return out
+
+def _dedupe_final(items: List[dict]) -> List[dict]:
+    """
+    Final safety-net dedupe. Guarantees unique card_id in the response.
+    This prevents the UI showing rank #1/#2/#3 as the same player.
+    """
+    seen: set[int] = set()
+    out: List[dict] = []
+    for it in items:
+        try:
+            cid = int(it.get("card_id") or it.get("pid") or 0)
+        except Exception:
+            continue
+        if not cid or cid in seen:
+            continue
+        seen.add(cid)
+        out.append(it)
     return out
 
 async def _fetch_html(session: aiohttp.ClientSession, url: str) -> str:
@@ -230,7 +252,8 @@ def _extract_items(html: str) -> List[dict]:
             name_hint_slug if (name_hint_slug and name_hint_slug.lower() != "momentum") else None
         ) or f"Card {cid}"
 
-        items.append({"card_id": cid, "percent": pct, "name_hint": name_hint})
+        # IMPORTANT: include pid here so frontend dedupe works even without DB enrichment
+        items.append({"card_id": cid, "pid": cid, "percent": pct, "name_hint": name_hint})
         seen_ids.add(cid)
 
     return items
@@ -241,22 +264,25 @@ async def _page_items(tf: str, page: int) -> List[dict]:
 
 # ------------------ Prices ------------------
 async def _get_console_price(card_id: int, platform: str = "ps") -> Optional[int]:
+    """
+    FUT.GG shape (as you pasted):
+      { "data": { "currentPrice": { "platform": "ps5", "price": 15000, ... } } }
+    """
     url = FUTGG_PRICE_URL.format(card_id=card_id)
     timeout = aiohttp.ClientTimeout(total=10)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as sess:
-            async with sess.get(url, headers=REQ_HEADERS) as r:
+            async with sess.get(url, headers={**REQ_HEADERS, "Accept": "application/json"}) as r:
                 if r.status != 200:
                     return None
-                data = await r.json()
+                payload = await r.json()
     except Exception:
         return None
 
-    key = "ps" if platform == "ps" else "xbox"
+    cp = ((payload or {}).get("data") or {}).get("currentPrice") or {}
     try:
-        prices = (data or {}).get("prices", {}).get(key, {}) or {}
-        val = prices.get("price") or prices.get("lowestBin") or prices.get("LCPrice")
-        return int(val) if isinstance(val, (int, float)) and val > 0 else None
+        price = int(cp.get("price"))
+        return price if price > 0 else None
     except Exception:
         return None
 
@@ -271,7 +297,8 @@ async def _enrich_meta(req: Request, rows: List[dict]) -> List[dict]:
     meta: Dict[int, dict] = {}
 
     try:
-        pool = getattr(req.app.state, "player_pool", None)
+        # support either app.state.player_pool or app.state.pool
+        pool = getattr(req.app.state, "player_pool", None) or getattr(req.app.state, "pool", None)
         if pool:
             async with pool.acquire() as conn:
                 dbrows = await conn.fetch(
@@ -294,7 +321,7 @@ async def _enrich_meta(req: Request, rows: List[dict]) -> List[dict]:
         out.append(
             {
                 "card_id": cid,
-                "pid": cid,          # <-- consistent id for frontend
+                "pid": cid,  # consistent id for frontend
                 "id": str(cid),
                 "name": name,
                 "rating": m.get("rating"),
@@ -313,12 +340,12 @@ async def _attach_prices(items: List[dict], platform: str = "ps") -> List[dict]:
     Adds UI-friendly fields:
       - platform
       - price_console (top-level)
+      - prices.console (nested, backwards compatible)
     """
     async def one(it: dict) -> dict:
         p = await _get_console_price(int(it["card_id"]), platform)
         it["platform"] = platform
         it["price_console"] = p
-        # keep nested too (harmless / backwards compatible)
         it["prices"] = {"console": p, "pc": None}
         return it
 
@@ -378,9 +405,11 @@ async def trending(
             if cid in r24m:
                 smart_map[cid] = {"chg6hPct": p6, "chg24hPct": r24m[cid]}
 
-        raw = [{"card_id": cid, "percent": smart_map[cid]["chg6hPct"], "name_hint": None} for cid in smart_map.keys()]
+        raw = [{"card_id": cid, "pid": cid, "percent": smart_map[cid]["chg6hPct"], "name_hint": None} for cid in smart_map.keys()]
+
         enriched = await _enrich_meta(req, raw)
         enriched = await _attach_prices(enriched, platform="ps")
+        enriched = _dedupe_final(enriched)
 
         for e in enriched:
             cid = int(e["card_id"])
@@ -401,6 +430,7 @@ async def trending(
     raw = await _fetch_trending(kind=type_, tf=tf_num, limit=limit)
     enriched = await _enrich_meta(req, raw)
     enriched = await _attach_prices(enriched, platform="ps")
+    enriched = _dedupe_final(enriched)
 
     if debug:
         for e in enriched:
