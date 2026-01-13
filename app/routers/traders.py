@@ -284,19 +284,25 @@ async def get_trader_profile(
         user_id = None
         is_authenticated = False
 
+    if trader_id in {"undefined", "null", ""}:
+        if is_authenticated:
+            trader_id = str(user_id)
+        else:
+            raise HTTPException(status_code=400, detail="Trader id required")
+
     query = """
         SELECT
             u.id,
             COALESCE(u.username, up.username, 'Anonymous') as username,
             COALESCE(u.avatar_url, up.avatar_url) as avatar_url,
             tp.bio,
-            tp.specialties,
-            tp.verified,
-            tp.subscription_price,
-            tp.total_followers,
-            tp.total_posts,
-            tp.avg_rating,
-            tp.total_ratings,
+            COALESCE(tp.specialties, ARRAY[]::text[]) as specialties,
+            COALESCE(tp.verified, FALSE) as verified,
+            COALESCE(tp.subscription_price, 0) as subscription_price,
+            COALESCE(tp.total_followers, 0) as total_followers,
+            COALESCE(tp.total_posts, 0) as total_posts,
+            COALESCE(tp.avg_rating, 0) as avg_rating,
+            COALESCE(tp.total_ratings, 0) as total_ratings,
             COALESCE(tp.created_at, u.created_at) as trader_since
         FROM users u
         LEFT JOIN user_profiles up ON u.id = up.user_id
