@@ -1512,13 +1512,18 @@ async def callback(request: Request):
             # Ensure users row exists (core DB uses TEXT ids; simplest is discord_id as string id)
             user_row = await conn.fetchrow(
                 """
-                INSERT INTO public.users (id, discord_id)
-                VALUES ($1, $2)
-                ON CONFLICT (discord_id) DO UPDATE SET discord_id = EXCLUDED.discord_id
+                INSERT INTO public.users (id, discord_id, username, avatar_url)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (discord_id) DO UPDATE SET 
+                    discord_id = EXCLUDED.discord_id,
+                    username = EXCLUDED.username,
+                    avatar_url = EXCLUDED.avatar_url
                 RETURNING id, discord_id, tier, plan, premium_until, roles
                 """,
                 str(discord_id),   # users.id is TEXT
-                discord_id         # users.discord_id is BIGINT
+                discord_id,        # users.discord_id is BIGINT
+                username,          # Add username
+                avatar_url         # Add avatar_url
             )
 
             app_user_id = str(user_row["id"])
