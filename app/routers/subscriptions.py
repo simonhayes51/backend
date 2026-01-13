@@ -212,7 +212,13 @@ async def get_my_subscriptions(
     """
 
     rows = await db.fetch(query, *params)
-    return [dict(row) for row in rows]
+    results = []
+    for row in rows:
+        trader_dict = dict(row)
+        trader_dict["trader_id"] = str(trader_dict["trader_id"])
+        trader_dict["user_id"] = str(trader_dict["trader_id"])
+        results.append(trader_dict)
+    return results
 
 
 @router.get("/followers", response_model=List[dict])
@@ -249,7 +255,13 @@ async def get_my_followers(
     """
 
     rows = await db.fetch(query, user_id)
-    return [dict(row) for row in rows]
+    results = []
+    for row in rows:
+        trader_dict = dict(row)
+        trader_dict["trader_id"] = str(trader_dict["id"])
+        trader_dict["user_id"] = str(trader_dict["id"])
+        results.append(trader_dict)
+    return results
 
 
 @router.get("/check/{trader_id}")
@@ -416,7 +428,13 @@ async def get_recommended_traders(
         except asyncpg_exceptions.UndefinedTableError:
             return []
 
-    return [dict(row) for row in rows]
+    results = []
+    for row in rows:
+        trader_dict = dict(row)
+        trader_dict["trader_id"] = str(trader_dict["id"])
+        trader_dict["user_id"] = str(trader_dict["id"])
+        results.append(trader_dict)
+    return results
 
 
 @router.get("/recommended")
@@ -580,6 +598,8 @@ async def get_trader_sub_stats(
     """
     Get subscription statistics for a trader profile
     """
+    if trader_id in {"undefined", "null", ""}:
+        raise HTTPException(status_code=400, detail="Trader id required")
     # Total active subscribers
     total = await db.fetchval(
         """
