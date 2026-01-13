@@ -28,8 +28,7 @@ from fastapi import (
 )
 from fastapi.responses import RedirectResponse, JSONResponse, StreamingResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
-import re
-from fastapi.exceptions import RequestValidationError
+from fastapi.exceptions import RequestValidationError, ResponseValidationError
 from starlette.middleware.sessions import SessionMiddleware
 import inspect
 from pydantic import BaseModel, Field
@@ -1107,6 +1106,16 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     response = JSONResponse(status_code=422, content={"detail": exc.errors()})
+    origin = request.headers.get("origin")
+    if _is_allowed_origin(origin):
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+    return response
+
+
+@app.exception_handler(ResponseValidationError)
+async def response_validation_exception_handler(request: Request, exc: ResponseValidationError):
+    response = JSONResponse(status_code=500, content={"detail": exc.errors()})
     origin = request.headers.get("origin")
     if _is_allowed_origin(origin):
         response.headers["Access-Control-Allow-Origin"] = origin
