@@ -314,6 +314,7 @@ async def get_trader_profile(
 
     trader_dict = dict(row)
     trader_dict["trader_id"] = str(trader_dict["id"])
+    trader_dict["user_id"] = str(trader_dict["id"])
 
     # Check if current user is subscribed
     if is_authenticated:
@@ -427,6 +428,7 @@ async def browse_traders(
     for row in rows:
         trader_dict = dict(row)
         trader_dict["trader_id"] = str(trader_dict["id"])
+        trader_dict["user_id"] = str(trader_dict["id"])
 
         # Check if current user is subscribed
         if is_authenticated:

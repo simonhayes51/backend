@@ -216,6 +216,7 @@ async def get_my_subscriptions(
     for row in rows:
         trader_dict = dict(row)
         trader_dict["trader_id"] = str(trader_dict["trader_id"])
+        trader_dict["user_id"] = str(trader_dict["trader_id"])
         results.append(trader_dict)
     return results
 
@@ -258,6 +259,7 @@ async def get_my_followers(
     for row in rows:
         trader_dict = dict(row)
         trader_dict["trader_id"] = str(trader_dict["id"])
+        trader_dict["user_id"] = str(trader_dict["id"])
         results.append(trader_dict)
     return results
 
@@ -430,6 +432,7 @@ async def get_recommended_traders(
     for row in rows:
         trader_dict = dict(row)
         trader_dict["trader_id"] = str(trader_dict["id"])
+        trader_dict["user_id"] = str(trader_dict["id"])
         results.append(trader_dict)
     return results
 

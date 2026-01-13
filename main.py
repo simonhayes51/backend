@@ -3133,6 +3133,16 @@ async def get_data_summary(
             "latest_trade": date_range["latest"].isoformat() if date_range and date_range["latest"] else None,
         }
 
+    except asyncpg_exceptions.UndefinedTableError:
+        return {
+            "trades_count": 0,
+            "goals_count": 0,
+            "starting_balance": 0,
+            "total_profit": 0,
+            "total_tax": 0,
+            "earliest_trade": None,
+            "latest_trade": None,
+        }
     except Exception as e:
         logging.error(f"Data summary error: {e}")
         raise HTTPException(status_code=500, detail="Failed to get data summary")
