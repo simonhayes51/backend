@@ -59,10 +59,15 @@ async def search_players(request: Request, q: str, limit: int = 50) -> Dict[str,
 
     where_sql = " AND ".join(where_clauses) if where_clauses else "TRUE"
     sql = f"""
-    SELECT id, card_id, name, rating, version, image_url, nation, league, club, positions, is_icon, is_hero
+    SELECT
+      id, card_id, name, rating, version, image_url, nation, league, club,
+      position, altposition, positions, price, price_num, is_icon, is_hero
     FROM fut_players
     WHERE {where_sql}
-    ORDER BY rating DESC, name ASC
+    ORDER BY
+      CASE WHEN price IS NULL THEN 1 ELSE 0 END,
+      rating DESC NULLS LAST,
+      name ASC
     LIMIT {min(max(limit,1),100)}
     """
 
@@ -78,7 +83,11 @@ async def search_players(request: Request, q: str, limit: int = 50) -> Dict[str,
             "nation": r["nation"],
             "league": r["league"],
             "club": r["club"],
+            "position": r["position"],
+            "altposition": r["altposition"],
             "positions": r["positions"],
+            "price": r["price"],
+            "price_num": r["price_num"],
             "isIcon": r["is_icon"],
             "isHero": r["is_hero"],
         } for r in rows]
