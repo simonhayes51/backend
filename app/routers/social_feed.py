@@ -765,3 +765,32 @@ async def get_post_stats(
             max(post["likes_count"] + post["dislikes_count"] + post["comments_count"], 1)
         )
     }
+
+
+@router.get("/debug/posts")
+async def debug_posts(db: asyncpg.Connection = Depends(get_db)):
+    """
+    Debug endpoint to check social_posts table contents
+    """
+    rows = await db.fetch("""
+        SELECT 
+            id, 
+            user_id, 
+            post_type, 
+            LEFT(content, 50) as content_preview,
+            CASE 
+                WHEN image_url IS NULL THEN 'NULL'
+                WHEN image_url = '' THEN 'EMPTY'
+                WHEN LENGTH(image_url) > 100 THEN 'HAS_IMAGE (' || LENGTH(image_url) || ' chars)'
+                ELSE image_url
+            END as image_status,
+            created_at
+        FROM social_posts
+        ORDER BY created_at DESC
+        LIMIT 10
+    """)
+    
+    return {
+        "total_posts": len(rows),
+        "posts": [dict(row) for row in rows]
+    }
