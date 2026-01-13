@@ -292,7 +292,7 @@ async def get_trader_profile(
             u.id,
             COALESCE(u.username, up.username, 'Anonymous') as username,
             COALESCE(u.avatar_url, up.avatar_url) as avatar_url,
-            COALESCE(tp.bio, up.bio) as bio,
+            COALESCE(up.bio, tp.bio) as bio,
             up.header_image_url,
             up.location,
             up.website_url,
