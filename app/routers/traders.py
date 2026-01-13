@@ -301,7 +301,7 @@ async def get_trader_profile(
             COALESCE(tp.subscription_price, 0) as subscription_price,
             COALESCE(tp.total_followers, 0) as total_followers,
             COALESCE(tp.total_posts, 0) as total_posts,
-            COALESCE(tp.avg_rating, 0) as avg_rating,
+            COALESCE(tp.avg_rating, 0)::float as avg_rating,
             COALESCE(tp.total_ratings, 0) as total_ratings,
             COALESCE(tp.created_at, u.created_at) as trader_since
         FROM users u

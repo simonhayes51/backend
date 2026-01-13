@@ -580,6 +580,8 @@ async def get_trader_sub_stats(
     """
     Get subscription statistics for a trader profile
     """
+    if trader_id in {"undefined", "null", ""}:
+        raise HTTPException(status_code=400, detail="Trader id required")
     # Total active subscribers
     total = await db.fetchval(
         """
