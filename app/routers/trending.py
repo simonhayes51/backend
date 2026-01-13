@@ -11,8 +11,6 @@ from bs4 import BeautifulSoup
 from fastapi import APIRouter, Request, HTTPException, Query
 from pydantic import BaseModel
 
-from app.auth.entitlements import compute_entitlements
-
 router = APIRouter(prefix="/api", tags=["trending"])
 
 # ------------------ Config ------------------
@@ -28,12 +26,13 @@ _CACHE: Dict[Tuple[str, int], Tuple[float, str]] = {}
 CACHE_TTL = 120  # seconds
 
 # ---------- ID & percent parsing ----------
+# Prefer explicit "26-<id>" segment; otherwise take the last number after /players/
 _26_SEGMENT_RE = re.compile(r"/players/[^?#]*/26-(\d+)(?:[/?#]|$)", re.IGNORECASE)
 _LAST_NUM_AFTER_PLAYERS_RE = re.compile(r"/players/[^?#]*?(\d+)(?:[/?#]|$)", re.IGNORECASE)
 PCT_RE = re.compile(r"([+\-]?\s?\d+(?:\.\d+)?)\s*%")
 
 def _cid_from_href(href: str) -> Optional[int]:
-    """Extract FUT card_id from any /players/... href."""
+    """Extract the FUT.GG card_id from any /players/... href."""
     if "/players/" not in href:
         return None
     m = _26_SEGMENT_RE.search(href)
@@ -67,7 +66,10 @@ def _name_hint_from_href(href: str) -> Optional[str]:
         return None
 
 def _name_from_context(anchor) -> Optional[str]:
-    """Try to pull a readable player name from nearby markup (<img alt="Name - ...">)."""
+    """
+    Try to pull a readable player name from nearby markup
+    (e.g., <img alt="Name - 85 - Something">).
+    """
     try:
         cur = anchor
         for _ in range(6):
@@ -84,7 +86,11 @@ def _name_from_context(anchor) -> Optional[str]:
         pass
     return None
 
-_NAME_SUFFIX_CLEAN_RE = re.compile(r"\s+(?:rare|non[- ]?rare|common)(?:\s+\d+\s*ovr)?$", re.IGNORECASE)
+# normalize FUT.GG extras like "Rare 84 OVR" appended in slugs
+_NAME_SUFFIX_CLEAN_RE = re.compile(
+    r"\s+(?:rare|non[- ]?rare|common)(?:\s+\d+\s*ovr)?$",
+    re.IGNORECASE,
+)
 _TRAILING_OVR_RE = re.compile(r"\s+\d+\s*ovr\b.*$", re.IGNORECASE)
 
 def _normalize_name(n: Optional[str]) -> Optional[str]:
@@ -95,12 +101,12 @@ def _normalize_name(n: Optional[str]) -> Optional[str]:
     s = _TRAILING_OVR_RE.sub("", s)
     return re.sub(r"\s{2,}", " ", s).strip()
 
-# ------------------ Models ------------------
-class _TrendingOut(BaseModel):
+# ------------------ Response model ------------------
+class TrendingOut(BaseModel):
     type: Literal["risers", "fallers", "smart"]
     timeframe: Literal["6h", "12h", "24h"]
     items: List[dict]
-    limited: bool = False
+    limited: bool = False  # kept for compatibility; always False now
 
 # ------------------ Helpers ------------------
 def _norm_tf(tf: Optional[str]) -> str:
@@ -116,6 +122,20 @@ def _norm_tf(tf: Optional[str]) -> str:
 
 def _human_tf(tf_num: str) -> str:
     return f"{tf_num}h"
+
+def _dedupe_by_card_id(rows: List[dict]) -> List[dict]:
+    seen: set[int] = set()
+    out: List[dict] = []
+    for r in rows:
+        try:
+            cid = int(r.get("card_id"))
+        except Exception:
+            continue
+        if cid in seen:
+            continue
+        seen.add(cid)
+        out.append(r)
+    return out
 
 async def _fetch_html(session: aiohttp.ClientSession, url: str) -> str:
     try:
@@ -187,24 +207,10 @@ def _nearest_percent_text(node) -> Optional[float]:
                 continue
     return None
 
-def _dedupe_by_card_id(rows: List[dict]) -> List[dict]:
-    seen: set[int] = set()
-    out: List[dict] = []
-    for r in rows:
-        try:
-            cid = int(r["card_id"])
-        except Exception:
-            continue
-        if cid in seen:
-            continue
-        seen.add(cid)
-        out.append(r)
-    return out
-
 def _extract_items(html: str) -> List[dict]:
     soup = BeautifulSoup(html, "html.parser")
     items: List[dict] = []
-    seen_ids: set[int] = set()
+    seen_ids: set[int] = set()  # de-dupe within page
 
     for a in soup.find_all("a", href=True):
         href = a["href"]
@@ -233,6 +239,7 @@ async def _page_items(tf: str, page: int) -> List[dict]:
     html = await _momentum_page(tf, page)
     return _extract_items(html)
 
+# ------------------ Prices ------------------
 async def _get_console_price(card_id: int, platform: str = "ps") -> Optional[int]:
     url = FUTGG_PRICE_URL.format(card_id=card_id)
     timeout = aiohttp.ClientTimeout(total=10)
@@ -254,23 +261,31 @@ async def _get_console_price(card_id: int, platform: str = "ps") -> Optional[int
         return None
 
 async def _enrich_meta(req: Request, rows: List[dict]) -> List[dict]:
+    """
+    Optional DB enrichment. If fut_players isn't available, still return usable payload.
+    """
     if not rows:
         return []
-    ids = [int(x["card_id"]) for x in rows]
-    try:
-        async with req.app.state.player_pool.acquire() as conn:
-            dbrows = await conn.fetch(
-                """
-                SELECT card_id, name, rating, position, league, nation, club, image_url
-                FROM fut_players
-                WHERE card_id = ANY($1::bigint[])
-                """,
-                ids,
-            )
-    except Exception:
-        dbrows = []
 
-    meta = {int(r["card_id"]): dict(r) for r in dbrows}
+    ids = [int(x["card_id"]) for x in rows]
+    meta: Dict[int, dict] = {}
+
+    try:
+        pool = getattr(req.app.state, "player_pool", None)
+        if pool:
+            async with pool.acquire() as conn:
+                dbrows = await conn.fetch(
+                    """
+                    SELECT card_id, name, rating, position, league, nation, club, image_url
+                    FROM fut_players
+                    WHERE card_id = ANY($1::bigint[])
+                    """,
+                    ids,
+                )
+            meta = {int(r["card_id"]): dict(r) for r in dbrows}
+    except Exception:
+        meta = {}
+
     out: List[dict] = []
     for r in rows:
         cid = int(r["card_id"])
@@ -279,8 +294,8 @@ async def _enrich_meta(req: Request, rows: List[dict]) -> List[dict]:
         out.append(
             {
                 "card_id": cid,
+                "pid": cid,          # <-- consistent id for frontend
                 "id": str(cid),
-                "pid": cid,  # <- helps frontend use pid consistently
                 "name": name,
                 "rating": m.get("rating"),
                 "position": m.get("position"),
@@ -294,11 +309,17 @@ async def _enrich_meta(req: Request, rows: List[dict]) -> List[dict]:
     return out
 
 async def _attach_prices(items: List[dict], platform: str = "ps") -> List[dict]:
+    """
+    Adds UI-friendly fields:
+      - platform
+      - price_console (top-level)
+    """
     async def one(it: dict) -> dict:
-        console_price = await _get_console_price(int(it["card_id"]), platform)
+        p = await _get_console_price(int(it["card_id"]), platform)
         it["platform"] = platform
-        it["price_console"] = console_price  # <- UI-friendly
-        it["prices"] = {"console": console_price, "pc": None}  # optional
+        it["price_console"] = p
+        # keep nested too (harmless / backwards compatible)
+        it["prices"] = {"console": p, "pc": None}
         return it
 
     results = await asyncio.gather(*(one(i) for i in items), return_exceptions=True)
@@ -308,8 +329,8 @@ async def _attach_prices(items: List[dict], platform: str = "ps") -> List[dict]:
 async def _fetch_trending(kind: Literal["risers", "fallers"], tf: str, limit: int) -> List[dict]:
     """
     Exactly as requested:
-      - Fallers: first 10 from page 1
-      - Risers : first 10 from the LAST page
+      - Fallers: first {limit} from page 1
+      - Risers : first {limit} from LAST page
     No merging. No sorting (FUT.GG already orders momentum pages).
     """
     first_html = await _momentum_page(tf, 1)
@@ -323,7 +344,7 @@ async def _fetch_trending(kind: Literal["risers", "fallers"], tf: str, limit: in
     return _dedupe_by_card_id(rows)[:limit]
 
 # ------------------ Route ------------------
-@router.get("/trending", response_model=_TrendingOut)
+@router.get("/trending", response_model=TrendingOut)
 async def trending(
     req: Request,
     type_: Literal["risers", "fallers", "smart"] = Query("risers", alias="type"),
@@ -331,44 +352,18 @@ async def trending(
     limit: int = Query(10, ge=1, le=50),
     debug: bool = Query(False),
 ):
-    ent = await compute_entitlements(req)
-    limits = ent.get("limits", {}).get("trending", {"timeframes": ["24h"], "limit": 10})
-    limited = False
-
-    # Premium gate for Smart (keep if you want smart tab)
-    if type_ == "smart" and not ent.get("is_premium", False):
-        raise HTTPException(
-            status_code=402,
-            detail={
-                "error": "payment_required",
-                "feature": "smart_trending",
-                "message": "Smart Trending is a premium feature.",
-                "upgrade_url": "/billing",
-            },
-        )
-
     tf_num = _norm_tf(tf_raw)
     tf_human = _human_tf(tf_num)
 
-    if tf_human not in limits.get("timeframes", ["24h", "12h", "6h"]):
-        tf_num = "24"
-        tf_human = "24h"
-        limited = True
-
-    max_items = int(limits.get("limit", 10))
-    if limit > max_items:
-        limit = max_items
-        limited = True
-
-    # ---- SMART ----
+    # ---- SMART (no paywall) ----
     if type_ == "smart":
-        f6 = await _fetch_trending("fallers", "6", limit=50)
-        r6 = await _fetch_trending("risers", "6", limit=50)
+        f6  = await _fetch_trending("fallers", "6",  limit=50)
+        r6  = await _fetch_trending("risers",  "6",  limit=50)
         f24 = await _fetch_trending("fallers", "24", limit=50)
-        r24 = await _fetch_trending("risers", "24", limit=50)
+        r24 = await _fetch_trending("risers",  "24", limit=50)
 
-        f6m = {int(x["card_id"]): float(x["percent"]) for x in f6}
-        r6m = {int(x["card_id"]): float(x["percent"]) for x in r6}
+        f6m  = {int(x["card_id"]): float(x["percent"]) for x in f6}
+        r6m  = {int(x["card_id"]): float(x["percent"]) for x in r6}
         f24m = {int(x["card_id"]): float(x["percent"]) for x in f24}
         r24m = {int(x["card_id"]): float(x["percent"]) for x in r24}
 
@@ -400,7 +395,7 @@ async def trending(
             for e in enriched:
                 e["__debug"] = {"smart_map": smart_map.get(int(e["card_id"]))}
 
-        return {"type": "smart", "timeframe": tf_human, "items": enriched[:limit], "limited": limited}
+        return {"type": "smart", "timeframe": tf_human, "items": enriched[:limit], "limited": False}
 
     # ---- RISERS / FALLERS ----
     raw = await _fetch_trending(kind=type_, tf=tf_num, limit=limit)
@@ -411,4 +406,4 @@ async def trending(
         for e in enriched:
             e["__debug"] = {"percent": e.get("percent")}
 
-    return {"type": type_, "timeframe": tf_human, "items": enriched[:limit], "limited": limited}
+    return {"type": type_, "timeframe": tf_human, "items": enriched[:limit], "limited": False}
