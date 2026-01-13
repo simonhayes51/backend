@@ -425,6 +425,7 @@ async def browse_traders(
     traders = []
     for row in rows:
         trader_dict = dict(row)
+        trader_dict["trader_id"] = str(trader_dict["id"])
 
         # Check if current user is subscribed
         if is_authenticated:
