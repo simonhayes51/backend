@@ -216,17 +216,17 @@ def _nearest_percent_text(node) -> Optional[float]:
 def _extract_items(html: str) -> List[dict]:
     """
     Extract from ONLY real player card links (ones that contain /26-<card_id>/).
-    This avoids picking up base player IDs, nav links, etc.
+    Avoids picking up base player IDs, nav links, etc.
     """
     soup = BeautifulSoup(html, "html.parser")
     items: List[dict] = []
     seen_ids: set[int] = set()
 
-    # only anchors with the true card id segment
     for a in soup.find_all("a", href=True):
         href = a.get("href") or ""
         if "26-" not in href:
             continue
+
         cid = _cid_from_href(href)
         if not cid or cid in seen_ids:
             continue
@@ -335,18 +335,39 @@ async def _attach_prices(items: List[dict], platform: str = "ps") -> List[dict]:
 # ------------------ Page selection logic ------------------
 async def _fetch_trending(kind: Literal["risers", "fallers"], tf: str, limit: int) -> List[dict]:
     """
-    As requested:
-      - Fallers: first {limit} from page 1
-      - Risers : first {limit} from last page
+    Fallers: take from page 1
+    Risers : walk backwards from last page until we have {limit}
+    This fixes cases where the last page only has 1 usable tile.
     """
     first_html = await _momentum_page(tf, 1)
     last_page = _parse_last_page_num(first_html)
 
-    page = 1 if kind == "fallers" else last_page
-    rows = await _page_items(tf, page)
+    if kind == "fallers":
+        rows = await _page_items(tf, 1)
+        rows = _dedupe_final(rows)
+        return rows[:limit]
 
-    rows = _dedupe_final(rows)
-    return rows[:limit]
+    # RISERS: walk backwards
+    collected: List[dict] = []
+    seen: set[int] = set()
+
+    page = last_page
+    while page >= 1 and len(collected) < limit:
+        rows = await _page_items(tf, page)
+        for r in rows:
+            try:
+                cid = int(r.get("card_id") or 0)
+            except Exception:
+                continue
+            if not cid or cid in seen:
+                continue
+            seen.add(cid)
+            collected.append(r)
+            if len(collected) >= limit:
+                break
+        page -= 1
+
+    return collected[:limit]
 
 # ------------------ Route ------------------
 @router.get("/trending", response_model=TrendingOut)
@@ -374,9 +395,11 @@ async def trending(
 
         smart_map: Dict[int, Dict[str, float]] = {}
 
+        # Up on 6h, down on 24h
         for cid, p6 in r6m.items():
             if cid in f24m:
                 smart_map[cid] = {"chg6hPct": p6, "chg24hPct": f24m[cid]}
+        # Down on 6h, up on 24h
         for cid, p6 in f6m.items():
             if cid in r24m:
                 smart_map[cid] = {"chg6hPct": p6, "chg24hPct": r24m[cid]}
