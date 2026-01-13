@@ -528,6 +528,16 @@ class UserSettings(BaseModel):
     default_chart_range: str = "30d"
     visible_widgets: List[str] = Field(default_factory=lambda: ["profit", "tax", "balance", "trades"])
 
+
+class UserProfileUpdate(BaseModel):
+    bio: Optional[str] = Field(None, max_length=1000)
+    header_image_url: Optional[str] = Field(None, max_length=2000)
+    location: Optional[str] = Field(None, max_length=255)
+    website_url: Optional[str] = Field(None, max_length=2000)
+    twitter_url: Optional[str] = Field(None, max_length=2000)
+    youtube_url: Optional[str] = Field(None, max_length=2000)
+    twitch_url: Optional[str] = Field(None, max_length=2000)
+
 class TradingGoal(BaseModel):
     title: str
     target_amount: int
@@ -663,6 +673,13 @@ async def lifespan(app: FastAPI):
             username VARCHAR(255),
             avatar_url TEXT,
             global_name VARCHAR(255),
+            bio TEXT,
+            header_image_url TEXT,
+            location VARCHAR(255),
+            website_url TEXT,
+            twitter_url TEXT,
+            youtube_url TEXT,
+            twitch_url TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )""")
@@ -673,6 +690,27 @@ async def lifespan(app: FastAPI):
         """)
         await conn.execute("""
         ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS premium_until TIMESTAMP WITH TIME ZONE
+        """)
+        await conn.execute("""
+        ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS bio TEXT
+        """)
+        await conn.execute("""
+        ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS header_image_url TEXT
+        """)
+        await conn.execute("""
+        ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS location VARCHAR(255)
+        """)
+        await conn.execute("""
+        ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS website_url TEXT
+        """)
+        await conn.execute("""
+        ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS twitter_url TEXT
+        """)
+        await conn.execute("""
+        ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS youtube_url TEXT
+        """)
+        await conn.execute("""
+        ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS twitch_url TEXT
         """)
 
         # Billing tables
@@ -1669,6 +1707,93 @@ async def get_dashboard(user_id: str = Depends(get_current_user), conn=Depends(g
 async def get_profile(user_id: str = Depends(get_current_user), conn=Depends(get_db)):
     return await fetch_dashboard_data(user_id, conn)
 
+
+@app.get("/api/user-profile")
+async def get_user_profile(user_id: str = Depends(get_current_user), conn=Depends(get_db)):
+    profile = await conn.fetchrow(
+        """
+        SELECT
+            user_id,
+            username,
+            avatar_url,
+            global_name,
+            bio,
+            header_image_url,
+            location,
+            website_url,
+            twitter_url,
+            youtube_url,
+            twitch_url,
+            created_at,
+            updated_at
+        FROM user_profiles
+        WHERE user_id = $1
+        """,
+        user_id,
+    )
+    if not profile:
+        raise HTTPException(status_code=404, detail="User profile not found")
+    return dict(profile)
+
+
+@app.patch("/api/user-profile")
+async def update_user_profile(
+    payload: UserProfileUpdate,
+    user_id: str = Depends(get_current_user),
+    conn=Depends(get_db),
+):
+    updates = []
+    params: list[Any] = []
+    if payload.bio is not None:
+        updates.append(f"bio = ${len(params) + 1}")
+        params.append(payload.bio)
+    if payload.header_image_url is not None:
+        updates.append(f"header_image_url = ${len(params) + 1}")
+        params.append(payload.header_image_url)
+    if payload.location is not None:
+        updates.append(f"location = ${len(params) + 1}")
+        params.append(payload.location)
+    if payload.website_url is not None:
+        updates.append(f"website_url = ${len(params) + 1}")
+        params.append(payload.website_url)
+    if payload.twitter_url is not None:
+        updates.append(f"twitter_url = ${len(params) + 1}")
+        params.append(payload.twitter_url)
+    if payload.youtube_url is not None:
+        updates.append(f"youtube_url = ${len(params) + 1}")
+        params.append(payload.youtube_url)
+    if payload.twitch_url is not None:
+        updates.append(f"twitch_url = ${len(params) + 1}")
+        params.append(payload.twitch_url)
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="No updates provided")
+
+    params.append(user_id)
+    query = f"""
+        UPDATE user_profiles
+        SET {', '.join(updates)}, updated_at = NOW()
+        WHERE user_id = ${len(params)}
+        RETURNING
+            user_id,
+            username,
+            avatar_url,
+            global_name,
+            bio,
+            header_image_url,
+            location,
+            website_url,
+            twitter_url,
+            youtube_url,
+            twitch_url,
+            created_at,
+            updated_at
+    """
+    row = await conn.fetchrow(query, *params)
+    if not row:
+        raise HTTPException(status_code=404, detail="User profile not found")
+    return dict(row)
+
 @app.post("/api/trades")
 async def add_trade(request: Request, user_id: str = Depends(get_current_user), conn=Depends(get_db)):
     data = await request.json()
@@ -2412,6 +2537,13 @@ async def get_current_user_info(request: Request, conn=Depends(get_db)):
             up.username, 
             up.avatar_url, 
             up.global_name, 
+            up.bio,
+            up.header_image_url,
+            up.location,
+            up.website_url,
+            up.twitter_url,
+            up.youtube_url,
+            up.twitch_url,
             up.is_premium, 
             up.premium_until,
             u.account_type,
@@ -2486,6 +2618,13 @@ async def get_current_user_info(request: Request, conn=Depends(get_db)):
         "username": profile["username"],
         "avatar_url": profile["avatar_url"],
         "global_name": profile["global_name"],
+        "bio": profile["bio"],
+        "header_image_url": profile["header_image_url"],
+        "location": profile["location"],
+        "website_url": profile["website_url"],
+        "twitter_url": profile["twitter_url"],
+        "youtube_url": profile["youtube_url"],
+        "twitch_url": profile["twitch_url"],
         "is_premium": is_premium,
         "premium_until": premium_until.isoformat() if premium_until else None,
         "last_validated": datetime.now(timezone.utc).isoformat(),
