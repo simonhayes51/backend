@@ -26,14 +26,13 @@ _CACHE: Dict[Tuple[str, int], Tuple[float, str]] = {}
 CACHE_TTL = 120  # seconds
 
 # ---------- ID & percent parsing ----------
-# Prefer explicit "26-<id>" segment; otherwise take the last number after /players/
 _26_SEGMENT_RE = re.compile(r"/players/[^?#]*/26-(\d+)(?:[/?#]|$)", re.IGNORECASE)
 _LAST_NUM_AFTER_PLAYERS_RE = re.compile(r"/players/[^?#]*?(\d+)(?:[/?#]|$)", re.IGNORECASE)
 PCT_RE = re.compile(r"([+\-]?\s?\d+(?:\.\d+)?)\s*%")
 
 def _cid_from_href(href: str) -> Optional[int]:
     """Extract the FUT.GG card_id from any /players/... href."""
-    if "/players/" not in href:
+    if "/players/" not in (href or ""):
         return None
     m = _26_SEGMENT_RE.search(href)
     if m:
@@ -55,7 +54,7 @@ def _name_hint_from_href(href: str) -> Optional[str]:
     e.g. /players/256853-malik-tillman/26-50588501/ -> 'Malik Tillman'
     """
     try:
-        if "/players/" not in href:
+        if "/players/" not in (href or ""):
             return None
         path = href.split("/players/", 1)[1].strip("/")
         first_seg = path.split("/", 1)[0]
@@ -72,7 +71,7 @@ def _name_hint_from_href(href: str) -> Optional[str]:
 def _name_from_context(anchor) -> Optional[str]:
     """
     Try to pull a readable player name from nearby markup
-    (e.g., <img alt="Name - 85 - Something">).
+    (e.g., <img alt="Name Setter - 85 - ...">).
     """
     try:
         cur = anchor
@@ -90,7 +89,6 @@ def _name_from_context(anchor) -> Optional[str]:
         pass
     return None
 
-# normalize FUT.GG extras like "Rare 84 OVR" appended in slugs
 _NAME_SUFFIX_CLEAN_RE = re.compile(
     r"\s+(?:rare|non[- ]?rare|common)(?:\s+\d+\s*ovr)?$",
     re.IGNORECASE,
@@ -127,24 +125,9 @@ def _norm_tf(tf: Optional[str]) -> str:
 def _human_tf(tf_num: str) -> str:
     return f"{tf_num}h"
 
-def _dedupe_by_card_id(rows: List[dict]) -> List[dict]:
-    seen: set[int] = set()
-    out: List[dict] = []
-    for r in rows:
-        try:
-            cid = int(r.get("card_id"))
-        except Exception:
-            continue
-        if cid in seen:
-            continue
-        seen.add(cid)
-        out.append(r)
-    return out
-
 def _dedupe_final(items: List[dict]) -> List[dict]:
     """
     Final safety-net dedupe. Guarantees unique card_id in the response.
-    This prevents the UI showing rank #1/#2/#3 as the same player.
     """
     seen: set[int] = set()
     out: List[dict] = []
@@ -202,59 +185,48 @@ def _parse_last_page_num(html: str) -> int:
                 last = max(last, int(t))
     return last
 
-def _nearest_percent_text(node) -> Optional[float]:
-    """Find a % near the link: walk up a few ancestors, then scan siblings."""
-    cur = node
-    for _ in range(5):
-        if cur is None:
-            break
-        txt = cur.get_text(" ", strip=True) if hasattr(cur, "get_text") else ""
-        m = PCT_RE.search(txt or "")
-        if m:
-            try:
-                return float(m.group(1).replace(" ", ""))
-            except Exception:
-                pass
-        cur = getattr(cur, "parent", None)
-
-    parent = getattr(node, "parent", None)
-    if parent:
-        for sib in getattr(parent, "children", []):
-            try:
-                txt = sib.get_text(" ", strip=True)
-                m = PCT_RE.search(txt or "")
-                if m:
-                    return float(m.group(1).replace(" ", ""))
-            except Exception:
-                continue
-    return None
-
+# ------------------ Correct card extraction (FIX) ------------------
 def _extract_items(html: str) -> List[dict]:
+    """
+    IMPORTANT:
+    We only scrape top-level player card anchors (the actual tiles),
+    not every <a> on the page. This stops the #1/#2/#3 duplicates.
+    """
     soup = BeautifulSoup(html, "html.parser")
     items: List[dict] = []
-    seen_ids: set[int] = set()  # de-dupe within page
+    seen: set[int] = set()
 
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
+    # Each momentum tile is a top-level player link
+    for card in soup.select('a[href^="/players/"]'):
+        href = card.get("href") or ""
         cid = _cid_from_href(href)
-        if not cid:
-            continue
-        if cid in seen_ids:
+        if not cid or cid in seen:
             continue
 
-        pct = _nearest_percent_text(a)
+        # Percent: find the first text node inside the card that matches "%".
+        pct = None
+        pct_text_node = card.find(string=PCT_RE)
+        if pct_text_node:
+            m = PCT_RE.search(str(pct_text_node))
+            if m:
+                try:
+                    pct = float(m.group(1).replace(" ", ""))
+                except Exception:
+                    pct = None
+
         if pct is None:
             continue
 
-        name_hint_img = _normalize_name(_name_from_context(a))
+        name_hint_img = _normalize_name(_name_from_context(card))
         name_hint_slug = _normalize_name(_name_hint_from_href(href))
-        name_hint = name_hint_img or (
-            name_hint_slug if (name_hint_slug and name_hint_slug.lower() != "momentum") else None
-        ) or f"Card {cid}"
+        name_hint = (
+            name_hint_img
+            or (name_hint_slug if name_hint_slug and name_hint_slug.lower() != "momentum" else None)
+            or f"Card {cid}"
+        )
 
-        # IMPORTANT: include pid here so frontend dedupe works even without DB enrichment
         items.append({"card_id": cid, "pid": cid, "percent": pct, "name_hint": name_hint})
-        seen_ids.add(cid)
+        seen.add(cid)
 
     return items
 
@@ -265,7 +237,7 @@ async def _page_items(tf: str, page: int) -> List[dict]:
 # ------------------ Prices ------------------
 async def _get_console_price(card_id: int, platform: str = "ps") -> Optional[int]:
     """
-    FUT.GG shape (as you pasted):
+    FUT.GG shape:
       { "data": { "currentPrice": { "platform": "ps5", "price": 15000, ... } } }
     """
     url = FUTGG_PRICE_URL.format(card_id=card_id)
@@ -297,7 +269,6 @@ async def _enrich_meta(req: Request, rows: List[dict]) -> List[dict]:
     meta: Dict[int, dict] = {}
 
     try:
-        # support either app.state.player_pool or app.state.pool
         pool = getattr(req.app.state, "player_pool", None) or getattr(req.app.state, "pool", None)
         if pool:
             async with pool.acquire() as conn:
@@ -321,7 +292,7 @@ async def _enrich_meta(req: Request, rows: List[dict]) -> List[dict]:
         out.append(
             {
                 "card_id": cid,
-                "pid": cid,  # consistent id for frontend
+                "pid": cid,
                 "id": str(cid),
                 "name": name,
                 "rating": m.get("rating"),
@@ -363,12 +334,12 @@ async def _fetch_trending(kind: Literal["risers", "fallers"], tf: str, limit: in
     first_html = await _momentum_page(tf, 1)
     last_page = _parse_last_page_num(first_html)
 
-    if kind == "fallers":
-        rows = await _page_items(tf, 1)
-        return _dedupe_by_card_id(rows)[:limit]
+    page = 1 if kind == "fallers" else last_page
+    rows = await _page_items(tf, page)
 
-    rows = await _page_items(tf, last_page)
-    return _dedupe_by_card_id(rows)[:limit]
+    # IMPORTANT: dedupe only after extracting tiles
+    rows = _dedupe_final(rows)
+    return rows[:limit]
 
 # ------------------ Route ------------------
 @router.get("/trending", response_model=TrendingOut)
@@ -382,7 +353,7 @@ async def trending(
     tf_num = _norm_tf(tf_raw)
     tf_human = _human_tf(tf_num)
 
-    # ---- SMART (no paywall) ----
+    # ---- SMART ----
     if type_ == "smart":
         f6  = await _fetch_trending("fallers", "6",  limit=50)
         r6  = await _fetch_trending("risers",  "6",  limit=50)
