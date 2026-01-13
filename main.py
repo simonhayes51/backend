@@ -889,6 +889,16 @@ async def lifespan(app: FastAPI):
     _watchlist_task = asyncio.create_task(_alerts_poll_loop())
     logging.info("✅ Watchlist alerts loop started (%ss)", WATCHLIST_POLL_INTERVAL)
 
+    # Run social_posts migration to add image_url column
+    async with pool.acquire() as conn:
+        try:
+            await conn.execute("""
+                ALTER TABLE social_posts ADD COLUMN IF NOT EXISTS image_url TEXT
+            """)
+            logging.info("✅ Migration: social_posts.image_url column ensured")
+        except Exception as e:
+            logging.warning(f"⚠️  Migration warning (social_posts.image_url): {e}")
+
     try:
         yield
     finally:
