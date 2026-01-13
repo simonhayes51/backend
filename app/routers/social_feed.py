@@ -80,6 +80,7 @@ def _format_post(row: dict) -> dict:
     post = dict(row)
     author_snapshot = {
         "id": post.get("user_id"),
+        "trader_id": str(post.get("user_id")) if post.get("user_id") is not None else None,
         "username": post.get("username"),
         "avatar_url": post.get("avatar_url"),
         "is_verified": post.get("verified"),

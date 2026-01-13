@@ -313,6 +313,7 @@ async def get_trader_profile(
         raise HTTPException(status_code=404, detail="Trader not found")
 
     trader_dict = dict(row)
+    trader_dict["trader_id"] = str(trader_dict["id"])
 
     # Check if current user is subscribed
     if is_authenticated:
