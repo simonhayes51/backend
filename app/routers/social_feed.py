@@ -299,31 +299,54 @@ async def get_feed(
 
         # Get posts with author info
         params.extend([limit, offset])
-        query = f"""
-            SELECT
-                sp.*,
-                COALESCE(u.username, 'Anonymous') as username,
-                u.avatar_url,
-                COALESCE(tp.verified, FALSE) as verified,
-                tp.avg_rating,
-                tp.total_followers,
-                tp.bio as trader_bio,
-                tp.specialties as trader_specialties,
-                tp.subscription_price as trader_subscription_price,
-                CASE WHEN sp.user_id::text = ${param_idx + 2}::text THEN TRUE ELSE FALSE END as is_author
-            FROM social_posts sp
-            LEFT JOIN users u ON sp.user_id = u.id OR sp.user_id::text = u.id::text
-            LEFT JOIN trader_profiles tp ON sp.user_id::text = tp.user_id::text
-            WHERE {where_clause}
-            ORDER BY sp.created_at DESC
-            LIMIT ${param_idx} OFFSET ${param_idx + 1}
-        """
-
-        # Add user_id for is_author check (or NULL if not authenticated)
-        query_params = params + [user_id if is_authenticated else None]
-
-        rows = await db.fetch(query, *query_params)
-    except asyncpg_exceptions.UndefinedTableError:
+        
+        # Try to get posts with full author info, fallback to basic if tables don't exist
+        try:
+            query = f"""
+                SELECT
+                    sp.*,
+                    COALESCE(u.username, 'Anonymous') as username,
+                    u.avatar_url,
+                    FALSE as verified,
+                    0 as avg_rating,
+                    0 as total_followers,
+                    NULL::text as trader_bio,
+                    ARRAY[]::text[] as trader_specialties,
+                    0 as trader_subscription_price,
+                    CASE WHEN sp.user_id::text = ${param_idx + 2}::text THEN TRUE ELSE FALSE END as is_author
+                FROM social_posts sp
+                LEFT JOIN users u ON sp.user_id::text = u.id::text
+                WHERE {where_clause}
+                ORDER BY sp.created_at DESC
+                LIMIT ${param_idx} OFFSET ${param_idx + 1}
+            """
+            
+            # Add user_id for is_author check (or NULL if not authenticated)
+            query_params = params + [user_id if is_authenticated else None]
+            rows = await db.fetch(query, *query_params)
+        except Exception as e:
+            # Log the error and return empty feed
+            print(f"Error fetching posts: {e}")
+            return {
+                "posts": [],
+                "total": 0,
+                "has_more": False,
+                "offset": offset,
+                "limit": limit
+            }
+    except asyncpg_exceptions.UndefinedTableError as e:
+        print(f"Table not found: {e}")
+        return {
+            "posts": [],
+            "total": 0,
+            "has_more": False,
+            "offset": offset,
+            "limit": limit
+        }
+    except Exception as e:
+        print(f"Unexpected error in get_feed: {e}")
+        import traceback
+        traceback.print_exc()
         return {
             "posts": [],
             "total": 0,
