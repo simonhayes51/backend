@@ -713,6 +713,57 @@ async def lifespan(app: FastAPI):
         ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS twitch_url TEXT
         """)
 
+        # messaging: conversations/messages/notifications
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS conversations (
+            id BIGSERIAL PRIMARY KEY,
+            user1_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            user2_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            last_message_id BIGINT,
+            last_message_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            CHECK (user1_id < user2_id),
+            UNIQUE(user1_id, user2_id)
+        )""")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_conversations_user1 ON conversations(user1_id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_conversations_user2 ON conversations(user2_id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_conversations_last_message ON conversations(last_message_at DESC)")
+
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id BIGSERIAL PRIMARY KEY,
+            conversation_id BIGINT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+            sender_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            recipient_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            content TEXT NOT NULL,
+            read_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            deleted_at TIMESTAMP
+        )""")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, created_at DESC)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient_id)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_unread ON messages(recipient_id, read_at) WHERE read_at IS NULL")
+
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS notifications (
+            id BIGSERIAL PRIMARY KEY,
+            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            notification_type VARCHAR(50) NOT NULL CHECK (notification_type IN (
+                'new_follower', 'post_like', 'post_comment', 'new_message',
+                'new_rating', 'mention', 'subscription'
+            )),
+            title VARCHAR(255) NOT NULL,
+            message TEXT NOT NULL,
+            related_user_id TEXT REFERENCES users(id) ON DELETE CASCADE,
+            related_post_id BIGINT REFERENCES social_posts(id) ON DELETE CASCADE,
+            related_comment_id BIGINT REFERENCES post_comments(id) ON DELETE CASCADE,
+            related_message_id BIGINT REFERENCES messages(id) ON DELETE CASCADE,
+            read_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, created_at DESC)")
+
         # Billing tables
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS subscriptions (

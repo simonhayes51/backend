@@ -152,6 +152,15 @@ async def send_message(
         message.recipient_id,
         message.content
     )
+    await db.execute(
+        """
+        UPDATE conversations
+        SET last_message_id = $1, last_message_at = NOW()
+        WHERE id = $2
+        """,
+        msg_row["id"],
+        conversation_id,
+    )
 
     # Get user profiles for response
     sender_info = await db.fetchrow(
@@ -434,6 +443,15 @@ async def send_message_in_conversation(
         user_id,
         recipient_id,
         payload.content,
+    )
+    await db.execute(
+        """
+        UPDATE conversations
+        SET last_message_id = $1, last_message_at = NOW()
+        WHERE id = $2
+        """,
+        msg_row["id"],
+        conversation_id,
     )
 
     sender_info = await db.fetchrow(
