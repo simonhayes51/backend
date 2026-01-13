@@ -45,6 +45,8 @@ class FeedPostCreatePayload(BaseModel):
     post_type: str
     premium: bool = False
     expires_in_hours: Optional[int] = None
+    image_url: Optional[str] = None  # Add image_url field
+    tags: Optional[List[str]] = None  # Add tags field
 
 
 class FeedPostUpdatePayload(BaseModel):
@@ -201,6 +203,8 @@ async def create_post_root(
         content=payload.content,
         is_premium=payload.premium,
         expires_at=_expires_at_from_hours(payload.expires_in_hours),
+        image_url=payload.image_url,  # Pass image_url
+        tags=payload.tags or [],  # Pass tags
     )
     return await create_post(post=social_post, request=request, db=db)
 
