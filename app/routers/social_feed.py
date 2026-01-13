@@ -149,9 +149,9 @@ async def create_post(
         INSERT INTO social_posts (
             user_id, post_type, content, player_name, player_card_id,
             buy_range_min, buy_range_max, sell_target, confidence_level,
-            tags, is_premium, expires_at
+            tags, image_url, is_premium, expires_at
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
         RETURNING *
     """
 
@@ -167,6 +167,7 @@ async def create_post(
         post.sell_target,
         post.confidence_level,
         post.tags or [],
+        post.image_url,
         post.is_premium,
         post.expires_at,
     )

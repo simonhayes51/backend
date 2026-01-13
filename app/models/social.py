@@ -68,6 +68,7 @@ class SocialPostCreate(BaseModel):
     sell_target: Optional[Decimal] = None
     confidence_level: Optional[int] = Field(None, ge=1, le=100)
     tags: Optional[List[str]] = []
+    image_url: Optional[str] = None
     is_premium: bool = False
     expires_at: Optional[datetime] = None
 
@@ -97,6 +98,7 @@ class SocialPost(BaseModel):
     sell_target: Optional[Decimal]
     confidence_level: Optional[int]
     tags: List[str]
+    image_url: Optional[str]
     is_premium: bool
     likes_count: int
     dislikes_count: int
