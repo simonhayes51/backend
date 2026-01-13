@@ -92,15 +92,15 @@ async def _attach_author(db: asyncpg.Connection, post: dict) -> dict:
     author = await db.fetchrow(
         """
         SELECT
-            up.username,
-            up.avatar_url,
+            u.username,
+            u.avatar_url,
             COALESCE(tp.verified, FALSE) as verified,
             tp.bio as trader_bio,
             tp.specialties as trader_specialties,
             tp.subscription_price as trader_subscription_price
-        FROM user_profiles up
-        LEFT JOIN trader_profiles tp ON up.user_id = tp.user_id
-        WHERE up.user_id = $1
+        FROM users u
+        LEFT JOIN trader_profiles tp ON u.id::text = tp.user_id::text
+        WHERE u.id::text = $1::text
         """,
         post.get("user_id"),
     )
@@ -307,15 +307,16 @@ async def get_feed(
                     sp.*,
                     COALESCE(u.username, 'Anonymous') as username,
                     u.avatar_url,
-                    FALSE as verified,
-                    0 as avg_rating,
-                    0 as total_followers,
-                    NULL::text as trader_bio,
-                    ARRAY[]::text[] as trader_specialties,
-                    0 as trader_subscription_price,
+                    COALESCE(tp.verified, FALSE) as verified,
+                    COALESCE(tp.avg_rating, 0) as avg_rating,
+                    COALESCE(tp.total_followers, 0) as total_followers,
+                    tp.bio as trader_bio,
+                    COALESCE(tp.specialties, ARRAY[]::text[]) as trader_specialties,
+                    COALESCE(tp.subscription_price, 0) as trader_subscription_price,
                     CASE WHEN sp.user_id::text = ${param_idx + 2}::text THEN TRUE ELSE FALSE END as is_author
                 FROM social_posts sp
                 LEFT JOIN users u ON sp.user_id::text = u.id::text
+                LEFT JOIN trader_profiles tp ON u.id::text = tp.user_id::text
                 WHERE {where_clause}
                 ORDER BY sp.created_at DESC
                 LIMIT ${param_idx} OFFSET ${param_idx + 1}
@@ -470,14 +471,14 @@ async def get_post(
     query = """
         SELECT
             sp.*,
-            up.username,
-            up.avatar_url,
+            u.username,
+            u.avatar_url,
             COALESCE(tp.verified, FALSE) as verified,
             tp.avg_rating,
             tp.total_followers
         FROM social_posts sp
-        JOIN user_profiles up ON sp.user_id = up.user_id
-        LEFT JOIN trader_profiles tp ON sp.user_id = tp.user_id
+        LEFT JOIN users u ON sp.user_id::text = u.id::text
+        LEFT JOIN trader_profiles tp ON u.id::text = tp.user_id::text
         WHERE sp.id = $1
     """
 
@@ -729,9 +730,9 @@ async def get_post_stats(
     # Get top reactors
     top_likers = await db.fetch(
         """
-        SELECT up.username, up.avatar_url
+        SELECT u.username, u.avatar_url
         FROM post_reactions pr
-        JOIN user_profiles up ON pr.user_id = up.user_id
+        LEFT JOIN users u ON pr.user_id::text = u.id::text
         WHERE pr.post_id = $1 AND pr.reaction_type = 'like'
         ORDER BY pr.created_at DESC
         LIMIT 10
