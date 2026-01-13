@@ -284,6 +284,12 @@ async def get_trader_profile(
         user_id = None
         is_authenticated = False
 
+    if trader_id in {"undefined", "null", ""}:
+        if is_authenticated:
+            trader_id = str(user_id)
+        else:
+            raise HTTPException(status_code=400, detail="Trader id required")
+
     query = """
         SELECT
             u.id,
