@@ -302,18 +302,18 @@ async def get_feed(
         query = f"""
             SELECT
                 sp.*,
-                up.username,
-                up.avatar_url,
+                COALESCE(u.username, 'Anonymous') as username,
+                u.avatar_url,
                 COALESCE(tp.verified, FALSE) as verified,
                 tp.avg_rating,
                 tp.total_followers,
                 tp.bio as trader_bio,
                 tp.specialties as trader_specialties,
                 tp.subscription_price as trader_subscription_price,
-                CASE WHEN sp.user_id = ${param_idx + 2} THEN TRUE ELSE FALSE END as is_author
+                CASE WHEN sp.user_id::text = ${param_idx + 2}::text THEN TRUE ELSE FALSE END as is_author
             FROM social_posts sp
-            JOIN user_profiles up ON sp.user_id = up.user_id
-            LEFT JOIN trader_profiles tp ON sp.user_id = tp.user_id
+            LEFT JOIN users u ON sp.user_id = u.id OR sp.user_id::text = u.id::text
+            LEFT JOIN trader_profiles tp ON sp.user_id::text = tp.user_id::text
             WHERE {where_clause}
             ORDER BY sp.created_at DESC
             LIMIT ${param_idx} OFFSET ${param_idx + 1}
