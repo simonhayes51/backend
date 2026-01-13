@@ -1085,6 +1085,16 @@ def _is_allowed_origin(origin: str | None) -> bool:
         return True
     return re.match(ALLOWED_ORIGIN_REGEX, origin) is not None
 
+
+@app.middleware("http")
+async def add_cors_headers(request: Request, call_next):
+    response = await call_next(request)
+    origin = request.headers.get("origin")
+    if _is_allowed_origin(origin):
+        response.headers.setdefault("Access-Control-Allow-Origin", origin)
+        response.headers.setdefault("Access-Control-Allow-Credentials", "true")
+    return response
+
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     response = JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
