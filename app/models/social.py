@@ -66,12 +66,14 @@ class TraderPublicProfile(BaseModel):
 
 class SocialPostCreate(BaseModel):
     post_type: str = Field(..., description="Type: quick_flip, prediction, tip, analysis")
+    title: Optional[str] = None
     content: str = Field(..., min_length=1, max_length=5000)
     player_name: Optional[str] = None
     player_card_id: Optional[str] = None
     buy_range_min: Optional[Decimal] = None
     buy_range_max: Optional[Decimal] = None
     sell_target: Optional[Decimal] = None
+    sell_at: Optional[datetime] = None
     confidence_level: Optional[int] = Field(None, ge=1, le=100)
     tags: Optional[List[str]] = []
     image_url: Optional[str] = None
@@ -87,21 +89,34 @@ class SocialPostCreate(BaseModel):
 
 
 class SocialPostUpdate(BaseModel):
+    title: Optional[str] = None
     content: Optional[str] = Field(None, min_length=1, max_length=5000)
+    post_type: Optional[str] = None
+    player_name: Optional[str] = None
+    player_card_id: Optional[str] = None
+    buy_range_min: Optional[Decimal] = None
+    buy_range_max: Optional[Decimal] = None
+    sell_target: Optional[Decimal] = None
+    sell_at: Optional[datetime] = None
+    confidence_level: Optional[int] = Field(None, ge=1, le=100)
     tags: Optional[List[str]] = None
+    image_url: Optional[str] = None
     is_premium: Optional[bool] = None
+    expires_at: Optional[datetime] = None
 
 
 class SocialPost(BaseModel):
     id: int
     user_id: str
     post_type: str
+    title: Optional[str] = None
     content: str
     player_name: Optional[str]
     player_card_id: Optional[str]
     buy_range_min: Optional[Decimal]
     buy_range_max: Optional[Decimal]
     sell_target: Optional[Decimal]
+    sell_at: Optional[datetime] = None
     confidence_level: Optional[int]
     tags: List[str]
     image_url: Optional[str]
@@ -109,6 +124,8 @@ class SocialPost(BaseModel):
     likes_count: int
     dislikes_count: int
     comments_count: int
+    views_count: int = 0
+    shares_count: int = 0
     created_at: datetime
     updated_at: datetime
     expires_at: Optional[datetime]
