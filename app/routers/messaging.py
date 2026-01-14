@@ -10,6 +10,7 @@ from app.models.social import (
     MessageCreate,
     Message,
     MessageWithUser,
+    MessagePayload,
     Conversation,
     ConversationWithDetails,
 )
@@ -103,10 +104,6 @@ class StartConversationRequest(BaseModel):
     recipientId: Optional[str] = None
     user_id: Optional[str] = None
     content: Optional[str] = None
-
-
-class MessagePayload(BaseModel):
-    content: str
 
 
 @router.post("/send", response_model=MessageWithUser)
@@ -671,6 +668,8 @@ async def search_users_for_messaging(
     request: Request,
     query: Optional[str] = Query(None),
     q: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    term: Optional[str] = Query(None),
     username: Optional[str] = Query(None),
     db: asyncpg.Connection = Depends(get_db)
 ):
@@ -680,7 +679,7 @@ async def search_users_for_messaging(
     user = get_current_user(request)
     user_id = user["id"]
 
-    search_term = query or q or username
+    search_term = query or q or search or term or username
     if not search_term or not search_term.strip():
         raise HTTPException(status_code=400, detail="Search query required")
 
@@ -713,6 +712,8 @@ async def search_users_for_messaging_alias(
     request: Request,
     query: Optional[str] = Query(None),
     q: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    term: Optional[str] = Query(None),
     username: Optional[str] = Query(None),
     db: asyncpg.Connection = Depends(get_db)
 ):
@@ -723,6 +724,8 @@ async def search_users_for_messaging_alias(
         request=request,
         query=query,
         q=q,
+        search=search,
+        term=term,
         username=username,
         db=db,
     )
@@ -734,6 +737,8 @@ async def search_users_for_messaging_alt_alias(
     request: Request,
     query: Optional[str] = Query(None),
     q: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    term: Optional[str] = Query(None),
     username: Optional[str] = Query(None),
     db: asyncpg.Connection = Depends(get_db)
 ):
@@ -744,6 +749,8 @@ async def search_users_for_messaging_alt_alias(
         request=request,
         query=query,
         q=q,
+        search=search,
+        term=term,
         username=username,
         db=db,
     )
