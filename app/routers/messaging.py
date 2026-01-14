@@ -99,6 +99,42 @@ def _format_conversation(row: dict) -> dict:
     return conversation
 
 
+async def _get_conversation_columns(db: asyncpg.Connection) -> set:
+    rows = await db.fetch(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = 'conversations'
+        """
+    )
+    return {row["column_name"] for row in rows}
+
+
+async def _update_conversation_last_message(
+    db: asyncpg.Connection,
+    conversation_id: int,
+    message_id: int,
+) -> None:
+    columns = await _get_conversation_columns(db)
+    set_parts = []
+    params = []
+    param_index = 1
+
+    if "last_message_id" in columns:
+        set_parts.append(f"last_message_id = ${param_index}")
+        params.append(message_id)
+        param_index += 1
+    if "last_message_at" in columns:
+        set_parts.append("last_message_at = NOW()")
+
+    if not set_parts:
+        return
+
+    params.append(conversation_id)
+    query = f"UPDATE conversations SET {', '.join(set_parts)} WHERE id = ${param_index}"
+    await db.execute(query, *params)
+
+
 async def _notifications_supports_related_message(db: asyncpg.Connection) -> bool:
     return await db.fetchval(
         """
@@ -218,14 +254,10 @@ async def send_message(
         message.recipient_id,
         message.content
     )
-    await db.execute(
-        """
-        UPDATE conversations
-        SET last_message_id = $1, last_message_at = NOW()
-        WHERE id = $2
-        """,
-        msg_row["id"],
-        conversation_id,
+    await _update_conversation_last_message(
+        db=db,
+        conversation_id=conversation_id,
+        message_id=msg_row["id"],
     )
 
     # Get user profiles for response
@@ -270,22 +302,39 @@ async def get_conversations(
     user = get_current_user(request)
     user_id = user["id"]
 
-    query = """
+    columns = await _get_conversation_columns(db)
+    last_message_select = (
+        "m.content as last_message_content"
+        if "last_message_id" in columns
+        else "NULL as last_message_content"
+    )
+    last_message_join = (
+        "LEFT JOIN messages m ON c.last_message_id = m.id"
+        if "last_message_id" in columns
+        else ""
+    )
+    order_clause = (
+        "ORDER BY c.last_message_at DESC NULLS LAST"
+        if "last_message_at" in columns
+        else ("ORDER BY c.created_at DESC" if "created_at" in columns else "ORDER BY c.id DESC")
+    )
+
+    query = f"""
         SELECT
             c.*,
             CASE
                 WHEN c.user1_id = $1 THEN c.user2_id
-                ELSE c.user1_id
+            ELSE c.user1_id
             END as other_user_id,
             CASE
                 WHEN c.user1_id = $1 THEN up2.username
-                ELSE up1.username
+            ELSE up1.username
             END as other_user_username,
             CASE
                 WHEN c.user1_id = $1 THEN up2.avatar_url
-                ELSE up1.avatar_url
+            ELSE up1.avatar_url
             END as other_user_avatar,
-            m.content as last_message_content,
+            {last_message_select},
             (
                 SELECT COUNT(*)
                 FROM messages
@@ -296,9 +345,9 @@ async def get_conversations(
         FROM conversations c
         LEFT JOIN user_profiles up1 ON c.user1_id = up1.user_id
         LEFT JOIN user_profiles up2 ON c.user2_id = up2.user_id
-        LEFT JOIN messages m ON c.last_message_id = m.id
+        {last_message_join}
         WHERE c.user1_id = $1 OR c.user2_id = $1
-        ORDER BY c.last_message_at DESC NULLS LAST
+        {order_clause}
     """
 
     rows = await db.fetch(query, user_id)
@@ -346,14 +395,10 @@ async def start_conversation(
             recipient_id,
             payload.content,
         )
-        await db.execute(
-            """
-            UPDATE conversations
-            SET last_message_id = $1, last_message_at = NOW()
-            WHERE id = $2
-            """,
-            msg_row["id"],
-            conversation_id,
+        await _update_conversation_last_message(
+            db=db,
+            conversation_id=conversation_id,
+            message_id=msg_row["id"],
         )
         sender_info = await db.fetchrow(
             "SELECT username FROM user_profiles WHERE user_id = $1",
@@ -367,23 +412,35 @@ async def start_conversation(
             message_id=msg_row["id"],
         )
 
+    columns = await _get_conversation_columns(db)
+    last_message_select = (
+        "m.content as last_message_content"
+        if "last_message_id" in columns
+        else "NULL as last_message_content"
+    )
+    last_message_join = (
+        "LEFT JOIN messages m ON c.last_message_id = m.id"
+        if "last_message_id" in columns
+        else ""
+    )
+
     row = await db.fetchrow(
-        """
+        f"""
         SELECT
             c.*,
             CASE
                 WHEN c.user1_id = $1 THEN c.user2_id
-                ELSE c.user1_id
+            ELSE c.user1_id
             END as other_user_id,
             CASE
                 WHEN c.user1_id = $1 THEN up2.username
-                ELSE up1.username
+            ELSE up1.username
             END as other_user_username,
             CASE
                 WHEN c.user1_id = $1 THEN up2.avatar_url
-                ELSE up1.avatar_url
+            ELSE up1.avatar_url
             END as other_user_avatar,
-            m.content as last_message_content,
+            {last_message_select},
             (
                 SELECT COUNT(*)
                 FROM messages
@@ -394,7 +451,7 @@ async def start_conversation(
         FROM conversations c
         LEFT JOIN user_profiles up1 ON c.user1_id = up1.user_id
         LEFT JOIN user_profiles up2 ON c.user2_id = up2.user_id
-        LEFT JOIN messages m ON c.last_message_id = m.id
+        {last_message_join}
         WHERE c.id = $2
         """,
         user_id,
@@ -542,14 +599,10 @@ async def send_message_in_conversation(
         recipient_id,
         payload.content,
     )
-    await db.execute(
-        """
-        UPDATE conversations
-        SET last_message_id = $1, last_message_at = NOW()
-        WHERE id = $2
-        """,
-        msg_row["id"],
-        conversation_id,
+    await _update_conversation_last_message(
+        db=db,
+        conversation_id=conversation_id,
+        message_id=msg_row["id"],
     )
 
     sender_info = await db.fetchrow(
