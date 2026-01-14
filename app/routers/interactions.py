@@ -19,6 +19,7 @@ from app.db import get_db
 
 router = APIRouter(prefix="/api/interactions", tags=["Post Interactions"])
 social_router = APIRouter(prefix="/api/social/interactions", tags=["Post Interactions"])
+social_posts_router = APIRouter(prefix="/api/social", tags=["Post Interactions"])
 
 
 def get_current_user(request):
@@ -26,6 +27,24 @@ def get_current_user(request):
     if "user" not in request.session:
         raise HTTPException(status_code=401, detail="Not authenticated")
     return request.session["user"]
+
+
+async def column_exists(
+    db: asyncpg.Connection,
+    table_name: str,
+    column_name: str,
+) -> bool:
+    return await db.fetchval(
+        """
+        SELECT EXISTS(
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_name = $1 AND column_name = $2
+        )
+        """,
+        table_name,
+        column_name,
+    )
 
 
 # ============================================================================
@@ -37,7 +56,9 @@ class ReactionPayload(BaseModel):
 
 
 class CommentPayload(BaseModel):
-    content: str
+    content: Optional[str] = None
+    comment: Optional[str] = None
+    text: Optional[str] = None
     parent_comment_id: Optional[int] = None
 
 
@@ -226,7 +247,16 @@ async def remove_reaction(
     if result == "DELETE 0":
         raise HTTPException(status_code=404, detail="Reaction not found")
 
-    return {"message": "Reaction removed"}
+    stats = await db.fetchrow(
+        """
+        SELECT
+            (SELECT COUNT(*) FROM post_reactions WHERE post_id = $1 AND reaction_type = 'like') as likes,
+            (SELECT COUNT(*) FROM post_reactions WHERE post_id = $1 AND reaction_type = 'dislike') as dislikes
+        """,
+        post_id
+    )
+
+    return {"message": "Reaction removed", "stats": dict(stats)}
 
 
 @router.get("/reactions/{post_id}")
@@ -265,6 +295,117 @@ async def get_post_reactions(
         "likes_count": len(likes),
         "dislikes_count": len(dislikes)
     }
+
+
+@social_posts_router.post("/posts/{post_id}/reactions")
+async def add_reaction_for_social_post(
+    post_id: int,
+    payload: ReactionPayload,
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db),
+):
+    return await add_reaction_for_post(
+        post_id=post_id,
+        payload=payload,
+        request=request,
+        db=db,
+    )
+
+
+@social_posts_router.delete("/posts/{post_id}/reactions")
+async def remove_reaction_for_social_post(
+    post_id: int,
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db),
+):
+    return await remove_reaction_for_post(
+        post_id=post_id,
+        request=request,
+        db=db,
+    )
+
+
+# ============================================================================
+# POST SHARES / VIEWS
+# ============================================================================
+
+@router.post("/posts/{post_id}/share")
+@social_router.post("/posts/{post_id}/share")
+@social_posts_router.post("/posts/{post_id}/share")
+async def record_share(
+    post_id: int,
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db),
+):
+    get_current_user(request)
+    if not await column_exists(db, "social_posts", "shares_count"):
+        return {"post_id": post_id, "shares_count": 0, "supported": False}
+    post = await db.fetchval(
+        "SELECT id FROM social_posts WHERE id = $1",
+        post_id
+    )
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+
+    row = await db.fetchrow(
+        """
+        UPDATE social_posts
+        SET shares_count = shares_count + 1
+        WHERE id = $1
+        RETURNING shares_count
+        """,
+        post_id
+    )
+    return {"post_id": post_id, "shares_count": row["shares_count"]}
+
+
+@router.post("/posts/{post_id}/shares")
+@social_router.post("/posts/{post_id}/shares")
+@social_posts_router.post("/posts/{post_id}/shares")
+async def record_share_alias(
+    post_id: int,
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db),
+):
+    return await record_share(post_id=post_id, request=request, db=db)
+
+
+@router.post("/posts/{post_id}/view")
+@social_router.post("/posts/{post_id}/view")
+@social_posts_router.post("/posts/{post_id}/view")
+async def record_view(
+    post_id: int,
+    db: asyncpg.Connection = Depends(get_db),
+):
+    if not await column_exists(db, "social_posts", "views_count"):
+        return {"post_id": post_id, "views_count": 0, "supported": False}
+    post = await db.fetchval(
+        "SELECT id FROM social_posts WHERE id = $1",
+        post_id
+    )
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+
+    row = await db.fetchrow(
+        """
+        UPDATE social_posts
+        SET views_count = views_count + 1
+        WHERE id = $1
+        RETURNING views_count
+        """,
+        post_id
+    )
+    return {"post_id": post_id, "views_count": row["views_count"]}
+
+
+@router.post("/posts/{post_id}/views")
+@social_router.post("/posts/{post_id}/views")
+@social_posts_router.post("/posts/{post_id}/views")
+async def record_view_alias(
+    post_id: int,
+    db: asyncpg.Connection = Depends(get_db),
+):
+    return await record_view(post_id=post_id, db=db)
 
 
 # ============================================================================
@@ -367,12 +508,47 @@ async def add_comment_for_post(
     request: Request,
     db: asyncpg.Connection = Depends(get_db),
 ):
+    content = payload.content or payload.comment or payload.text
+    if not content:
+        raise HTTPException(status_code=400, detail="Comment content is required")
     comment = CommentCreate(
         post_id=post_id,
-        content=payload.content,
+        content=content,
         parent_comment_id=payload.parent_comment_id,
     )
     return await add_comment(comment=comment, request=request, db=db)
+
+
+@social_posts_router.post("/posts/{post_id}/comments")
+async def add_comment_for_social_post(
+    post_id: int,
+    payload: CommentPayload,
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db),
+):
+    return await add_comment_for_post(
+        post_id=post_id,
+        payload=payload,
+        request=request,
+        db=db,
+    )
+
+
+@router.post("/posts/{post_id}/comment")
+@social_router.post("/posts/{post_id}/comment")
+@social_posts_router.post("/posts/{post_id}/comment")
+async def add_comment_for_post_alias(
+    post_id: int,
+    payload: CommentPayload,
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db),
+):
+    return await add_comment_for_post(
+        post_id=post_id,
+        payload=payload,
+        request=request,
+        db=db,
+    )
 
 
 @router.get("/comments/{post_id}", response_model=List[CommentWithAuthor])
@@ -443,6 +619,23 @@ async def get_comments_for_post(
     db: asyncpg.Connection = Depends(get_db),
 ):
     return await get_comments(
+        post_id=post_id,
+        request=request,
+        offset=offset,
+        limit=limit,
+        db=db,
+    )
+
+
+@social_posts_router.get("/posts/{post_id}/comments", response_model=List[CommentWithAuthor])
+async def get_comments_for_social_post(
+    post_id: int,
+    request: Request,
+    offset: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=100),
+    db: asyncpg.Connection = Depends(get_db),
+):
+    return await get_comments_for_post(
         post_id=post_id,
         request=request,
         offset=offset,
