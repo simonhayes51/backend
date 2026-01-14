@@ -1599,7 +1599,7 @@ async def callback(request: Request):
 
 
         # ONLY set session data for verified members
-        username = f"{user_data.get('username','user')}#{user_data.get('discriminator', '0000')}"
+        username = user_data.get("global_name") or user_data.get("username") or "User"
         avatar_url = (
             f"https://cdn.discordapp.com/avatars/{user_id}/{user_data['avatar']}.png"
             if user_data.get('avatar')
