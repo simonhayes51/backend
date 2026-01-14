@@ -94,9 +94,7 @@ def _format_conversation(row: dict) -> dict:
         "username": conversation.get("other_user_username"),
         "avatar_url": conversation.get("other_user_avatar"),
     }
-    conversation["last_message"] = {
-        "content": conversation.get("last_message_content"),
-    }
+    conversation["last_message"] = conversation.get("last_message_content")
     return conversation
 
 
@@ -104,6 +102,7 @@ class StartConversationRequest(BaseModel):
     recipient_id: Optional[str] = None
     recipientId: Optional[str] = None
     user_id: Optional[str] = None
+    content: Optional[str] = None
 
 
 class MessagePayload(BaseModel):
@@ -274,6 +273,46 @@ async def start_conversation(
     conversation_id = await get_or_create_conversation(
         db, user_id, recipient_id
     )
+    if payload.content:
+        msg_row = await db.fetchrow(
+            """
+            INSERT INTO messages (
+                conversation_id, sender_id, recipient_id, content
+            )
+            VALUES ($1, $2, $3, $4)
+            RETURNING *
+            """,
+            conversation_id,
+            user_id,
+            recipient_id,
+            payload.content,
+        )
+        await db.execute(
+            """
+            UPDATE conversations
+            SET last_message_id = $1, last_message_at = NOW()
+            WHERE id = $2
+            """,
+            msg_row["id"],
+            conversation_id,
+        )
+        sender_info = await db.fetchrow(
+            "SELECT username FROM user_profiles WHERE user_id = $1",
+            user_id,
+        )
+        await db.execute(
+            """
+            INSERT INTO notifications (
+                user_id, notification_type, title, message,
+                related_user_id, related_message_id
+            )
+            VALUES ($1, 'new_message', 'New Message', $2, $3, $4)
+            """,
+            recipient_id,
+            f"{(sender_info or {}).get('username', 'Someone')} sent you a message",
+            user_id,
+            msg_row["id"],
+        )
 
     row = await db.fetchrow(
         """
