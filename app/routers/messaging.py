@@ -101,7 +101,9 @@ def _format_conversation(row: dict) -> dict:
 
 
 class StartConversationRequest(BaseModel):
-    recipient_id: str
+    recipient_id: Optional[str] = None
+    recipientId: Optional[str] = None
+    user_id: Optional[str] = None
 
 
 class MessagePayload(BaseModel):
@@ -151,6 +153,15 @@ async def send_message(
         user_id,
         message.recipient_id,
         message.content
+    )
+    await db.execute(
+        """
+        UPDATE conversations
+        SET last_message_id = $1, last_message_at = NOW()
+        WHERE id = $2
+        """,
+        msg_row["id"],
+        conversation_id,
     )
 
     # Get user profiles for response
@@ -246,18 +257,22 @@ async def start_conversation(
     user = get_current_user(request)
     user_id = user["id"]
 
-    if user_id == payload.recipient_id:
+    recipient_id = payload.recipient_id or payload.recipientId or payload.user_id
+    if not recipient_id:
+        raise HTTPException(status_code=400, detail="Recipient id required")
+
+    if user_id == recipient_id:
         raise HTTPException(status_code=400, detail="Cannot message yourself")
 
     recipient = await db.fetchval(
         "SELECT id FROM users WHERE id = $1",
-        payload.recipient_id,
+        recipient_id,
     )
     if not recipient:
         raise HTTPException(status_code=404, detail="Recipient not found")
 
     conversation_id = await get_or_create_conversation(
-        db, user_id, payload.recipient_id
+        db, user_id, recipient_id
     )
 
     row = await db.fetchrow(
@@ -434,6 +449,15 @@ async def send_message_in_conversation(
         user_id,
         recipient_id,
         payload.content,
+    )
+    await db.execute(
+        """
+        UPDATE conversations
+        SET last_message_id = $1, last_message_at = NOW()
+        WHERE id = $2
+        """,
+        msg_row["id"],
+        conversation_id,
     )
 
     sender_info = await db.fetchrow(

@@ -212,7 +212,13 @@ async def get_my_subscriptions(
     """
 
     rows = await db.fetch(query, *params)
-    return [dict(row) for row in rows]
+    results = []
+    for row in rows:
+        trader_dict = dict(row)
+        trader_dict["trader_id"] = str(trader_dict["trader_id"])
+        trader_dict["user_id"] = str(trader_dict["trader_id"])
+        results.append(trader_dict)
+    return results
 
 
 @router.get("/followers", response_model=List[dict])
@@ -249,7 +255,13 @@ async def get_my_followers(
     """
 
     rows = await db.fetch(query, user_id)
-    return [dict(row) for row in rows]
+    results = []
+    for row in rows:
+        trader_dict = dict(row)
+        trader_dict["trader_id"] = str(trader_dict["id"])
+        trader_dict["user_id"] = str(trader_dict["id"])
+        results.append(trader_dict)
+    return results
 
 
 @router.get("/check/{trader_id}")
@@ -416,7 +428,13 @@ async def get_recommended_traders(
         except asyncpg_exceptions.UndefinedTableError:
             return []
 
-    return [dict(row) for row in rows]
+    results = []
+    for row in rows:
+        trader_dict = dict(row)
+        trader_dict["trader_id"] = str(trader_dict["id"])
+        trader_dict["user_id"] = str(trader_dict["id"])
+        results.append(trader_dict)
+    return results
 
 
 @router.get("/recommended")
@@ -580,50 +598,60 @@ async def get_trader_sub_stats(
     """
     Get subscription statistics for a trader profile
     """
-    # Total active subscribers
-    total = await db.fetchval(
-        """
-        SELECT COUNT(*) FROM trader_subscriptions
-        WHERE trader_id = $1 AND is_active = TRUE
-        """,
-        trader_id
-    )
-
-    # Founding subscribers
-    founding = await db.fetchval(
-        """
-        SELECT COUNT(*) FROM trader_subscriptions
-        WHERE trader_id = $1 AND is_founding_subscriber = TRUE AND is_active = TRUE
-        """,
-        trader_id
-    )
-
-    # Tier breakdown
-    tier_breakdown = await db.fetch(
-        """
-        SELECT subscription_type, COUNT(*) as count
-        FROM trader_subscriptions
-        WHERE trader_id = $1 AND is_active = TRUE
-        GROUP BY subscription_type
-        """,
-        trader_id
-    )
-
-    breakdown = {row["subscription_type"]: row["count"] for row in tier_breakdown}
-
-    # Active percentage (engaged in last 7 days)
-    active_count = await db.fetchval(
-        """
-        SELECT COUNT(DISTINCT s.subscriber_id) FROM trader_subscriptions s
-        WHERE s.trader_id = $1 AND s.is_active = TRUE
-        AND s.subscriber_id IN (
-            SELECT user_id FROM post_reactions WHERE created_at > NOW() - INTERVAL '7 days'
-            UNION
-            SELECT user_id FROM post_comments WHERE created_at > NOW() - INTERVAL '7 days'
+    if trader_id in {"undefined", "null", ""}:
+        raise HTTPException(status_code=400, detail="Trader id required")
+    try:
+        # Total active subscribers
+        total = await db.fetchval(
+            """
+            SELECT COUNT(*) FROM trader_subscriptions
+            WHERE trader_id = $1 AND is_active = TRUE
+            """,
+            trader_id
         )
-        """,
-        trader_id
-    )
+
+        # Founding subscribers
+        founding = await db.fetchval(
+            """
+            SELECT COUNT(*) FROM trader_subscriptions
+            WHERE trader_id = $1 AND is_founding_subscriber = TRUE AND is_active = TRUE
+            """,
+            trader_id
+        )
+
+        # Tier breakdown
+        tier_breakdown = await db.fetch(
+            """
+            SELECT subscription_type, COUNT(*) as count
+            FROM trader_subscriptions
+            WHERE trader_id = $1 AND is_active = TRUE
+            GROUP BY subscription_type
+            """,
+            trader_id
+        )
+
+        breakdown = {row["subscription_type"]: row["count"] for row in tier_breakdown}
+
+        # Active percentage (engaged in last 7 days)
+        active_count = await db.fetchval(
+            """
+            SELECT COUNT(DISTINCT s.subscriber_id) FROM trader_subscriptions s
+            WHERE s.trader_id = $1 AND s.is_active = TRUE
+            AND s.subscriber_id IN (
+                SELECT user_id FROM post_reactions WHERE created_at > NOW() - INTERVAL '7 days'
+                UNION
+                SELECT user_id FROM post_comments WHERE created_at > NOW() - INTERVAL '7 days'
+            )
+            """,
+            trader_id
+        )
+    except asyncpg_exceptions.UndefinedTableError:
+        return {
+            "total": 0,
+            "active_percentage": 0,
+            "founding_count": 0,
+            "tier_breakdown": {},
+        }
 
     active_pct = (active_count / total * 100) if total > 0 else 0
 
