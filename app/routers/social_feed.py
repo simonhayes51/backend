@@ -197,6 +197,7 @@ async def create_post(
 
     has_title = await column_exists(db, "social_posts", "title")
     has_sell_at = await column_exists(db, "social_posts", "sell_at")
+    has_image_url = await column_exists(db, "social_posts", "image_url")
 
     columns = [
         "user_id",
@@ -209,7 +210,6 @@ async def create_post(
         "sell_target",
         "confidence_level",
         "tags",
-        "image_url",
         "is_premium",
         "expires_at",
     ]
@@ -226,7 +226,6 @@ async def create_post(
         post.sell_at,
         post.confidence_level,
         post.tags or [],
-        post.image_url,
         post.is_premium,
         post.expires_at,
     ]
@@ -240,6 +239,11 @@ async def create_post(
         insert_at = columns.index("sell_target") + 1
         columns.insert(insert_at, "sell_at")
         values.insert(insert_at, post.sell_at)
+
+    if has_image_url:
+        insert_at = columns.index("tags") + 1
+        columns.insert(insert_at, "image_url")
+        values.insert(insert_at, post.image_url)
 
     placeholders = ", ".join(f"${idx}" for idx in range(1, len(values) + 1))
     query = f"""
@@ -838,41 +842,6 @@ async def update_post_root(
     if (payload.sell_target is not None or payload.sell_at is not None) and not post_type_set:
         updates.append(f"post_type = ${param_idx}")
         params.append("quick_flip")
-        param_idx += 1
-
-    if payload.sell_target is not None:
-        updates.append(f"sell_target = ${param_idx}")
-        params.append(payload.sell_target)
-        param_idx += 1
-
-    if payload.sell_at is not None and has_sell_at:
-        updates.append(f"sell_at = ${param_idx}")
-        params.append(payload.sell_at)
-        param_idx += 1
-
-    if payload.confidence_level is not None:
-        updates.append(f"confidence_level = ${param_idx}")
-        params.append(payload.confidence_level)
-        param_idx += 1
-
-    if payload.player_name is not None:
-        updates.append(f"player_name = ${param_idx}")
-        params.append(payload.player_name)
-        param_idx += 1
-
-    if payload.player_card_id is not None:
-        updates.append(f"player_card_id = ${param_idx}")
-        params.append(payload.player_card_id)
-        param_idx += 1
-
-    if payload.buy_range_min is not None:
-        updates.append(f"buy_range_min = ${param_idx}")
-        params.append(payload.buy_range_min)
-        param_idx += 1
-
-    if payload.buy_range_max is not None:
-        updates.append(f"buy_range_max = ${param_idx}")
-        params.append(payload.buy_range_max)
         param_idx += 1
 
     if payload.sell_target is not None:
