@@ -33,6 +33,20 @@ async def table_exists(db: asyncpg.Connection, table_name: str) -> bool:
     return await db.fetchval("SELECT to_regclass($1)", table_name) is not None
 
 
+async def column_exists(db: asyncpg.Connection, table_name: str, column_name: str) -> bool:
+    return await db.fetchval(
+        """
+        SELECT EXISTS(
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_name = $1 AND column_name = $2
+        )
+        """,
+        table_name,
+        column_name,
+    )
+
+
 async def ensure_tables_exist(db: asyncpg.Connection, table_names: List[str]) -> bool:
     for table_name in table_names:
         if not await table_exists(db, table_name):
@@ -179,19 +193,25 @@ async def create_post(
             detail="Only traders can create posts. Upgrade to a trader account."
         )
 
-    # Create the post
-    query = """
-        INSERT INTO social_posts (
-            user_id, post_type, title, content, player_name, player_card_id,
-            buy_range_min, buy_range_max, sell_target, sell_at, confidence_level,
-            tags, image_url, is_premium, expires_at
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-        RETURNING *
-    """
+    has_title = await column_exists(db, "social_posts", "title")
+    has_sell_at = await column_exists(db, "social_posts", "sell_at")
 
-    row = await db.fetchrow(
-        query,
+    columns = [
+        "user_id",
+        "post_type",
+        "content",
+        "player_name",
+        "player_card_id",
+        "buy_range_min",
+        "buy_range_max",
+        "sell_target",
+        "confidence_level",
+        "tags",
+        "image_url",
+        "is_premium",
+        "expires_at",
+    ]
+    values = [
         user_id,
         post.post_type,
         post.title,
@@ -207,7 +227,28 @@ async def create_post(
         post.image_url,
         post.is_premium,
         post.expires_at,
-    )
+    ]
+
+    if has_title:
+        insert_at = columns.index("post_type") + 1
+        columns.insert(insert_at, "title")
+        values.insert(insert_at, post.title)
+
+    if has_sell_at:
+        insert_at = columns.index("sell_target") + 1
+        columns.insert(insert_at, "sell_at")
+        values.insert(insert_at, post.sell_at)
+
+    placeholders = ", ".join(f"${idx}" for idx in range(1, len(values) + 1))
+    query = f"""
+        INSERT INTO social_posts (
+            {', '.join(columns)}
+        )
+        VALUES ({placeholders})
+        RETURNING *
+    """
+
+    row = await db.fetchrow(query, *values)
 
     post_dict = dict(row)
     post_dict = await _attach_author(db, post_dict)
@@ -606,8 +647,11 @@ async def update_post(
     params = []
     param_idx = 1
     allowed_post_types = ["quick_flip", "prediction", "tip", "analysis"]
+    has_title = await column_exists(db, "social_posts", "title")
+    has_sell_at = await column_exists(db, "social_posts", "sell_at")
+    has_image_url = await column_exists(db, "social_posts", "image_url")
 
-    if post_update.title is not None:
+    if post_update.title is not None and has_title:
         updates.append(f"title = ${param_idx}")
         params.append(post_update.title)
         param_idx += 1
@@ -649,7 +693,7 @@ async def update_post(
         params.append(post_update.sell_target)
         param_idx += 1
 
-    if post_update.sell_at is not None:
+    if post_update.sell_at is not None and has_sell_at:
         updates.append(f"sell_at = ${param_idx}")
         params.append(post_update.sell_at)
         param_idx += 1
@@ -664,7 +708,7 @@ async def update_post(
         params.append(post_update.tags)
         param_idx += 1
 
-    if post_update.image_url is not None:
+    if post_update.image_url is not None and has_image_url:
         updates.append(f"image_url = ${param_idx}")
         params.append(post_update.image_url)
         param_idx += 1
@@ -723,8 +767,11 @@ async def update_post_root(
     params = []
     param_idx = 1
     allowed_post_types = ["quick_flip", "prediction", "tip", "analysis"]
+    has_title = await column_exists(db, "social_posts", "title")
+    has_sell_at = await column_exists(db, "social_posts", "sell_at")
+    has_image_url = await column_exists(db, "social_posts", "image_url")
 
-    if payload.title is not None:
+    if payload.title is not None and has_title:
         updates.append(f"title = ${param_idx}")
         params.append(payload.title)
         param_idx += 1
@@ -766,7 +813,7 @@ async def update_post_root(
         params.append(payload.sell_target)
         param_idx += 1
 
-    if payload.sell_at is not None:
+    if payload.sell_at is not None and has_sell_at:
         updates.append(f"sell_at = ${param_idx}")
         params.append(payload.sell_at)
         param_idx += 1
@@ -786,7 +833,7 @@ async def update_post_root(
         params.append(_expires_at_from_hours(payload.expires_in_hours))
         param_idx += 1
 
-    if payload.image_url is not None:
+    if payload.image_url is not None and has_image_url:
         updates.append(f"image_url = ${param_idx}")
         params.append(payload.image_url)
         param_idx += 1

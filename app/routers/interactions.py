@@ -29,6 +29,24 @@ def get_current_user(request):
     return request.session["user"]
 
 
+async def column_exists(
+    db: asyncpg.Connection,
+    table_name: str,
+    column_name: str,
+) -> bool:
+    return await db.fetchval(
+        """
+        SELECT EXISTS(
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_name = $1 AND column_name = $2
+        )
+        """,
+        table_name,
+        column_name,
+    )
+
+
 # ============================================================================
 # POST REACTIONS (Likes/Dislikes)
 # ============================================================================
@@ -318,6 +336,8 @@ async def record_share(
     db: asyncpg.Connection = Depends(get_db),
 ):
     get_current_user(request)
+    if not await column_exists(db, "social_posts", "shares_count"):
+        return {"post_id": post_id, "shares_count": 0, "supported": False}
     post = await db.fetchval(
         "SELECT id FROM social_posts WHERE id = $1",
         post_id
@@ -344,6 +364,8 @@ async def record_view(
     post_id: int,
     db: asyncpg.Connection = Depends(get_db),
 ):
+    if not await column_exists(db, "social_posts", "views_count"):
+        return {"post_id": post_id, "views_count": 0, "supported": False}
     post = await db.fetchval(
         "SELECT id FROM social_posts WHERE id = $1",
         post_id
