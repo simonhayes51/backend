@@ -4,6 +4,7 @@ Social Feed Router - Trading tips, predictions, and social posts
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from typing import Optional, List
 from datetime import datetime, timedelta
+from decimal import Decimal
 import asyncpg
 from asyncpg import exceptions as asyncpg_exceptions
 from pydantic import BaseModel, Field
@@ -43,6 +44,12 @@ class FeedPostCreatePayload(BaseModel):
     title: Optional[str] = None
     content: str = Field(..., min_length=1, max_length=5000)
     post_type: str
+    player_name: Optional[str] = None
+    player_card_id: Optional[str] = None
+    buy_range_min: Optional[Decimal] = None
+    buy_range_max: Optional[Decimal] = None
+    sell_target: Optional[Decimal] = None
+    confidence_level: Optional[int] = Field(None, ge=1, le=100)
     premium: bool = False
     expires_in_hours: Optional[int] = None
     image_url: Optional[str] = None  # Add image_url field
@@ -73,6 +80,7 @@ def _format_post(row: dict) -> dict:
     post = dict(row)
     author_snapshot = {
         "id": post.get("user_id"),
+        "trader_id": str(post.get("user_id")) if post.get("user_id") is not None else None,
         "username": post.get("username"),
         "avatar_url": post.get("avatar_url"),
         "is_verified": post.get("verified"),
@@ -201,6 +209,12 @@ async def create_post_root(
     social_post = SocialPostCreate(
         post_type=payload.post_type,
         content=payload.content,
+        player_name=payload.player_name,
+        player_card_id=payload.player_card_id,
+        buy_range_min=payload.buy_range_min,
+        buy_range_max=payload.buy_range_max,
+        sell_target=payload.sell_target,
+        confidence_level=payload.confidence_level,
         is_premium=payload.premium,
         expires_at=_expires_at_from_hours(payload.expires_in_hours),
         image_url=payload.image_url,  # Pass image_url
