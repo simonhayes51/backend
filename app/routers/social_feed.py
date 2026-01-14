@@ -49,6 +49,7 @@ class FeedPostCreatePayload(BaseModel):
     buy_range_min: Optional[Decimal] = None
     buy_range_max: Optional[Decimal] = None
     sell_target: Optional[Decimal] = None
+    sell_at: Optional[datetime] = None
     confidence_level: Optional[int] = Field(None, ge=1, le=100)
     premium: bool = False
     expires_in_hours: Optional[int] = None
@@ -60,8 +61,17 @@ class FeedPostUpdatePayload(BaseModel):
     title: Optional[str] = None
     content: Optional[str] = Field(None, min_length=1, max_length=5000)
     post_type: Optional[str] = None
+    player_name: Optional[str] = None
+    player_card_id: Optional[str] = None
+    buy_range_min: Optional[Decimal] = None
+    buy_range_max: Optional[Decimal] = None
+    sell_target: Optional[Decimal] = None
+    sell_at: Optional[datetime] = None
+    confidence_level: Optional[int] = Field(None, ge=1, le=100)
     premium: Optional[bool] = None
     expires_in_hours: Optional[int] = None
+    image_url: Optional[str] = None
+    tags: Optional[List[str]] = None
 
 
 def _expires_at_from_hours(expires_in_hours: Optional[int]) -> Optional[datetime]:
@@ -94,6 +104,8 @@ def _format_post(row: dict) -> dict:
         "likes": post.get("likes_count"),
         "dislikes": post.get("dislikes_count"),
         "comments": post.get("comments_count"),
+        "views": post.get("views_count"),
+        "shares": post.get("shares_count"),
     }
     return post
 
@@ -170,11 +182,11 @@ async def create_post(
     # Create the post
     query = """
         INSERT INTO social_posts (
-            user_id, post_type, content, player_name, player_card_id,
-            buy_range_min, buy_range_max, sell_target, confidence_level,
+            user_id, post_type, title, content, player_name, player_card_id,
+            buy_range_min, buy_range_max, sell_target, sell_at, confidence_level,
             tags, image_url, is_premium, expires_at
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
         RETURNING *
     """
 
@@ -182,12 +194,14 @@ async def create_post(
         query,
         user_id,
         post.post_type,
+        post.title,
         post.content,
         post.player_name,
         post.player_card_id,
         post.buy_range_min,
         post.buy_range_max,
         post.sell_target,
+        post.sell_at,
         post.confidence_level,
         post.tags or [],
         post.image_url,
@@ -208,12 +222,14 @@ async def create_post_root(
 ):
     social_post = SocialPostCreate(
         post_type=payload.post_type,
+        title=payload.title,
         content=payload.content,
         player_name=payload.player_name,
         player_card_id=payload.player_card_id,
         buy_range_min=payload.buy_range_min,
         buy_range_max=payload.buy_range_max,
         sell_target=payload.sell_target,
+        sell_at=payload.sell_at,
         confidence_level=payload.confidence_level,
         is_premium=payload.premium,
         expires_at=_expires_at_from_hours(payload.expires_in_hours),
@@ -589,10 +605,58 @@ async def update_post(
     updates = []
     params = []
     param_idx = 1
+    allowed_post_types = ["quick_flip", "prediction", "tip", "analysis"]
+
+    if post_update.title is not None:
+        updates.append(f"title = ${param_idx}")
+        params.append(post_update.title)
+        param_idx += 1
 
     if post_update.content is not None:
         updates.append(f"content = ${param_idx}")
         params.append(post_update.content)
+        param_idx += 1
+
+    if post_update.post_type is not None:
+        if post_update.post_type not in allowed_post_types:
+            raise HTTPException(status_code=400, detail="Invalid post type")
+        updates.append(f"post_type = ${param_idx}")
+        params.append(post_update.post_type)
+        param_idx += 1
+
+    if post_update.player_name is not None:
+        updates.append(f"player_name = ${param_idx}")
+        params.append(post_update.player_name)
+        param_idx += 1
+
+    if post_update.player_card_id is not None:
+        updates.append(f"player_card_id = ${param_idx}")
+        params.append(post_update.player_card_id)
+        param_idx += 1
+
+    if post_update.buy_range_min is not None:
+        updates.append(f"buy_range_min = ${param_idx}")
+        params.append(post_update.buy_range_min)
+        param_idx += 1
+
+    if post_update.buy_range_max is not None:
+        updates.append(f"buy_range_max = ${param_idx}")
+        params.append(post_update.buy_range_max)
+        param_idx += 1
+
+    if post_update.sell_target is not None:
+        updates.append(f"sell_target = ${param_idx}")
+        params.append(post_update.sell_target)
+        param_idx += 1
+
+    if post_update.sell_at is not None:
+        updates.append(f"sell_at = ${param_idx}")
+        params.append(post_update.sell_at)
+        param_idx += 1
+
+    if post_update.confidence_level is not None:
+        updates.append(f"confidence_level = ${param_idx}")
+        params.append(post_update.confidence_level)
         param_idx += 1
 
     if post_update.tags is not None:
@@ -600,9 +664,19 @@ async def update_post(
         params.append(post_update.tags)
         param_idx += 1
 
+    if post_update.image_url is not None:
+        updates.append(f"image_url = ${param_idx}")
+        params.append(post_update.image_url)
+        param_idx += 1
+
     if post_update.is_premium is not None:
         updates.append(f"is_premium = ${param_idx}")
         params.append(post_update.is_premium)
+        param_idx += 1
+
+    if post_update.expires_at is not None:
+        updates.append(f"expires_at = ${param_idx}")
+        params.append(post_update.expires_at)
         param_idx += 1
 
     if not updates:
@@ -648,6 +722,12 @@ async def update_post_root(
     updates = []
     params = []
     param_idx = 1
+    allowed_post_types = ["quick_flip", "prediction", "tip", "analysis"]
+
+    if payload.title is not None:
+        updates.append(f"title = ${param_idx}")
+        params.append(payload.title)
+        param_idx += 1
 
     if payload.content is not None:
         updates.append(f"content = ${param_idx}")
@@ -655,8 +735,45 @@ async def update_post_root(
         param_idx += 1
 
     if payload.post_type is not None:
+        if payload.post_type not in allowed_post_types:
+            raise HTTPException(status_code=400, detail="Invalid post type")
         updates.append(f"post_type = ${param_idx}")
         params.append(payload.post_type)
+        param_idx += 1
+
+    if payload.player_name is not None:
+        updates.append(f"player_name = ${param_idx}")
+        params.append(payload.player_name)
+        param_idx += 1
+
+    if payload.player_card_id is not None:
+        updates.append(f"player_card_id = ${param_idx}")
+        params.append(payload.player_card_id)
+        param_idx += 1
+
+    if payload.buy_range_min is not None:
+        updates.append(f"buy_range_min = ${param_idx}")
+        params.append(payload.buy_range_min)
+        param_idx += 1
+
+    if payload.buy_range_max is not None:
+        updates.append(f"buy_range_max = ${param_idx}")
+        params.append(payload.buy_range_max)
+        param_idx += 1
+
+    if payload.sell_target is not None:
+        updates.append(f"sell_target = ${param_idx}")
+        params.append(payload.sell_target)
+        param_idx += 1
+
+    if payload.sell_at is not None:
+        updates.append(f"sell_at = ${param_idx}")
+        params.append(payload.sell_at)
+        param_idx += 1
+
+    if payload.confidence_level is not None:
+        updates.append(f"confidence_level = ${param_idx}")
+        params.append(payload.confidence_level)
         param_idx += 1
 
     if payload.premium is not None:
@@ -667,6 +784,16 @@ async def update_post_root(
     if payload.expires_in_hours is not None:
         updates.append(f"expires_at = ${param_idx}")
         params.append(_expires_at_from_hours(payload.expires_in_hours))
+        param_idx += 1
+
+    if payload.image_url is not None:
+        updates.append(f"image_url = ${param_idx}")
+        params.append(payload.image_url)
+        param_idx += 1
+
+    if payload.tags is not None:
+        updates.append(f"tags = ${param_idx}")
+        params.append(payload.tags)
         param_idx += 1
 
     if not updates:
@@ -776,11 +903,13 @@ async def get_post_stats(
         "likes_count": post["likes_count"],
         "dislikes_count": post["dislikes_count"],
         "comments_count": post["comments_count"],
+        "views_count": post["views_count"],
+        "shares_count": post["shares_count"],
         "top_likers": [dict(row) for row in top_likers],
         "created_at": post["created_at"],
         "engagement_rate": (
-            (post["likes_count"] + post["comments_count"]) /
-            max(post["likes_count"] + post["dislikes_count"] + post["comments_count"], 1)
+            (post["likes_count"] + post["comments_count"] + post["shares_count"]) /
+            max(post["likes_count"] + post["dislikes_count"] + post["comments_count"] + post["shares_count"], 1)
         )
     }
 
