@@ -77,6 +77,7 @@ class FeedPostUpdatePayload(BaseModel):
     post_type: Optional[str] = None
     player_name: Optional[str] = None
     player_card_id: Optional[str] = None
+    buy_price: Optional[Decimal] = None
     buy_range_min: Optional[Decimal] = None
     buy_range_max: Optional[Decimal] = None
     sell_target: Optional[Decimal] = None
@@ -114,6 +115,7 @@ def _format_post(row: dict) -> dict:
     }
     post["title"] = post.get("title")
     post["author"] = author_snapshot
+    post["sell_signal"] = bool(post.get("sell_target") or post.get("sell_at"))
     post["stats"] = {
         "likes": post.get("likes_count"),
         "dislikes": post.get("dislikes_count"),
@@ -406,7 +408,7 @@ async def get_feed(
                 LEFT JOIN users u ON sp.user_id::text = u.id::text
                 LEFT JOIN trader_profiles tp ON u.id::text = tp.user_id::text
                 WHERE {where_clause}
-                ORDER BY sp.created_at DESC
+                ORDER BY COALESCE(sp.updated_at, sp.created_at) DESC
                 LIMIT ${param_idx} OFFSET ${param_idx + 1}
             """
             
@@ -661,12 +663,14 @@ async def update_post(
         params.append(post_update.content)
         param_idx += 1
 
+    post_type_set = False
     if post_update.post_type is not None:
         if post_update.post_type not in allowed_post_types:
             raise HTTPException(status_code=400, detail="Invalid post type")
         updates.append(f"post_type = ${param_idx}")
         params.append(post_update.post_type)
         param_idx += 1
+        post_type_set = True
 
     if post_update.player_name is not None:
         updates.append(f"player_name = ${param_idx}")
@@ -678,6 +682,14 @@ async def update_post(
         params.append(post_update.player_card_id)
         param_idx += 1
 
+    if post_update.buy_price is not None:
+        updates.append(f"buy_range_min = ${param_idx}")
+        params.append(post_update.buy_price)
+        param_idx += 1
+        updates.append(f"buy_range_max = ${param_idx}")
+        params.append(post_update.buy_price)
+        param_idx += 1
+
     if post_update.buy_range_min is not None:
         updates.append(f"buy_range_min = ${param_idx}")
         params.append(post_update.buy_range_min)
@@ -686,6 +698,11 @@ async def update_post(
     if post_update.buy_range_max is not None:
         updates.append(f"buy_range_max = ${param_idx}")
         params.append(post_update.buy_range_max)
+        param_idx += 1
+
+    if (post_update.sell_target is not None or post_update.sell_at is not None) and not post_type_set:
+        updates.append(f"post_type = ${param_idx}")
+        params.append("quick_flip")
         param_idx += 1
 
     if post_update.sell_target is not None:
@@ -781,11 +798,61 @@ async def update_post_root(
         params.append(payload.content)
         param_idx += 1
 
+    post_type_set = False
     if payload.post_type is not None:
         if payload.post_type not in allowed_post_types:
             raise HTTPException(status_code=400, detail="Invalid post type")
         updates.append(f"post_type = ${param_idx}")
         params.append(payload.post_type)
+        param_idx += 1
+        post_type_set = True
+
+    if payload.player_name is not None:
+        updates.append(f"player_name = ${param_idx}")
+        params.append(payload.player_name)
+        param_idx += 1
+
+    if payload.player_card_id is not None:
+        updates.append(f"player_card_id = ${param_idx}")
+        params.append(payload.player_card_id)
+        param_idx += 1
+
+    if payload.buy_price is not None:
+        updates.append(f"buy_range_min = ${param_idx}")
+        params.append(payload.buy_price)
+        param_idx += 1
+        updates.append(f"buy_range_max = ${param_idx}")
+        params.append(payload.buy_price)
+        param_idx += 1
+
+    if payload.buy_range_min is not None:
+        updates.append(f"buy_range_min = ${param_idx}")
+        params.append(payload.buy_range_min)
+        param_idx += 1
+
+    if payload.buy_range_max is not None:
+        updates.append(f"buy_range_max = ${param_idx}")
+        params.append(payload.buy_range_max)
+        param_idx += 1
+
+    if (payload.sell_target is not None or payload.sell_at is not None) and not post_type_set:
+        updates.append(f"post_type = ${param_idx}")
+        params.append("quick_flip")
+        param_idx += 1
+
+    if payload.sell_target is not None:
+        updates.append(f"sell_target = ${param_idx}")
+        params.append(payload.sell_target)
+        param_idx += 1
+
+    if payload.sell_at is not None and has_sell_at:
+        updates.append(f"sell_at = ${param_idx}")
+        params.append(payload.sell_at)
+        param_idx += 1
+
+    if payload.confidence_level is not None:
+        updates.append(f"confidence_level = ${param_idx}")
+        params.append(payload.confidence_level)
         param_idx += 1
 
     if payload.player_name is not None:

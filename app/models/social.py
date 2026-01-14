@@ -94,6 +94,7 @@ class SocialPostUpdate(BaseModel):
     post_type: Optional[str] = None
     player_name: Optional[str] = None
     player_card_id: Optional[str] = None
+    buy_price: Optional[Decimal] = None
     buy_range_min: Optional[Decimal] = None
     buy_range_max: Optional[Decimal] = None
     sell_target: Optional[Decimal] = None
