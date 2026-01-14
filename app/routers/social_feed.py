@@ -877,6 +877,36 @@ async def update_post_social_alias(
     )
 
 
+@social_router.patch("/posts/{post_id}", response_model=SocialPostWithAuthor)
+async def update_post_social_patch_alias(
+    post_id: int,
+    post_update: SocialPostUpdate,
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db),
+):
+    return await update_post(
+        post_id=post_id,
+        post_update=post_update,
+        request=request,
+        db=db,
+    )
+
+
+@social_router.post("/posts/{post_id}/edit")
+async def update_post_social_edit_alias(
+    post_id: int,
+    payload: FeedPostUpdatePayload,
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db),
+):
+    return await update_post_root(
+        post_id=post_id,
+        payload=payload,
+        request=request,
+        db=db,
+    )
+
+
 @router.delete("/posts/{post_id}")
 async def delete_post(
     post_id: int,

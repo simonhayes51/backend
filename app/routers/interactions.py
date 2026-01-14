@@ -56,7 +56,9 @@ class ReactionPayload(BaseModel):
 
 
 class CommentPayload(BaseModel):
-    content: str
+    content: Optional[str] = None
+    comment: Optional[str] = None
+    text: Optional[str] = None
     parent_comment_id: Optional[int] = None
 
 
@@ -357,6 +359,17 @@ async def record_share(
     return {"post_id": post_id, "shares_count": row["shares_count"]}
 
 
+@router.post("/posts/{post_id}/shares")
+@social_router.post("/posts/{post_id}/shares")
+@social_posts_router.post("/posts/{post_id}/shares")
+async def record_share_alias(
+    post_id: int,
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db),
+):
+    return await record_share(post_id=post_id, request=request, db=db)
+
+
 @router.post("/posts/{post_id}/view")
 @social_router.post("/posts/{post_id}/view")
 @social_posts_router.post("/posts/{post_id}/view")
@@ -383,6 +396,16 @@ async def record_view(
         post_id
     )
     return {"post_id": post_id, "views_count": row["views_count"]}
+
+
+@router.post("/posts/{post_id}/views")
+@social_router.post("/posts/{post_id}/views")
+@social_posts_router.post("/posts/{post_id}/views")
+async def record_view_alias(
+    post_id: int,
+    db: asyncpg.Connection = Depends(get_db),
+):
+    return await record_view(post_id=post_id, db=db)
 
 
 # ============================================================================
@@ -485,9 +508,12 @@ async def add_comment_for_post(
     request: Request,
     db: asyncpg.Connection = Depends(get_db),
 ):
+    content = payload.content or payload.comment or payload.text
+    if not content:
+        raise HTTPException(status_code=400, detail="Comment content is required")
     comment = CommentCreate(
         post_id=post_id,
-        content=payload.content,
+        content=content,
         parent_comment_id=payload.parent_comment_id,
     )
     return await add_comment(comment=comment, request=request, db=db)
@@ -495,6 +521,23 @@ async def add_comment_for_post(
 
 @social_posts_router.post("/posts/{post_id}/comments")
 async def add_comment_for_social_post(
+    post_id: int,
+    payload: CommentPayload,
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db),
+):
+    return await add_comment_for_post(
+        post_id=post_id,
+        payload=payload,
+        request=request,
+        db=db,
+    )
+
+
+@router.post("/posts/{post_id}/comment")
+@social_router.post("/posts/{post_id}/comment")
+@social_posts_router.post("/posts/{post_id}/comment")
+async def add_comment_for_post_alias(
     post_id: int,
     payload: CommentPayload,
     request: Request,
