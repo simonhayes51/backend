@@ -216,12 +216,14 @@ async def create_post(
     values = [
         user_id,
         post.post_type,
+        post.title,
         post.content,
         post.player_name,
         post.player_card_id,
         post.buy_range_min,
         post.buy_range_max,
         post.sell_target,
+        post.sell_at,
         post.confidence_level,
         post.tags or [],
         post.image_url,
@@ -836,6 +838,41 @@ async def update_post_root(
     if (payload.sell_target is not None or payload.sell_at is not None) and not post_type_set:
         updates.append(f"post_type = ${param_idx}")
         params.append("quick_flip")
+        param_idx += 1
+
+    if payload.sell_target is not None:
+        updates.append(f"sell_target = ${param_idx}")
+        params.append(payload.sell_target)
+        param_idx += 1
+
+    if payload.sell_at is not None and has_sell_at:
+        updates.append(f"sell_at = ${param_idx}")
+        params.append(payload.sell_at)
+        param_idx += 1
+
+    if payload.confidence_level is not None:
+        updates.append(f"confidence_level = ${param_idx}")
+        params.append(payload.confidence_level)
+        param_idx += 1
+
+    if payload.player_name is not None:
+        updates.append(f"player_name = ${param_idx}")
+        params.append(payload.player_name)
+        param_idx += 1
+
+    if payload.player_card_id is not None:
+        updates.append(f"player_card_id = ${param_idx}")
+        params.append(payload.player_card_id)
+        param_idx += 1
+
+    if payload.buy_range_min is not None:
+        updates.append(f"buy_range_min = ${param_idx}")
+        params.append(payload.buy_range_min)
+        param_idx += 1
+
+    if payload.buy_range_max is not None:
+        updates.append(f"buy_range_max = ${param_idx}")
+        params.append(payload.buy_range_max)
         param_idx += 1
 
     if payload.sell_target is not None:
