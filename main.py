@@ -1362,8 +1362,9 @@ async def check_server_membership(discord_id: int | str) -> bool:
                 headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"}
             ) as resp:
                 return resp.status == 200
-    except Exception:
-        return False
+    except Exception as exc:
+        logging.warning("Discord membership check failed; skipping enforcement: %s", exc)
+        return True
 
 def issue_extension_token(discord_id: str) -> str:
     now = int(time.time())
