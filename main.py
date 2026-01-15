@@ -1218,7 +1218,8 @@ ALLOWED_ORIGINS = [
     "http://localhost:5173",
     "http://localhost:3000",
 ]
-ALLOWED_ORIGIN_REGEX = r"^https://.*\.futhub\.co\.uk$"
+ALLOWED_ORIGIN_REGEX = r"^https://.*\\.futhub\\.co\\.uk$"
+
 
 def _is_allowed_origin(origin: str | None) -> bool:
     if not origin:
@@ -1228,69 +1229,22 @@ def _is_allowed_origin(origin: str | None) -> bool:
     return re.match(ALLOWED_ORIGIN_REGEX, origin) is not None
 
 
-@app.middleware("http")
-async def add_cors_headers(request: Request, call_next):
-    response = await call_next(request)
-    origin = request.headers.get("origin")
-    if _is_allowed_origin(origin):
-        response.headers.setdefault("Access-Control-Allow-Origin", origin)
-        response.headers.setdefault("Access-Control-Allow-Credentials", "true")
-    return response
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS + ["https://api.futhub.co.uk"],
-    allow_origin_regex=ALLOWED_ORIGIN_REGEX,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
-    response = JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
-    origin = request.headers.get("origin")
-    if _is_allowed_origin(origin):
-        response.headers["Access-Control-Allow-Origin"] = origin
-        response.headers["Access-Control-Allow-Credentials"] = "true"
-    return response
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    response = JSONResponse(status_code=422, content={"detail": exc.errors()})
-    origin = request.headers.get("origin")
-    if _is_allowed_origin(origin):
-        response.headers["Access-Control-Allow-Origin"] = origin
-        response.headers["Access-Control-Allow-Credentials"] = "true"
-    return response
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
 
 @app.exception_handler(ResponseValidationError)
 async def response_validation_exception_handler(request: Request, exc: ResponseValidationError):
-    response = JSONResponse(status_code=500, content={"detail": exc.errors()})
-    origin = request.headers.get("origin")
-    if _is_allowed_origin(origin):
-        response.headers["Access-Control-Allow-Origin"] = origin
-        response.headers["Access-Control-Allow-Credentials"] = "true"
-    return response
+    return JSONResponse(status_code=500, content={"detail": exc.errors()})
 
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
-    response = JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
-    origin = request.headers.get("origin")
-    if _is_allowed_origin(origin):
-        response.headers["Access-Control-Allow-Origin"] = origin
-        response.headers["Access-Control-Allow-Credentials"] = "true"
-    return response
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS + ["https://api.futhub.co.uk"],
-    allow_origin_regex=ALLOWED_ORIGIN_REGEX,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+    return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
 
 def _session_middleware_kwargs() -> dict:
     kwargs = {
@@ -1307,6 +1261,15 @@ def _session_middleware_kwargs() -> dict:
 app.add_middleware(
     SessionMiddleware,
     **_session_middleware_kwargs(),
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS + ["https://api.futhub.co.uk"],
+    allow_origin_regex=ALLOWED_ORIGIN_REGEX,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
     
