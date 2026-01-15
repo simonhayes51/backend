@@ -106,13 +106,7 @@ def _format_conversation(row: dict) -> dict:
         "username": conversation.get("other_user_username"),
         "avatar_url": conversation.get("other_user_avatar"),
     }
-    last_message_content = conversation.get("last_message_content")
-    if isinstance(last_message_content, dict):
-        conversation["last_message"] = last_message_content
-    elif last_message_content is not None:
-        conversation["last_message"] = {"content": last_message_content}
-    else:
-        conversation["last_message"] = None
+    conversation["last_message"] = None
     return conversation
 
 
