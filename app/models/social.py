@@ -15,12 +15,24 @@ class TraderProfileCreate(BaseModel):
     bio: Optional[str] = None
     specialties: Optional[List[str]] = []
     subscription_price: Optional[Decimal] = Decimal('0')
+    tier_basic_price: Optional[Decimal] = Decimal('4.99')
+    tier_premium_price: Optional[Decimal] = Decimal('9.99')
+    tier_elite_price: Optional[Decimal] = Decimal('19.99')
+    tier_basic_cap: Optional[int] = None
+    tier_premium_cap: Optional[int] = None
+    tier_elite_cap: Optional[int] = None
 
 
 class TraderProfileUpdate(BaseModel):
     bio: Optional[str] = None
     specialties: Optional[List[str]] = None
     subscription_price: Optional[Decimal] = None
+    tier_basic_price: Optional[Decimal] = None
+    tier_premium_price: Optional[Decimal] = None
+    tier_elite_price: Optional[Decimal] = None
+    tier_basic_cap: Optional[int] = None
+    tier_premium_cap: Optional[int] = None
+    tier_elite_cap: Optional[int] = None
 
 
 class TraderProfile(BaseModel):
@@ -29,6 +41,12 @@ class TraderProfile(BaseModel):
     specialties: List[str]
     verified: bool
     subscription_price: Decimal
+    tier_basic_price: Decimal
+    tier_premium_price: Decimal
+    tier_elite_price: Decimal
+    tier_basic_cap: Optional[int]
+    tier_premium_cap: Optional[int]
+    tier_elite_cap: Optional[int]
     total_followers: int
     total_posts: int
     avg_rating: float
@@ -52,6 +70,12 @@ class TraderPublicProfile(BaseModel):
     specialties: List[str]
     verified: bool
     subscription_price: Decimal
+    tier_basic_price: Decimal
+    tier_premium_price: Decimal
+    tier_elite_price: Decimal
+    tier_basic_cap: Optional[int]
+    tier_premium_cap: Optional[int]
+    tier_elite_cap: Optional[int]
     total_followers: int
     total_posts: int
     avg_rating: float
@@ -159,6 +183,7 @@ class FeedResponse(BaseModel):
 
 class SubscriptionCreate(BaseModel):
     trader_id: str
+    tier: str = "free"  # "free", "basic", "premium", "elite"
 
 
 class Subscription(BaseModel):
@@ -390,3 +415,13 @@ class TraderStats(UserStats):
     total_ratings: int = 0
     verified: bool = False
     subscription_price: Decimal = Decimal('0')
+
+
+class TraderAnalytics(BaseModel):
+    total_active_subscribers: int
+    active_basic_subscribers: int
+    active_premium_subscribers: int
+    active_elite_subscribers: int
+    monthly_earnings_estimated: Decimal
+    total_followers: int
+    views_last_30_days: int = 0
