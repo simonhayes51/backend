@@ -189,17 +189,15 @@ async def compute_entitlements(req: Request) -> Dict[str, Any]:
         except Exception:
             pass
 
-    premium = _is_premium(plan, premium_until, roles)
-    tier = _get_tier(plan, premium_until, roles)
+    # Treat all authenticated users as having full premium access
+    premium = bool(user_id)
+    tier: Tier = "elite" if user_id else "basic"
 
-    # Set limits based on tier
-    if tier == "elite":
+    # Set generous limits for authenticated users
+    if premium:
         watchlist_max = ELITE_WATCHLIST_MAX
         trending = ELITE_TRENDING
-    elif tier == "pro":
-        watchlist_max = PRO_WATCHLIST_MAX
-        trending = PRO_TRENDING
-    else:  # basic
+    else:
         watchlist_max = BASIC_WATCHLIST_MAX
         trending = BASIC_TRENDING
 
@@ -209,17 +207,8 @@ async def compute_entitlements(req: Request) -> Dict[str, Any]:
         "bulk_trades_max": 100 if tier == "elite" else (25 if tier == "pro" else 10),
     }
 
-    # Determine available features based on tier
-    features: Set[Feature] = set()
-    plan_lower = (plan or "basic").lower()
-
-    for feature, conf in FEATURE_MATRIX.items():
-        # Check if user's plan is in allowed plans
-        if plan_lower in conf.get("plans", set()):
-            features.add(feature)
-        # Check if user has required role
-        elif set(roles) & conf.get("roles", set()):
-            features.add(feature)
+    # Grant all features to authenticated users
+    features: Set[Feature] = set(FEATURE_MATRIX.keys()) if premium else set()
 
     return {
         "user_id": user_id,
@@ -234,39 +223,7 @@ async def compute_entitlements(req: Request) -> Dict[str, Any]:
 
 
 def require_feature(feature: Feature):
-    """
-    FastAPI dependency that errors with 402 if the user is not allowed to use the feature.
-    """
     async def _dep(req: Request):
-        ent = await compute_entitlements(req)
-
-        # Simple pass if they're premium overall
-        if ent["is_premium"]:
-            return True
-
-        conf = FEATURE_MATRIX.get(feature, {})
-        allowed = False
-
-        # Allow by role
-        if conf:
-            if set(ent["roles"]) & set(conf.get("roles", set())):
-                allowed = True
-
-            # Allow by plan
-            plan = (ent.get("plan") or "").lower()
-            if plan and plan in conf.get("plans", set()):
-                allowed = True
-
-        if not allowed:
-            raise HTTPException(
-                status_code=402,
-                detail={
-                    "error": "payment_required",
-                    "feature": feature,
-                    "message": f"{feature.replace('_', ' ').title()} is a premium feature.",
-                    "upgrade_url": "/billing",
-                },
-            )
         return True
 
     return _dep
