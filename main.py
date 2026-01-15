@@ -40,6 +40,7 @@ from app.services.prices import get_player_price  # optional
 from app.routers.smart_buy import router as smart_buy_router
 from app.routers.trade_finder import router as trade_finder_router
 from app.routers.auth_me import router as auth_me_router
+from app.routers.auth_email import router as auth_email_router
 from app.routers.trending import router as trending_router
 from discord_manager import discord_manager
 from app.routers.market import router as market_router
@@ -1439,6 +1440,7 @@ async def ext_add_trade(
 
 # ---- Router wiring (single, final) ----
 app.include_router(auth_me_router)          # /api/auth/me
+app.include_router(auth_email_router)       # /api/auth/email/*
 app.include_router(trade_finder_router)     # /api/trade-finder...
 app.include_router(ext_router)              # /ext/...
 
