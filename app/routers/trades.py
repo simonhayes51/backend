@@ -1,5 +1,5 @@
 # app/routers/trades.py
-from fastapi import APIRouter, Depends, Request, HTTPException
+from fastapi import APIRouter, Depends, Request, HTTPException, Query
 from typing import Dict, Any, List
 from pydantic import BaseModel, Field, validator
 from app.db import get_db
@@ -7,6 +7,54 @@ from app.auth.entitlements import compute_entitlements
 from datetime import datetime
 
 router = APIRouter(prefix="/api/trades", tags=["Trades"])
+
+@router.get("/")
+async def get_my_trades(
+    request: Request,
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(100, ge=1, le=500, description="Items per page"),
+    db=Depends(get_db)
+):
+    """
+    Get current user's trades
+    """
+    ent = await compute_entitlements(request)
+    user_id = ent.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    offset = (page - 1) * limit
+    
+    # Get total count
+    total = await db.fetchval(
+        "SELECT COUNT(*) FROM trades WHERE user_id=$1",
+        user_id
+    )
+
+    # Get paginated trades
+    rows = await db.fetch(
+        """
+        SELECT * FROM trades
+        WHERE user_id=$1
+        ORDER BY timestamp DESC
+        LIMIT $2 OFFSET $3
+        """,
+        user_id, limit, offset
+    )
+
+    total_pages = (total + limit - 1) // limit if total > 0 else 1
+
+    return {
+        "trades": [dict(r) for r in rows],
+        "pagination": {
+            "page": page,
+            "limit": limit,
+            "total": total,
+            "total_pages": total_pages,
+            "has_next": page < total_pages,
+            "has_prev": page > 1
+        }
+    }
 
 class TradeItem(BaseModel):
     player: str = Field(..., min_length=1)
