@@ -3,13 +3,14 @@ Instant Messaging Router - Direct messages between users
 """
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from typing import List, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, root_validator
 import asyncpg
 
 from app.models.social import (
     MessageCreate,
     Message,
     MessageWithUser,
+    MessagePayload,
     Conversation,
     ConversationWithDetails,
 )
@@ -98,15 +99,134 @@ def _format_conversation(row: dict) -> dict:
     return conversation
 
 
+async def _get_conversation_columns(db: asyncpg.Connection) -> set:
+    rows = await db.fetch(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = 'conversations'
+        """
+    )
+    return {row["column_name"] for row in rows}
+
+
+async def _table_exists(db: asyncpg.Connection, table_name: str) -> bool:
+    return await db.fetchval(
+        """
+        SELECT EXISTS (
+            SELECT 1
+            FROM information_schema.tables
+            WHERE table_name = $1
+        )
+        """,
+        table_name,
+    )
+
+
+async def _user_profiles_exist(db: asyncpg.Connection) -> bool:
+    return await _table_exists(db, "user_profiles")
+
+
+async def _update_conversation_last_message(
+    db: asyncpg.Connection,
+    conversation_id: int,
+    message_id: int,
+) -> None:
+    columns = await _get_conversation_columns(db)
+    set_parts = []
+    params = []
+    param_index = 1
+
+    if "last_message_id" in columns:
+        set_parts.append(f"last_message_id = ${param_index}")
+        params.append(message_id)
+        param_index += 1
+    if "last_message_at" in columns:
+        set_parts.append("last_message_at = NOW()")
+
+    if not set_parts:
+        return
+
+    params.append(conversation_id)
+    query = f"UPDATE conversations SET {', '.join(set_parts)} WHERE id = ${param_index}"
+    await db.execute(query, *params)
+
+
+async def _notifications_supports_related_message(db: asyncpg.Connection) -> bool:
+    if not await _table_exists(db, "notifications"):
+        return False
+    return await db.fetchval(
+        """
+        SELECT EXISTS (
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_name = 'notifications'
+              AND column_name = 'related_message_id'
+        )
+        """
+    )
+
+
+async def _create_message_notification(
+    db: asyncpg.Connection,
+    recipient_id: str,
+    sender_id: str,
+    sender_name: str,
+    message_id: int,
+) -> None:
+    if await _notifications_supports_related_message(db):
+        await db.execute(
+            """
+            INSERT INTO notifications (
+                user_id, notification_type, title, message,
+                related_user_id, related_message_id
+            )
+            VALUES ($1, 'new_message', 'New Message', $2, $3, $4)
+            """,
+            recipient_id,
+            f"{sender_name} sent you a message",
+            sender_id,
+            message_id,
+        )
+        return
+
+    await db.execute(
+        """
+        INSERT INTO notifications (
+            user_id, notification_type, title, message,
+            related_user_id
+        )
+        VALUES ($1, 'new_message', 'New Message', $2, $3)
+        """,
+        recipient_id,
+        f"{sender_name} sent you a message",
+        sender_id,
+    )
+
+
 class StartConversationRequest(BaseModel):
     recipient_id: Optional[str] = None
     recipientId: Optional[str] = None
+    recipient: Optional[str] = None
     user_id: Optional[str] = None
+    userId: Optional[str] = None
     content: Optional[str] = None
+    message: Optional[str] = None
+    text: Optional[str] = None
 
-
-class MessagePayload(BaseModel):
-    content: str
+    @root_validator(pre=True)
+    def normalize_start_fields(cls, values):
+        if values.get("recipient_id") is None:
+            for key in ("recipientId", "recipient", "user_id", "userId"):
+                if values.get(key):
+                    values["recipient_id"] = values[key]
+                    break
+        if values.get("content") is None:
+            for key in ("message", "text"):
+                if values.get(key):
+                    values["content"] = values[key]
+                    break
+        return values
 
 
 @router.post("/send", response_model=MessageWithUser)
@@ -153,48 +273,50 @@ async def send_message(
         message.recipient_id,
         message.content
     )
-    await db.execute(
-        """
-        UPDATE conversations
-        SET last_message_id = $1, last_message_at = NOW()
-        WHERE id = $2
-        """,
-        msg_row["id"],
-        conversation_id,
+    await _update_conversation_last_message(
+        db=db,
+        conversation_id=conversation_id,
+        message_id=msg_row["id"],
     )
 
     # Get user profiles for response
-    sender_info = await db.fetchrow(
-        "SELECT username, avatar_url FROM user_profiles WHERE user_id = $1",
-        user_id
-    )
+    sender_info = None
+    recipient_info = None
+    if await _user_profiles_exist(db):
+        sender_info = await db.fetchrow(
+            "SELECT username, avatar_url FROM user_profiles WHERE user_id = $1",
+            user_id
+        )
 
-    recipient_info = await db.fetchrow(
-        "SELECT username, avatar_url FROM user_profiles WHERE user_id = $1",
-        message.recipient_id
-    )
+        recipient_info = await db.fetchrow(
+            "SELECT username, avatar_url FROM user_profiles WHERE user_id = $1",
+            message.recipient_id
+        )
 
     # Create notification for recipient
-    await db.execute(
-        """
-        INSERT INTO notifications (
-            user_id, notification_type, title, message,
-            related_user_id, related_message_id
-        )
-        VALUES ($1, 'new_message', 'New Message', $2, $3, $4)
-        """,
-        message.recipient_id,
-        f"{sender_info['username']} sent you a message",
-        user_id,
-        msg_row["id"]
+    sender_name = (
+        (sender_info or {}).get("username")
+        or user.get("username")
+        or "Someone"
+    )
+    await _create_message_notification(
+        db=db,
+        recipient_id=message.recipient_id,
+        sender_id=user_id,
+        sender_name=sender_name,
+        message_id=msg_row["id"],
     )
 
     # Combine message data with user info
     msg_dict = dict(msg_row)
-    msg_dict["sender_username"] = sender_info["username"]
-    msg_dict["sender_avatar"] = sender_info["avatar_url"]
-    msg_dict["recipient_username"] = recipient_info["username"]
-    msg_dict["recipient_avatar"] = recipient_info["avatar_url"]
+    msg_dict["sender_username"] = (
+        (sender_info or {}).get("username") or user.get("username")
+    )
+    msg_dict["sender_avatar"] = (
+        (sender_info or {}).get("avatar_url") or user.get("avatar_url")
+    )
+    msg_dict["recipient_username"] = (recipient_info or {}).get("username")
+    msg_dict["recipient_avatar"] = (recipient_info or {}).get("avatar_url")
 
     return _format_message(msg_dict, user_id)
 
@@ -211,22 +333,51 @@ async def get_conversations(
     user = get_current_user(request)
     user_id = user["id"]
 
-    query = """
+    columns = await _get_conversation_columns(db)
+    profiles_exist = await _user_profiles_exist(db)
+    last_message_select = (
+        "m.content as last_message_content"
+        if "last_message_id" in columns
+        else "NULL as last_message_content"
+    )
+    last_message_join = (
+        "LEFT JOIN messages m ON c.last_message_id = m.id"
+        if "last_message_id" in columns
+        else ""
+    )
+    order_clause = (
+        "ORDER BY c.last_message_at DESC NULLS LAST"
+        if "last_message_at" in columns
+        else ("ORDER BY c.created_at DESC" if "created_at" in columns else "ORDER BY c.id DESC")
+    )
+
+    username_select = (
+        "CASE WHEN c.user1_id = $1 THEN up2.username ELSE up1.username END as other_user_username"
+        if profiles_exist
+        else "NULL as other_user_username"
+    )
+    avatar_select = (
+        "CASE WHEN c.user1_id = $1 THEN up2.avatar_url ELSE up1.avatar_url END as other_user_avatar"
+        if profiles_exist
+        else "NULL as other_user_avatar"
+    )
+    profiles_join = (
+        "LEFT JOIN user_profiles up1 ON c.user1_id = up1.user_id\n"
+        "LEFT JOIN user_profiles up2 ON c.user2_id = up2.user_id"
+        if profiles_exist
+        else ""
+    )
+
+    query = f"""
         SELECT
             c.*,
             CASE
                 WHEN c.user1_id = $1 THEN c.user2_id
-                ELSE c.user1_id
+            ELSE c.user1_id
             END as other_user_id,
-            CASE
-                WHEN c.user1_id = $1 THEN up2.username
-                ELSE up1.username
-            END as other_user_username,
-            CASE
-                WHEN c.user1_id = $1 THEN up2.avatar_url
-                ELSE up1.avatar_url
-            END as other_user_avatar,
-            m.content as last_message_content,
+            {username_select},
+            {avatar_select},
+            {last_message_select},
             (
                 SELECT COUNT(*)
                 FROM messages
@@ -235,11 +386,10 @@ async def get_conversations(
                     AND read_at IS NULL
             ) as unread_count
         FROM conversations c
-        LEFT JOIN user_profiles up1 ON c.user1_id = up1.user_id
-        LEFT JOIN user_profiles up2 ON c.user2_id = up2.user_id
-        LEFT JOIN messages m ON c.last_message_id = m.id
+        {profiles_join}
+        {last_message_join}
         WHERE c.user1_id = $1 OR c.user2_id = $1
-        ORDER BY c.last_message_at DESC NULLS LAST
+        {order_clause}
     """
 
     rows = await db.fetch(query, user_id)
@@ -256,7 +406,7 @@ async def start_conversation(
     user = get_current_user(request)
     user_id = user["id"]
 
-    recipient_id = payload.recipient_id or payload.recipientId or payload.user_id
+    recipient_id = payload.recipient_id
     if not recipient_id:
         raise HTTPException(status_code=400, detail="Recipient id required")
 
@@ -287,50 +437,66 @@ async def start_conversation(
             recipient_id,
             payload.content,
         )
-        await db.execute(
-            """
-            UPDATE conversations
-            SET last_message_id = $1, last_message_at = NOW()
-            WHERE id = $2
-            """,
-            msg_row["id"],
-            conversation_id,
+        await _update_conversation_last_message(
+            db=db,
+            conversation_id=conversation_id,
+            message_id=msg_row["id"],
         )
-        sender_info = await db.fetchrow(
-            "SELECT username FROM user_profiles WHERE user_id = $1",
-            user_id,
-        )
-        await db.execute(
-            """
-            INSERT INTO notifications (
-                user_id, notification_type, title, message,
-                related_user_id, related_message_id
+        sender_name = user.get("username") or "Someone"
+        if await _user_profiles_exist(db):
+            sender_info = await db.fetchrow(
+                "SELECT username FROM user_profiles WHERE user_id = $1",
+                user_id,
             )
-            VALUES ($1, 'new_message', 'New Message', $2, $3, $4)
-            """,
-            recipient_id,
-            f"{(sender_info or {}).get('username', 'Someone')} sent you a message",
-            user_id,
-            msg_row["id"],
+            sender_name = (sender_info or {}).get("username", sender_name)
+        await _create_message_notification(
+            db=db,
+            recipient_id=recipient_id,
+            sender_id=user_id,
+            sender_name=sender_name,
+            message_id=msg_row["id"],
         )
 
+    columns = await _get_conversation_columns(db)
+    profiles_exist = await _user_profiles_exist(db)
+    last_message_select = (
+        "m.content as last_message_content"
+        if "last_message_id" in columns
+        else "NULL as last_message_content"
+    )
+    last_message_join = (
+        "LEFT JOIN messages m ON c.last_message_id = m.id"
+        if "last_message_id" in columns
+        else ""
+    )
+    username_select = (
+        "CASE WHEN c.user1_id = $1 THEN up2.username ELSE up1.username END as other_user_username"
+        if profiles_exist
+        else "NULL as other_user_username"
+    )
+    avatar_select = (
+        "CASE WHEN c.user1_id = $1 THEN up2.avatar_url ELSE up1.avatar_url END as other_user_avatar"
+        if profiles_exist
+        else "NULL as other_user_avatar"
+    )
+    profiles_join = (
+        "LEFT JOIN user_profiles up1 ON c.user1_id = up1.user_id\n"
+        "LEFT JOIN user_profiles up2 ON c.user2_id = up2.user_id"
+        if profiles_exist
+        else ""
+    )
+
     row = await db.fetchrow(
-        """
+        f"""
         SELECT
             c.*,
             CASE
                 WHEN c.user1_id = $1 THEN c.user2_id
-                ELSE c.user1_id
+            ELSE c.user1_id
             END as other_user_id,
-            CASE
-                WHEN c.user1_id = $1 THEN up2.username
-                ELSE up1.username
-            END as other_user_username,
-            CASE
-                WHEN c.user1_id = $1 THEN up2.avatar_url
-                ELSE up1.avatar_url
-            END as other_user_avatar,
-            m.content as last_message_content,
+            {username_select},
+            {avatar_select},
+            {last_message_select},
             (
                 SELECT COUNT(*)
                 FROM messages
@@ -339,9 +505,8 @@ async def start_conversation(
                     AND read_at IS NULL
             ) as unread_count
         FROM conversations c
-        LEFT JOIN user_profiles up1 ON c.user1_id = up1.user_id
-        LEFT JOIN user_profiles up2 ON c.user2_id = up2.user_id
-        LEFT JOIN messages m ON c.last_message_id = m.id
+        {profiles_join}
+        {last_message_join}
         WHERE c.id = $2
         """,
         user_id,
@@ -393,21 +558,35 @@ async def get_conversation_messages(
         user_id
     )
 
-    # Get messages with user info
-    query = """
-        SELECT
-            m.*,
-            up1.username as sender_username,
-            up1.avatar_url as sender_avatar,
-            up2.username as recipient_username,
-            up2.avatar_url as recipient_avatar
-        FROM messages m
-        JOIN user_profiles up1 ON m.sender_id = up1.user_id
-        JOIN user_profiles up2 ON m.recipient_id = up2.user_id
-        WHERE m.conversation_id = $1 AND m.deleted_at IS NULL
-        ORDER BY m.created_at DESC
-        LIMIT $2 OFFSET $3
-    """
+    profiles_exist = await _user_profiles_exist(db)
+    if profiles_exist:
+        query = """
+            SELECT
+                m.*,
+                up1.username as sender_username,
+                up1.avatar_url as sender_avatar,
+                up2.username as recipient_username,
+                up2.avatar_url as recipient_avatar
+            FROM messages m
+            JOIN user_profiles up1 ON m.sender_id = up1.user_id
+            JOIN user_profiles up2 ON m.recipient_id = up2.user_id
+            WHERE m.conversation_id = $1 AND m.deleted_at IS NULL
+            ORDER BY m.created_at DESC
+            LIMIT $2 OFFSET $3
+        """
+    else:
+        query = """
+            SELECT
+                m.*,
+                NULL as sender_username,
+                NULL as sender_avatar,
+                NULL as recipient_username,
+                NULL as recipient_avatar
+            FROM messages m
+            WHERE m.conversation_id = $1 AND m.deleted_at IS NULL
+            ORDER BY m.created_at DESC
+            LIMIT $2 OFFSET $3
+        """
 
     rows = await db.fetch(query, conversation_id, limit, offset)
     return [_format_message(dict(row), user_id) for row in rows]
@@ -439,20 +618,35 @@ async def get_conversation_messages_by_id(
         user_id
     )
 
-    query = """
-        SELECT
-            m.*,
-            up1.username as sender_username,
-            up1.avatar_url as sender_avatar,
-            up2.username as recipient_username,
-            up2.avatar_url as recipient_avatar
-        FROM messages m
-        JOIN user_profiles up1 ON m.sender_id = up1.user_id
-        JOIN user_profiles up2 ON m.recipient_id = up2.user_id
-        WHERE m.conversation_id = $1 AND m.deleted_at IS NULL
-        ORDER BY m.created_at DESC
-        LIMIT $2 OFFSET $3
-    """
+    profiles_exist = await _user_profiles_exist(db)
+    if profiles_exist:
+        query = """
+            SELECT
+                m.*,
+                up1.username as sender_username,
+                up1.avatar_url as sender_avatar,
+                up2.username as recipient_username,
+                up2.avatar_url as recipient_avatar
+            FROM messages m
+            JOIN user_profiles up1 ON m.sender_id = up1.user_id
+            JOIN user_profiles up2 ON m.recipient_id = up2.user_id
+            WHERE m.conversation_id = $1 AND m.deleted_at IS NULL
+            ORDER BY m.created_at DESC
+            LIMIT $2 OFFSET $3
+        """
+    else:
+        query = """
+            SELECT
+                m.*,
+                NULL as sender_username,
+                NULL as sender_avatar,
+                NULL as recipient_username,
+                NULL as recipient_avatar
+            FROM messages m
+            WHERE m.conversation_id = $1 AND m.deleted_at IS NULL
+            ORDER BY m.created_at DESC
+            LIMIT $2 OFFSET $3
+        """
 
     rows = await db.fetch(query, conversation["id"], limit, offset)
     return [_format_message(dict(row), user_id) for row in rows]
@@ -489,45 +683,47 @@ async def send_message_in_conversation(
         recipient_id,
         payload.content,
     )
-    await db.execute(
-        """
-        UPDATE conversations
-        SET last_message_id = $1, last_message_at = NOW()
-        WHERE id = $2
-        """,
-        msg_row["id"],
-        conversation_id,
+    await _update_conversation_last_message(
+        db=db,
+        conversation_id=conversation_id,
+        message_id=msg_row["id"],
     )
 
-    sender_info = await db.fetchrow(
-        "SELECT username, avatar_url FROM user_profiles WHERE user_id = $1",
-        user_id
-    )
-
-    recipient_info = await db.fetchrow(
-        "SELECT username, avatar_url FROM user_profiles WHERE user_id = $1",
-        recipient_id
-    )
-
-    await db.execute(
-        """
-        INSERT INTO notifications (
-            user_id, notification_type, title, message,
-            related_user_id, related_message_id
+    sender_info = None
+    recipient_info = None
+    if await _user_profiles_exist(db):
+        sender_info = await db.fetchrow(
+            "SELECT username, avatar_url FROM user_profiles WHERE user_id = $1",
+            user_id
         )
-        VALUES ($1, 'new_message', 'New Message', $2, $3, $4)
-        """,
-        recipient_id,
-        f"{sender_info['username']} sent you a message",
-        user_id,
-        msg_row["id"]
+
+        recipient_info = await db.fetchrow(
+            "SELECT username, avatar_url FROM user_profiles WHERE user_id = $1",
+            recipient_id
+        )
+
+    sender_name = (
+        (sender_info or {}).get("username")
+        or user.get("username")
+        or "Someone"
+    )
+    await _create_message_notification(
+        db=db,
+        recipient_id=recipient_id,
+        sender_id=user_id,
+        sender_name=sender_name,
+        message_id=msg_row["id"],
     )
 
     msg_dict = dict(msg_row)
-    msg_dict["sender_username"] = sender_info["username"]
-    msg_dict["sender_avatar"] = sender_info["avatar_url"]
-    msg_dict["recipient_username"] = recipient_info["username"]
-    msg_dict["recipient_avatar"] = recipient_info["avatar_url"]
+    msg_dict["sender_username"] = (
+        (sender_info or {}).get("username") or user.get("username")
+    )
+    msg_dict["sender_avatar"] = (
+        (sender_info or {}).get("avatar_url") or user.get("avatar_url")
+    )
+    msg_dict["recipient_username"] = (recipient_info or {}).get("username")
+    msg_dict["recipient_avatar"] = (recipient_info or {}).get("avatar_url")
 
     return _format_message(msg_dict, user_id)
 
@@ -671,6 +867,11 @@ async def search_users_for_messaging(
     request: Request,
     query: Optional[str] = Query(None),
     q: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    searchTerm: Optional[str] = Query(None),
+    term: Optional[str] = Query(None),
+    name: Optional[str] = Query(None),
+    value: Optional[str] = Query(None),
     username: Optional[str] = Query(None),
     db: asyncpg.Connection = Depends(get_db)
 ):
@@ -680,9 +881,20 @@ async def search_users_for_messaging(
     user = get_current_user(request)
     user_id = user["id"]
 
-    search_term = query or q or username
+    search_term = (
+        query
+        or q
+        or search
+        or searchTerm
+        or term
+        or name
+        or value
+        or username
+    )
     if not search_term or not search_term.strip():
-        raise HTTPException(status_code=400, detail="Search query required")
+        return []
+    if not await _user_profiles_exist(db):
+        return []
 
     # Search users by username
     rows = await db.fetch(
@@ -713,6 +925,11 @@ async def search_users_for_messaging_alias(
     request: Request,
     query: Optional[str] = Query(None),
     q: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    searchTerm: Optional[str] = Query(None),
+    term: Optional[str] = Query(None),
+    name: Optional[str] = Query(None),
+    value: Optional[str] = Query(None),
     username: Optional[str] = Query(None),
     db: asyncpg.Connection = Depends(get_db)
 ):
@@ -723,6 +940,11 @@ async def search_users_for_messaging_alias(
         request=request,
         query=query,
         q=q,
+        search=search,
+        searchTerm=searchTerm,
+        term=term,
+        name=name,
+        value=value,
         username=username,
         db=db,
     )
@@ -734,6 +956,11 @@ async def search_users_for_messaging_alt_alias(
     request: Request,
     query: Optional[str] = Query(None),
     q: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    searchTerm: Optional[str] = Query(None),
+    term: Optional[str] = Query(None),
+    name: Optional[str] = Query(None),
+    value: Optional[str] = Query(None),
     username: Optional[str] = Query(None),
     db: asyncpg.Connection = Depends(get_db)
 ):
@@ -744,6 +971,11 @@ async def search_users_for_messaging_alt_alias(
         request=request,
         query=query,
         q=q,
+        search=search,
+        searchTerm=searchTerm,
+        term=term,
+        name=name,
+        value=value,
         username=username,
         db=db,
     )
