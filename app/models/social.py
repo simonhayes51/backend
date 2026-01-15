@@ -3,7 +3,7 @@ Pydantic models for social trading feed features
 """
 from datetime import datetime
 from typing import Optional, List, Dict, Any
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, validator, root_validator
 from decimal import Decimal
 
 
@@ -281,6 +281,33 @@ class RatingWithAuthor(Rating):
 class MessageCreate(BaseModel):
     recipient_id: str
     content: str = Field(..., min_length=1, max_length=5000)
+
+    @root_validator(pre=True)
+    def normalize_message_fields(cls, values):
+        if values.get("recipient_id") is None:
+            for key in ("recipientId", "recipient", "user_id", "userId"):
+                if values.get(key):
+                    values["recipient_id"] = values[key]
+                    break
+        if values.get("content") is None:
+            for key in ("message", "text"):
+                if values.get(key):
+                    values["content"] = values[key]
+                    break
+        return values
+
+
+class MessagePayload(BaseModel):
+    content: str
+
+    @root_validator(pre=True)
+    def normalize_payload_fields(cls, values):
+        if values.get("content") is None:
+            for key in ("message", "text"):
+                if values.get(key):
+                    values["content"] = values[key]
+                    break
+        return values
 
 
 class Message(BaseModel):
