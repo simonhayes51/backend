@@ -56,11 +56,30 @@ class TraderProfile(BaseModel):
     tier_elite_cap: Optional[int]
     total_followers: int
     total_posts: int
-    avg_rating: float = 0.0
+    avg_rating: Optional[float] = 0.0
     total_ratings: int = 0
-    achievements: List[dict] = Field(default_factory=list)
+    achievements: Optional[List[dict]] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
+
+    @validator("avg_rating", pre=True, always=True)
+    def _default_avg_rating(cls, v):
+        if v is None:
+            return 0.0
+        return v
+
+    @validator("achievements", pre=True, always=True)
+    def _coerce_achievements(cls, v):
+        if v in (None, ""):
+            return []
+        if isinstance(v, str):
+            try:
+                import json
+
+                return json.loads(v)
+            except Exception:
+                return []
+        return v
 
 
 class TraderPublicProfile(BaseModel):
@@ -85,10 +104,10 @@ class TraderPublicProfile(BaseModel):
     tier_elite_cap: Optional[int]
     total_followers: int
     total_posts: int
-    avg_rating: float
+    avg_rating: Optional[float] = 0.0
     total_ratings: int
     trader_since: datetime
-    is_subscribed: Optional[bool] = False  # Will be populated based on current user
+    is_subscribed: Optional[bool] = False
 
 
 # ============================================================================
