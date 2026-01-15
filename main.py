@@ -1218,8 +1218,7 @@ ALLOWED_ORIGINS = [
     "http://localhost:5173",
     "http://localhost:3000",
 ]
-ALLOWED_ORIGIN_REGEX = r"^https://.*\\.futhub\\.co\\.uk$"
-
+ALLOWED_ORIGIN_REGEX = r"^https://.*\.futhub\.co\.uk$"
 
 def _is_allowed_origin(origin: str | None) -> bool:
     if not origin:
@@ -1237,6 +1236,15 @@ async def add_cors_headers(request: Request, call_next):
         response.headers.setdefault("Access-Control-Allow-Origin", origin)
         response.headers.setdefault("Access-Control-Allow-Credentials", "true")
     return response
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS + ["https://api.futhub.co.uk"],
+    allow_origin_regex=ALLOWED_ORIGIN_REGEX,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
