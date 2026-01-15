@@ -333,6 +333,7 @@ async def check_subscription(
 
 
 @router.get("/stats")
+@router.get("/my-stats")
 async def get_subscription_stats(
     request: Request,
     db: asyncpg.Connection = Depends(get_db)
