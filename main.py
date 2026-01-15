@@ -1144,8 +1144,8 @@ async def sbc_solve(req: SbcSolveReq, conn=Depends(get_db)):
 
 @app.get("/api/entitlements")
 async def get_entitlements(request: Request):
-    """Get user's current entitlements with real-time validation"""
-    uid = request.session.get("user_id")
+    ent = await compute_entitlements(request)
+    uid = ent["user_id"]
     if not uid:
         return {
             "user_id": None,
@@ -1155,62 +1155,19 @@ async def get_entitlements(request: Request):
                 "watchlist_max": 3,
                 "trending": {"timeframes": ["24h"], "limit": 5, "smart": False}
             },
-            "roles": []
+            "roles": [],
+            "last_validated": datetime.now(timezone.utc).isoformat(),
         }
 
-    # Use app.state pool created by lifespan
-    async with request.app.state.pool.acquire() as conn:
-        is_premium = False
-        premium_until = None
-
-        active_subscription = await conn.fetchrow(
-            """
-            SELECT current_period_end, status, cancel_at_period_end
-            FROM subscriptions
-            WHERE user_id = $1
-              AND status IN ('active', 'trialing', 'trial')
-            ORDER BY created_at DESC
-            LIMIT 1
-            """,
-            uid
-        )
-
-        if active_subscription:
-            current_period_end = active_subscription["current_period_end"]
-            now = datetime.now(timezone.utc)
-            if current_period_end and current_period_end > now:
-                is_premium = True
-                premium_until = current_period_end
-            else:
-                await conn.execute(
-                    """
-                    UPDATE user_profiles
-                    SET is_premium = FALSE, premium_until = NULL, updated_at = NOW()
-                    WHERE user_id = $1
-                    """,
-                    uid
-                )
-                try:
-                    await discord_manager.remove_premium_role(uid)
-                except Exception as e:
-                    logging.warning(f"Failed to remove Discord role for expired user {uid}: {e}")
-
-        return {
-            "user_id": uid,
-            "is_premium": is_premium,
-            "premium_until": premium_until.isoformat() if premium_until else None,
-            "features": ["smart_buy", "trade_finder", "deal_confidence", "backtest", "smart_trending"] if is_premium else [],
-            "limits": {
-                "watchlist_max": 500 if is_premium else 3,
-                "trending": {
-                    "timeframes": ["4h", "6h", "24h"] if is_premium else ["24h"],
-                    "limit": 20 if is_premium else 5,
-                    "smart": is_premium
-                }
-            },
-            "roles": ["Premium"] if is_premium else [],
-            "last_validated": datetime.now(timezone.utc).isoformat()
-        }
+    return {
+        "user_id": uid,
+        "is_premium": ent["is_premium"],
+        "premium_until": ent["premium_until"],
+        "features": ent["features"],
+        "limits": ent["limits"],
+        "roles": ent["roles"],
+        "last_validated": datetime.now(timezone.utc).isoformat(),
+    }
 
 ALLOWED_ORIGINS = [
     "https://app.futhub.co.uk",
@@ -2140,17 +2097,16 @@ async def sbc_candidates(
 @app.get("/api/watchlist/usage")
 async def watchlist_usage(request: Request, user_id: str = Depends(get_current_user)):
     """
-    Return current watchlist usage vs plan limit.
+    Return current watchlist usage information.
     """
-    ent = await compute_entitlements(request)
     async with request.app.state.watchlist_pool.acquire() as conn:
         used = await conn.fetchval(
             "SELECT COUNT(*) FROM watchlist WHERE user_id=$1", user_id
         )
     return {
         "used": int(used or 0),
-        "max": int(ent["limits"]["watchlist_max"]),
-        "is_premium": bool(ent["is_premium"]),
+        "max": 1000000,
+        "is_premium": True,
     }
 
 @app.get("/api/watchlist")
@@ -3743,42 +3699,23 @@ async def get_current_price(
 
 @app.get("/api/trending")
 async def api_trending(
-    request: Request,
     type_: Optional[Literal["risers","fallers","smart"]] = Query(None, alias="type"),
     trend_type: Optional[Literal["risers","fallers","smart"]] = None,
     tf: Optional[str] = "24",
     limit: int = Query(10, ge=1, le=50),
 ):
-    ent = await compute_entitlements(request)
-    premium = bool(ent["is_premium"])
-    allowed_tfs = {"6", "12", "24"} if premium else {"24"}
-
     tf_norm = _norm_tf(tf)
     limited = False
 
     kind = (type_ or trend_type or "fallers").lower()
 
-    # Premium-only "smart"
-    if kind == "smart" and not premium:
-        raise HTTPException(
-            status_code=402,
-            detail={
-                "error": "payment_required",
-                "feature": "smart_trending",
-                "message": "Smart Trending is a premium feature.",
-                "upgrade_url": "/billing",
-            },
-        )
-
-    # Coerce timeframe for free users
-    if tf_norm not in allowed_tfs:
+    # Normalize timeframe
+    if tf_norm not in {"4", "6", "12", "24"}:
         tf_norm = "24"
-        limited = True
 
-    # Cap item count
-    max_items = 20 if premium else 5
-    if limit > max_items:
-        limit = max_items
+    # Cap item count consistently
+    if limit > 20:
+        limit = 20
         limited = True
 
       # ---------- simple risers/fallers ----------
