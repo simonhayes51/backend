@@ -31,6 +31,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError, ResponseValidationError
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.proxy_headers import ProxyHeadersMiddleware
 import inspect
 from pydantic import BaseModel, Field
 
@@ -1093,6 +1094,8 @@ async def lifespan(app: FastAPI):
 
 # --- FastAPI app ---
 app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 
 
 @app.exception_handler(asyncpg_exceptions.UndefinedTableError)
