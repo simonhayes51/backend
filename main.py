@@ -64,9 +64,7 @@ from app.routers.messaging import router as messaging_router
 from app.routers.messaging import social_router as messaging_social_router
 from app.routers.ratings import router as ratings_router
 from app.routers.ratings import social_router as ratings_social_router
-from app.routers.traders import admin_router as traders_admin_router
 from app.routers.traders import router as traders_router
-from app.routers.traders import social_router as traders_social_router
 from app.routers.notifications import router as notifications_router
 from app.routers.content_requests import router as content_requests_router
 
@@ -1473,8 +1471,6 @@ app.include_router(messaging_social_router)  # /api/social/messages/*
 app.include_router(ratings_router)          # /api/ratings/*
 app.include_router(ratings_social_router)    # /api/social/ratings/*
 app.include_router(traders_router)          # /api/traders/*
-app.include_router(traders_admin_router)    # /api/admin/traders/*
-app.include_router(traders_social_router)   # /api/social/traders/*
 app.include_router(notifications_router)    # /api/notifications/*
 app.include_router(content_requests_router)  # /api/content-requests/*
 
