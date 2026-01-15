@@ -51,16 +51,27 @@ async def get_or_create_conversation(
     if conversation_id:
         return conversation_id
 
-    # Create new conversation
-    conversation_id = await db.fetchval(
-        """
-        INSERT INTO conversations (user1_id, user2_id)
-        VALUES ($1, $2)
-        RETURNING id
-        """,
-        user1_id,
-        user2_id
-    )
+    try:
+        # Create new conversation
+        conversation_id = await db.fetchval(
+            """
+            INSERT INTO conversations (user1_id, user2_id)
+            VALUES ($1, $2)
+            RETURNING id
+            """,
+            user1_id,
+            user2_id
+        )
+    except asyncpg.UniqueViolationError:
+        # Conversation was created concurrently
+        conversation_id = await db.fetchval(
+            """
+            SELECT id FROM conversations
+            WHERE user1_id = $1 AND user2_id = $2
+            """,
+            user1_id,
+            user2_id
+        )
 
     return conversation_id
 
