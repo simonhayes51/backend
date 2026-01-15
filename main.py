@@ -1201,7 +1201,10 @@ async def response_validation_exception_handler(request: Request, exc: ResponseV
 
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
-    return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
+    import traceback
+    error_msg = f"{str(exc)}\n{traceback.format_exc()}"
+    logging.error(f"Unhandled exception: {error_msg}")
+    return JSONResponse(status_code=500, content={"detail": error_msg})
 
 
 class CatchExceptionsMiddleware(BaseHTTPMiddleware):
@@ -1209,8 +1212,10 @@ class CatchExceptionsMiddleware(BaseHTTPMiddleware):
         try:
             return await call_next(request)
         except Exception as exc:
-            logging.error(f"Unhandled exception: {exc}", exc_info=True)
-            return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
+            import traceback
+            error_msg = f"{str(exc)}\n{traceback.format_exc()}"
+            logging.error(f"Unhandled exception: {error_msg}", exc_info=True)
+            return JSONResponse(status_code=500, content={"detail": error_msg})
 
 def _session_middleware_kwargs() -> dict:
     kwargs = {
