@@ -127,22 +127,27 @@ def _format_post(row: dict) -> dict:
 
 
 async def _attach_author(db: asyncpg.Connection, post: dict) -> dict:
-    author = await db.fetchrow(
-        """
-        SELECT
-            up.username,
-            up.avatar_url,
-            COALESCE(tp.verified, FALSE) as verified,
-            tp.bio as trader_bio,
-            tp.specialties as trader_specialties,
-            tp.subscription_price as trader_subscription_price
-        FROM users u
-        LEFT JOIN user_profiles up ON u.id::text = up.user_id::text
-        LEFT JOIN trader_profiles tp ON u.id::text = tp.user_id::text
-        WHERE u.id::text = $1::text
-        """,
-        post.get("user_id"),
-    )
+    try:
+        author = await db.fetchrow(
+            """
+            SELECT
+                up.username,
+                up.avatar_url,
+                COALESCE(tp.verified, FALSE) as verified,
+                tp.bio as trader_bio,
+                tp.specialties as trader_specialties,
+                tp.subscription_price as trader_subscription_price
+            FROM users u
+            LEFT JOIN user_profiles up ON u.id::text = up.user_id::text
+            LEFT JOIN trader_profiles tp ON u.id::text = tp.user_id::text
+            WHERE u.id::text = $1::text
+            """,
+            post.get("user_id"),
+        )
+    except asyncpg.UndefinedTableError:
+        # Tables might not exist yet
+        return post
+
     if author:
         post["username"] = author["username"]
         post["avatar_url"] = author["avatar_url"]
@@ -166,16 +171,24 @@ async def create_post(
     user_id = user["id"]
 
     # Ensure user has username populated (fallback to discord username or id)
-    username = await db.fetchval("SELECT username FROM user_profiles WHERE user_id = $1", user_id)
+    try:
+        username = await db.fetchval("SELECT username FROM user_profiles WHERE user_id = $1", user_id)
+    except asyncpg.UndefinedTableError:
+        username = None
+
     if not username:
          # Fallback to user ID
         username = f"User_{str(user_id)[:8]}"
 
     # Check if user is a trader
-    account_type = await db.fetchval(
-        "SELECT account_type FROM users WHERE id = $1",
-        user_id
-    )
+    try:
+        account_type = await db.fetchval(
+            "SELECT account_type FROM users WHERE id = $1",
+            user_id
+        )
+    except asyncpg.UndefinedColumnError:
+        account_type = None
+
     is_trader = account_type == "trader"
     if not is_trader:
         is_trader = await db.fetchval(
