@@ -1319,7 +1319,9 @@ async def get_member_role_names(discord_user_id: str) -> list[str]:
 DISCORD_PREMIUM_ROLE_ID = os.getenv("DISCORD_PREMIUM_ROLE_ID")
 
 _ROLE_CACHE: dict[str, dict] = {}
+_MEMBERSHIP_CACHE: dict[str, dict] = {}
 ROLE_CACHE_TTL = 300  # 5 minutes
+MEMBERSHIP_CACHE_TTL = 300  # 5 minutes
 
 async def user_has_premium_role(user_id: str) -> bool:
     """Return True if the member has the Premium role in your guild (cached)."""
@@ -1350,21 +1352,39 @@ async def user_has_premium_role(user_id: str) -> bool:
     return ok
 
 
-async def check_server_membership(discord_id: int | str) -> bool:
+async def check_server_membership(discord_id: int | str) -> bool | None:
     if not (DISCORD_BOT_TOKEN and DISCORD_SERVER_ID):
         return True
 
+    now = time.time()
+    discord_id = str(discord_id)  # ensure URL-safe
+    cached = _MEMBERSHIP_CACHE.get(discord_id)
+    if cached and (now - cached["at"] < MEMBERSHIP_CACHE_TTL):
+        return bool(cached["ok"])
+
     try:
-        discord_id = str(discord_id)  # ensure URL-safe
         async with aiohttp.ClientSession() as session:
             async with session.get(
                 f"https://discord.com/api/guilds/{DISCORD_SERVER_ID}/members/{discord_id}",
                 headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"}
             ) as resp:
-                return resp.status == 200
+                if resp.status == 200:
+                    ok = True
+                elif resp.status in {429, 500, 502, 503, 504}:
+                    logging.warning(
+                        "Discord membership check failed with %s; using cached result.",
+                        resp.status,
+                    )
+                    ok = bool(cached["ok"]) if cached else None
+                else:
+                    ok = False
     except Exception as exc:
-        logging.warning("Discord membership check failed; skipping enforcement: %s", exc)
-        return True
+        logging.warning("Discord membership check failed; using cached result: %s", exc)
+        ok = bool(cached["ok"]) if cached else None
+
+    if ok is not None:
+        _MEMBERSHIP_CACHE[discord_id] = {"ok": ok, "at": now}
+    return ok
 
 def issue_extension_token(discord_id: str) -> str:
     now = int(time.time())
@@ -1604,11 +1624,16 @@ async def callback(request: Request):
         is_member = await check_server_membership(discord_id)
         print(f"🔍 Membership result: {is_member}")
 
-        if not is_member:
+        if is_member is False:
             print(f"❌ Discord user {discord_id} is NOT a member - clearing session")
             request.session.clear()
             print(f"🔍 Redirecting to: {FRONTEND_URL}/#/access-denied")
             return RedirectResponse(f"{FRONTEND_URL}/#/access-denied")
+        if is_member is None:
+            logging.warning(
+                "Discord membership check unavailable for %s; allowing login.",
+                discord_id,
+            )
 
         
         print(f"✅ Discord user {discord_id} is a member - proceeding with login")
@@ -2597,7 +2622,7 @@ async def get_current_user_info(request: Request, conn=Depends(get_db)):
     # RE-CHECK membership using DISCORD ID (NOT UUID)
     print(f"🔍 Re-checking membership for discord user {discord_id}")
     is_member = await check_server_membership(int(discord_id))
-    if not is_member:
+    if is_member is False:
         print(f"❌ Discord user {discord_id} no longer a member - clearing session")
         request.session.clear()
         return {
@@ -2605,6 +2630,11 @@ async def get_current_user_info(request: Request, conn=Depends(get_db)):
             "error": "membership_revoked",
             "message": "Discord server membership required"
         }
+    if is_member is None:
+        logging.warning(
+            "Discord membership check unavailable for %s; keeping session.",
+            discord_id,
+        )
 
     # Get user profile using UUID (with account_type from users table)
     if not await _table_exists(conn, "user_profiles"):
