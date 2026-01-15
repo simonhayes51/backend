@@ -1644,40 +1644,45 @@ async def callback(request: Request):
         discord_user_id = int(user_id)
         
                         # --- Upsert user + profile, then set session ---
-        async with request.app.state.pool.acquire() as conn:
-            # Ensure users row exists (core DB uses TEXT ids; simplest is discord_id as string id)
-            user_row = await conn.fetchrow(
-                """
-                INSERT INTO public.users (id, discord_id, username, avatar_url)
-                VALUES ($1, $2, $3, $4)
-                ON CONFLICT (discord_id) DO UPDATE SET 
-                    discord_id = EXCLUDED.discord_id,
-                    username = EXCLUDED.username,
-                    avatar_url = EXCLUDED.avatar_url
-                RETURNING id, discord_id, tier, plan, premium_until, roles
-                """,
-                str(discord_id),   # users.id is TEXT
-                discord_id,        # users.discord_id is BIGINT
-                username,          # Add username
-                avatar_url         # Add avatar_url
-            )
-
-            app_user_id = str(user_row["id"])
-
-            # Upsert user profile (user_profiles.user_id is VARCHAR in your core DB)
-            if await _table_exists(conn, "user_profiles"):
-                await conn.execute(
+        user_row = None
+        app_user_id = str(discord_id)
+        try:
+            async with request.app.state.pool.acquire() as conn:
+                # Ensure users row exists (core DB uses TEXT ids; simplest is discord_id as string id)
+                user_row = await conn.fetchrow(
                     """
-                    INSERT INTO public.user_profiles (user_id, username, avatar_url, global_name, updated_at)
-                    VALUES ($1, $2, $3, $4, NOW())
-                    ON CONFLICT (user_id) DO UPDATE SET
+                    INSERT INTO public.users (id, discord_id, username, avatar_url)
+                    VALUES ($1, $2, $3, $4)
+                    ON CONFLICT (discord_id) DO UPDATE SET 
+                        discord_id = EXCLUDED.discord_id,
                         username = EXCLUDED.username,
-                        avatar_url = EXCLUDED.avatar_url,
-                        global_name = EXCLUDED.global_name,
-                        updated_at = NOW()
+                        avatar_url = EXCLUDED.avatar_url
+                    RETURNING id, discord_id, tier, plan, premium_until, roles
                     """,
-                    app_user_id, username, avatar_url, global_name
+                    str(discord_id),   # users.id is TEXT
+                    discord_id,        # users.discord_id is BIGINT
+                    username,          # Add username
+                    avatar_url         # Add avatar_url
                 )
+
+                app_user_id = str(user_row["id"])
+
+                # Upsert user profile (user_profiles.user_id is VARCHAR in your core DB)
+                if await _table_exists(conn, "user_profiles"):
+                    await conn.execute(
+                        """
+                        INSERT INTO public.user_profiles (user_id, username, avatar_url, global_name, updated_at)
+                        VALUES ($1, $2, $3, $4, NOW())
+                        ON CONFLICT (user_id) DO UPDATE SET
+                            username = EXCLUDED.username,
+                            avatar_url = EXCLUDED.avatar_url,
+                            global_name = EXCLUDED.global_name,
+                            updated_at = NOW()
+                        """,
+                        app_user_id, username, avatar_url, global_name
+                    )
+        except Exception as exc:
+            logging.warning("User upsert failed; proceeding with session-only login: %s", exc)
 
         # Session
         request.session["user_id"] = app_user_id
@@ -1691,7 +1696,9 @@ async def callback(request: Request):
             "username": username,
             "avatar_url": avatar_url,
             "global_name": global_name,
-            "tier": user_row.get("tier") if isinstance(user_row, dict) else user_row["tier"],
+            "tier": (user_row.get("tier") if isinstance(user_row, dict) else user_row["tier"])
+            if user_row
+            else None,
         }
 
         # Discord roles lookup uses discord_id
