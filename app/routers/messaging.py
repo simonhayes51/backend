@@ -110,6 +110,23 @@ async def _get_conversation_columns(db: asyncpg.Connection) -> set:
     return {row["column_name"] for row in rows}
 
 
+async def _table_exists(db: asyncpg.Connection, table_name: str) -> bool:
+    return await db.fetchval(
+        """
+        SELECT EXISTS (
+            SELECT 1
+            FROM information_schema.tables
+            WHERE table_name = $1
+        )
+        """,
+        table_name,
+    )
+
+
+async def _user_profiles_exist(db: asyncpg.Connection) -> bool:
+    return await _table_exists(db, "user_profiles")
+
+
 async def _update_conversation_last_message(
     db: asyncpg.Connection,
     conversation_id: int,
@@ -136,6 +153,8 @@ async def _update_conversation_last_message(
 
 
 async def _notifications_supports_related_message(db: asyncpg.Connection) -> bool:
+    if not await _table_exists(db, "notifications"):
+        return False
     return await db.fetchval(
         """
         SELECT EXISTS (
@@ -261,31 +280,43 @@ async def send_message(
     )
 
     # Get user profiles for response
-    sender_info = await db.fetchrow(
-        "SELECT username, avatar_url FROM user_profiles WHERE user_id = $1",
-        user_id
-    )
+    sender_info = None
+    recipient_info = None
+    if await _user_profiles_exist(db):
+        sender_info = await db.fetchrow(
+            "SELECT username, avatar_url FROM user_profiles WHERE user_id = $1",
+            user_id
+        )
 
-    recipient_info = await db.fetchrow(
-        "SELECT username, avatar_url FROM user_profiles WHERE user_id = $1",
-        message.recipient_id
-    )
+        recipient_info = await db.fetchrow(
+            "SELECT username, avatar_url FROM user_profiles WHERE user_id = $1",
+            message.recipient_id
+        )
 
     # Create notification for recipient
+    sender_name = (
+        (sender_info or {}).get("username")
+        or user.get("username")
+        or "Someone"
+    )
     await _create_message_notification(
         db=db,
         recipient_id=message.recipient_id,
         sender_id=user_id,
-        sender_name=sender_info["username"],
+        sender_name=sender_name,
         message_id=msg_row["id"],
     )
 
     # Combine message data with user info
     msg_dict = dict(msg_row)
-    msg_dict["sender_username"] = sender_info["username"]
-    msg_dict["sender_avatar"] = sender_info["avatar_url"]
-    msg_dict["recipient_username"] = recipient_info["username"]
-    msg_dict["recipient_avatar"] = recipient_info["avatar_url"]
+    msg_dict["sender_username"] = (
+        (sender_info or {}).get("username") or user.get("username")
+    )
+    msg_dict["sender_avatar"] = (
+        (sender_info or {}).get("avatar_url") or user.get("avatar_url")
+    )
+    msg_dict["recipient_username"] = (recipient_info or {}).get("username")
+    msg_dict["recipient_avatar"] = (recipient_info or {}).get("avatar_url")
 
     return _format_message(msg_dict, user_id)
 
@@ -303,6 +334,7 @@ async def get_conversations(
     user_id = user["id"]
 
     columns = await _get_conversation_columns(db)
+    profiles_exist = await _user_profiles_exist(db)
     last_message_select = (
         "m.content as last_message_content"
         if "last_message_id" in columns
@@ -319,6 +351,23 @@ async def get_conversations(
         else ("ORDER BY c.created_at DESC" if "created_at" in columns else "ORDER BY c.id DESC")
     )
 
+    username_select = (
+        "CASE WHEN c.user1_id = $1 THEN up2.username ELSE up1.username END as other_user_username"
+        if profiles_exist
+        else "NULL as other_user_username"
+    )
+    avatar_select = (
+        "CASE WHEN c.user1_id = $1 THEN up2.avatar_url ELSE up1.avatar_url END as other_user_avatar"
+        if profiles_exist
+        else "NULL as other_user_avatar"
+    )
+    profiles_join = (
+        "LEFT JOIN user_profiles up1 ON c.user1_id = up1.user_id\n"
+        "LEFT JOIN user_profiles up2 ON c.user2_id = up2.user_id"
+        if profiles_exist
+        else ""
+    )
+
     query = f"""
         SELECT
             c.*,
@@ -326,14 +375,8 @@ async def get_conversations(
                 WHEN c.user1_id = $1 THEN c.user2_id
             ELSE c.user1_id
             END as other_user_id,
-            CASE
-                WHEN c.user1_id = $1 THEN up2.username
-            ELSE up1.username
-            END as other_user_username,
-            CASE
-                WHEN c.user1_id = $1 THEN up2.avatar_url
-            ELSE up1.avatar_url
-            END as other_user_avatar,
+            {username_select},
+            {avatar_select},
             {last_message_select},
             (
                 SELECT COUNT(*)
@@ -343,8 +386,7 @@ async def get_conversations(
                     AND read_at IS NULL
             ) as unread_count
         FROM conversations c
-        LEFT JOIN user_profiles up1 ON c.user1_id = up1.user_id
-        LEFT JOIN user_profiles up2 ON c.user2_id = up2.user_id
+        {profiles_join}
         {last_message_join}
         WHERE c.user1_id = $1 OR c.user2_id = $1
         {order_clause}
@@ -400,19 +442,23 @@ async def start_conversation(
             conversation_id=conversation_id,
             message_id=msg_row["id"],
         )
-        sender_info = await db.fetchrow(
-            "SELECT username FROM user_profiles WHERE user_id = $1",
-            user_id,
-        )
+        sender_name = user.get("username") or "Someone"
+        if await _user_profiles_exist(db):
+            sender_info = await db.fetchrow(
+                "SELECT username FROM user_profiles WHERE user_id = $1",
+                user_id,
+            )
+            sender_name = (sender_info or {}).get("username", sender_name)
         await _create_message_notification(
             db=db,
             recipient_id=recipient_id,
             sender_id=user_id,
-            sender_name=(sender_info or {}).get("username", "Someone"),
+            sender_name=sender_name,
             message_id=msg_row["id"],
         )
 
     columns = await _get_conversation_columns(db)
+    profiles_exist = await _user_profiles_exist(db)
     last_message_select = (
         "m.content as last_message_content"
         if "last_message_id" in columns
@@ -421,6 +467,22 @@ async def start_conversation(
     last_message_join = (
         "LEFT JOIN messages m ON c.last_message_id = m.id"
         if "last_message_id" in columns
+        else ""
+    )
+    username_select = (
+        "CASE WHEN c.user1_id = $1 THEN up2.username ELSE up1.username END as other_user_username"
+        if profiles_exist
+        else "NULL as other_user_username"
+    )
+    avatar_select = (
+        "CASE WHEN c.user1_id = $1 THEN up2.avatar_url ELSE up1.avatar_url END as other_user_avatar"
+        if profiles_exist
+        else "NULL as other_user_avatar"
+    )
+    profiles_join = (
+        "LEFT JOIN user_profiles up1 ON c.user1_id = up1.user_id\n"
+        "LEFT JOIN user_profiles up2 ON c.user2_id = up2.user_id"
+        if profiles_exist
         else ""
     )
 
@@ -432,14 +494,8 @@ async def start_conversation(
                 WHEN c.user1_id = $1 THEN c.user2_id
             ELSE c.user1_id
             END as other_user_id,
-            CASE
-                WHEN c.user1_id = $1 THEN up2.username
-            ELSE up1.username
-            END as other_user_username,
-            CASE
-                WHEN c.user1_id = $1 THEN up2.avatar_url
-            ELSE up1.avatar_url
-            END as other_user_avatar,
+            {username_select},
+            {avatar_select},
             {last_message_select},
             (
                 SELECT COUNT(*)
@@ -449,8 +505,7 @@ async def start_conversation(
                     AND read_at IS NULL
             ) as unread_count
         FROM conversations c
-        LEFT JOIN user_profiles up1 ON c.user1_id = up1.user_id
-        LEFT JOIN user_profiles up2 ON c.user2_id = up2.user_id
+        {profiles_join}
         {last_message_join}
         WHERE c.id = $2
         """,
@@ -503,21 +558,35 @@ async def get_conversation_messages(
         user_id
     )
 
-    # Get messages with user info
-    query = """
-        SELECT
-            m.*,
-            up1.username as sender_username,
-            up1.avatar_url as sender_avatar,
-            up2.username as recipient_username,
-            up2.avatar_url as recipient_avatar
-        FROM messages m
-        JOIN user_profiles up1 ON m.sender_id = up1.user_id
-        JOIN user_profiles up2 ON m.recipient_id = up2.user_id
-        WHERE m.conversation_id = $1 AND m.deleted_at IS NULL
-        ORDER BY m.created_at DESC
-        LIMIT $2 OFFSET $3
-    """
+    profiles_exist = await _user_profiles_exist(db)
+    if profiles_exist:
+        query = """
+            SELECT
+                m.*,
+                up1.username as sender_username,
+                up1.avatar_url as sender_avatar,
+                up2.username as recipient_username,
+                up2.avatar_url as recipient_avatar
+            FROM messages m
+            JOIN user_profiles up1 ON m.sender_id = up1.user_id
+            JOIN user_profiles up2 ON m.recipient_id = up2.user_id
+            WHERE m.conversation_id = $1 AND m.deleted_at IS NULL
+            ORDER BY m.created_at DESC
+            LIMIT $2 OFFSET $3
+        """
+    else:
+        query = """
+            SELECT
+                m.*,
+                NULL as sender_username,
+                NULL as sender_avatar,
+                NULL as recipient_username,
+                NULL as recipient_avatar
+            FROM messages m
+            WHERE m.conversation_id = $1 AND m.deleted_at IS NULL
+            ORDER BY m.created_at DESC
+            LIMIT $2 OFFSET $3
+        """
 
     rows = await db.fetch(query, conversation_id, limit, offset)
     return [_format_message(dict(row), user_id) for row in rows]
@@ -549,20 +618,35 @@ async def get_conversation_messages_by_id(
         user_id
     )
 
-    query = """
-        SELECT
-            m.*,
-            up1.username as sender_username,
-            up1.avatar_url as sender_avatar,
-            up2.username as recipient_username,
-            up2.avatar_url as recipient_avatar
-        FROM messages m
-        JOIN user_profiles up1 ON m.sender_id = up1.user_id
-        JOIN user_profiles up2 ON m.recipient_id = up2.user_id
-        WHERE m.conversation_id = $1 AND m.deleted_at IS NULL
-        ORDER BY m.created_at DESC
-        LIMIT $2 OFFSET $3
-    """
+    profiles_exist = await _user_profiles_exist(db)
+    if profiles_exist:
+        query = """
+            SELECT
+                m.*,
+                up1.username as sender_username,
+                up1.avatar_url as sender_avatar,
+                up2.username as recipient_username,
+                up2.avatar_url as recipient_avatar
+            FROM messages m
+            JOIN user_profiles up1 ON m.sender_id = up1.user_id
+            JOIN user_profiles up2 ON m.recipient_id = up2.user_id
+            WHERE m.conversation_id = $1 AND m.deleted_at IS NULL
+            ORDER BY m.created_at DESC
+            LIMIT $2 OFFSET $3
+        """
+    else:
+        query = """
+            SELECT
+                m.*,
+                NULL as sender_username,
+                NULL as sender_avatar,
+                NULL as recipient_username,
+                NULL as recipient_avatar
+            FROM messages m
+            WHERE m.conversation_id = $1 AND m.deleted_at IS NULL
+            ORDER BY m.created_at DESC
+            LIMIT $2 OFFSET $3
+        """
 
     rows = await db.fetch(query, conversation["id"], limit, offset)
     return [_format_message(dict(row), user_id) for row in rows]
@@ -605,29 +689,41 @@ async def send_message_in_conversation(
         message_id=msg_row["id"],
     )
 
-    sender_info = await db.fetchrow(
-        "SELECT username, avatar_url FROM user_profiles WHERE user_id = $1",
-        user_id
-    )
+    sender_info = None
+    recipient_info = None
+    if await _user_profiles_exist(db):
+        sender_info = await db.fetchrow(
+            "SELECT username, avatar_url FROM user_profiles WHERE user_id = $1",
+            user_id
+        )
 
-    recipient_info = await db.fetchrow(
-        "SELECT username, avatar_url FROM user_profiles WHERE user_id = $1",
-        recipient_id
-    )
+        recipient_info = await db.fetchrow(
+            "SELECT username, avatar_url FROM user_profiles WHERE user_id = $1",
+            recipient_id
+        )
 
+    sender_name = (
+        (sender_info or {}).get("username")
+        or user.get("username")
+        or "Someone"
+    )
     await _create_message_notification(
         db=db,
         recipient_id=recipient_id,
         sender_id=user_id,
-        sender_name=sender_info["username"],
+        sender_name=sender_name,
         message_id=msg_row["id"],
     )
 
     msg_dict = dict(msg_row)
-    msg_dict["sender_username"] = sender_info["username"]
-    msg_dict["sender_avatar"] = sender_info["avatar_url"]
-    msg_dict["recipient_username"] = recipient_info["username"]
-    msg_dict["recipient_avatar"] = recipient_info["avatar_url"]
+    msg_dict["sender_username"] = (
+        (sender_info or {}).get("username") or user.get("username")
+    )
+    msg_dict["sender_avatar"] = (
+        (sender_info or {}).get("avatar_url") or user.get("avatar_url")
+    )
+    msg_dict["recipient_username"] = (recipient_info or {}).get("username")
+    msg_dict["recipient_avatar"] = (recipient_info or {}).get("avatar_url")
 
     return _format_message(msg_dict, user_id)
 
@@ -796,6 +892,8 @@ async def search_users_for_messaging(
         or username
     )
     if not search_term or not search_term.strip():
+        return []
+    if not await _user_profiles_exist(db):
         return []
 
     # Search users by username
