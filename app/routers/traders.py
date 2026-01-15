@@ -328,6 +328,20 @@ async def get_trader_analytics(
     )
 
 
+@router.get("/earnings", response_model=TraderAnalytics)
+async def get_trader_earnings(
+    request: Request,
+    range: str = Query("month"),
+    db: asyncpg.Connection = Depends(get_db)
+):
+    """
+    Backwards-compatible alias for trader earnings analytics.
+    Frontend calls /api/traders/earnings?range=month; we currently
+    ignore the range parameter and reuse get_trader_analytics.
+    """
+    return await get_trader_analytics(request, db)
+
+
 @router.get("/{trader_id}", response_model=TraderPublicProfile)
 async def get_trader_profile(
     trader_id: str,
