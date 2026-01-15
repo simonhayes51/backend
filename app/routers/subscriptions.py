@@ -78,6 +78,17 @@ async def subscribe_to_trader(
     user = get_current_user(request)
     user_id = user["id"]
 
+    required_tables = [
+        "public.users",
+        "public.trader_subscriptions",
+        "public.notifications",
+    ]
+    if not await ensure_tables_exist(db, required_tables):
+        raise HTTPException(
+            status_code=503,
+            detail="Subscriptions feature not available (database not migrated)",
+        )
+
     # Can't subscribe to yourself
     if user_id == subscription.trader_id:
         raise HTTPException(status_code=400, detail="Cannot subscribe to yourself")
