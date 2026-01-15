@@ -223,14 +223,12 @@ async def create_post(
     values = [
         user_id,
         post.post_type,
-        post.title,
         post.content,
         post.player_name,
         post.player_card_id,
         post.buy_range_min,
         post.buy_range_max,
         post.sell_target,
-        post.sell_at,
         post.confidence_level,
         post.tags or [],
         post.is_premium,
@@ -238,19 +236,16 @@ async def create_post(
     ]
 
     if has_title:
-        insert_at = columns.index("post_type") + 1
-        columns.insert(insert_at, "title")
-        values.insert(insert_at, post.title)
+        columns.append("title")
+        values.append(post.title)
 
     if has_sell_at:
-        insert_at = columns.index("sell_target") + 1
-        columns.insert(insert_at, "sell_at")
-        values.insert(insert_at, post.sell_at)
+        columns.append("sell_at")
+        values.append(post.sell_at)
 
     if has_image_url:
-        insert_at = columns.index("tags") + 1
-        columns.insert(insert_at, "image_url")
-        values.insert(insert_at, post.image_url)
+        columns.append("image_url")
+        values.append(post.image_url)
 
     placeholders = ", ".join(f"${idx}" for idx in range(1, len(values) + 1))
     query = f"""
