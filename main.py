@@ -1319,7 +1319,9 @@ async def get_member_role_names(discord_user_id: str) -> list[str]:
 DISCORD_PREMIUM_ROLE_ID = os.getenv("DISCORD_PREMIUM_ROLE_ID")
 
 _ROLE_CACHE: dict[str, dict] = {}
+_MEMBERSHIP_CACHE: dict[str, dict] = {}
 ROLE_CACHE_TTL = 300  # 5 minutes
+MEMBERSHIP_CACHE_TTL = 300  # 5 minutes
 
 async def user_has_premium_role(user_id: str) -> bool:
     """Return True if the member has the Premium role in your guild (cached)."""
@@ -1354,17 +1356,34 @@ async def check_server_membership(discord_id: int | str) -> bool:
     if not (DISCORD_BOT_TOKEN and DISCORD_SERVER_ID):
         return True
 
+    now = time.time()
+    discord_id = str(discord_id)  # ensure URL-safe
+    cached = _MEMBERSHIP_CACHE.get(discord_id)
+    if cached and (now - cached["at"] < MEMBERSHIP_CACHE_TTL):
+        return bool(cached["ok"])
+
     try:
-        discord_id = str(discord_id)  # ensure URL-safe
         async with aiohttp.ClientSession() as session:
             async with session.get(
                 f"https://discord.com/api/guilds/{DISCORD_SERVER_ID}/members/{discord_id}",
                 headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"}
             ) as resp:
-                return resp.status == 200
+                if resp.status == 200:
+                    ok = True
+                elif resp.status in {429, 500, 502, 503, 504}:
+                    logging.warning(
+                        "Discord membership check failed with %s; using cached result.",
+                        resp.status,
+                    )
+                    ok = bool(cached["ok"]) if cached else True
+                else:
+                    ok = False
     except Exception as exc:
-        logging.warning("Discord membership check failed; skipping enforcement: %s", exc)
-        return True
+        logging.warning("Discord membership check failed; using cached result: %s", exc)
+        ok = bool(cached["ok"]) if cached else True
+
+    _MEMBERSHIP_CACHE[discord_id] = {"ok": ok, "at": now}
+    return ok
 
 def issue_extension_token(discord_id: str) -> str:
     now = int(time.time())
