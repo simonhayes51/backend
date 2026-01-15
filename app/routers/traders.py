@@ -78,6 +78,84 @@ async def upgrade_to_trader(
     return dict(row)
 
 
+@router.get("/transactions")
+async def get_trader_transactions_alias(
+    request: Request,
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(100, ge=1, le=500, description="Items per page"),
+    db: asyncpg.Connection = Depends(get_db)
+):
+    """
+    Get current user's trades (alias for /api/trades)
+    """
+    user = get_current_user(request)
+    user_id = user["id"]
+    
+    offset = (page - 1) * limit
+    
+    # Get total count
+    total = await db.fetchval(
+        "SELECT COUNT(*) FROM trades WHERE user_id=$1",
+        user_id
+    )
+
+    # Get paginated trades
+    rows = await db.fetch(
+        """
+        SELECT * FROM trades
+        WHERE user_id=$1
+        ORDER BY timestamp DESC
+        LIMIT $2 OFFSET $3
+        """,
+        user_id, limit, offset
+    )
+
+    total_pages = (total + limit - 1) // limit if total > 0 else 1
+
+    return {
+        "trades": [dict(r) for r in rows],
+        "pagination": {
+            "page": page,
+            "limit": limit,
+            "total": total,
+            "total_pages": total_pages,
+            "has_next": page < total_pages,
+            "has_prev": page > 1
+        }
+    }
+
+
+@router.get("/my-subscribers")
+async def get_my_subscribers_alias(
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db)
+):
+    """
+    Get list of users subscribed to me (alias for /api/subscriptions/my-subscribers)
+    """
+    user = get_current_user(request)
+    user_id = user["id"]
+    
+    rows = await db.fetch(
+        """
+        SELECT
+          ts.subscriber_id,
+          ts.is_active,
+          ts.created_at,
+          u.username,
+          u.avatar_url,
+          up.global_name
+        FROM trader_subscriptions ts
+        LEFT JOIN users u ON u.id = ts.subscriber_id
+        LEFT JOIN user_profiles up ON up.user_id = ts.subscriber_id
+        WHERE ts.trader_id = $1
+        ORDER BY ts.created_at DESC
+        """,
+        user_id,
+    )
+    return [dict(r) for r in rows]
+
+
 @router.get("/me", response_model=TraderProfile)
 async def get_current_trader_profile(
     request: Request,
