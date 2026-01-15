@@ -527,8 +527,8 @@ async def start_conversation(
     return _format_conversation(dict(row))
 
 
-@router.get("/conversations/{other_user_id}/messages", response_model=List[MessageWithUser])
-@social_router.get("/conversations/{other_user_id}/messages", response_model=List[MessageWithUser])
+@router.get("/users/{other_user_id}/messages", response_model=List[MessageWithUser])
+@social_router.get("/users/{other_user_id}/messages", response_model=List[MessageWithUser])
 async def get_conversation_messages(
     other_user_id: str,
     request: Request,
@@ -537,7 +537,7 @@ async def get_conversation_messages(
     db: asyncpg.Connection = Depends(get_db)
 ):
     """
-    Get messages in a conversation with another user
+    Get messages in a conversation with another user (by user id)
     """
     user = get_current_user(request)
     user_id = str(user["id"])
@@ -863,6 +863,20 @@ async def mark_conversation_read(
 @router.post("/conversations/{conversation_id}/read")
 @social_router.post("/conversations/{conversation_id}/read")
 async def mark_conversation_read_alias(
+    conversation_id: int,
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db),
+):
+    return await mark_conversation_read(
+        conversation_id=conversation_id,
+        request=request,
+        db=db,
+    )
+
+
+@router.get("/conversations/{conversation_id}/read")
+@social_router.get("/conversations/{conversation_id}/read")
+async def mark_conversation_read_get_alias(
     conversation_id: int,
     request: Request,
     db: asyncpg.Connection = Depends(get_db),
