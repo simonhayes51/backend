@@ -45,7 +45,7 @@ class TraderProfileUpdate(BaseModel):
 class TraderProfile(BaseModel):
     user_id: str
     bio: Optional[str]
-    specialties: List[str]
+    specialties: List[str] = Field(default_factory=list)
     verified: bool
     subscription_price: Decimal
     tier_basic_price: Decimal
@@ -56,9 +56,9 @@ class TraderProfile(BaseModel):
     tier_elite_cap: Optional[int]
     total_followers: int
     total_posts: int
-    avg_rating: float
-    total_ratings: int
-    achievements: List[dict]
+    avg_rating: float = 0.0
+    total_ratings: int = 0
+    achievements: List[dict] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
 
