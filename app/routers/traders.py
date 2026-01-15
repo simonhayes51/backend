@@ -293,12 +293,18 @@ async def get_trader_analytics(
     # Calculate earnings
     # Assuming monthly cycle
     earnings = Decimal(0)
-    if profile['tier_basic_price']:
-        earnings += counts['basic'] * profile['tier_basic_price']
-    if profile['tier_premium_price']:
-        earnings += counts['premium'] * profile['tier_premium_price']
-    if profile['tier_elite_price']:
-        earnings += counts['elite'] * profile['tier_elite_price']
+    
+    # Use .get() to handle missing columns if migration hasn't run
+    tier_basic_price = profile.get('tier_basic_price')
+    tier_premium_price = profile.get('tier_premium_price')
+    tier_elite_price = profile.get('tier_elite_price')
+
+    if tier_basic_price:
+        earnings += counts['basic'] * tier_basic_price
+    if tier_premium_price:
+        earnings += counts['premium'] * tier_premium_price
+    if tier_elite_price:
+        earnings += counts['elite'] * tier_elite_price
     
     # Total followers (active free + active paid)
     total_followers = sum(counts.values())
@@ -308,14 +314,18 @@ async def get_trader_analytics(
 
     # Mock views for now or query posts views
     # If we have post views in social_posts, we can sum them up for last 30 days
-    views = await db.fetchval(
-        """
-        SELECT COALESCE(SUM(views_count), 0)
-        FROM social_posts
-        WHERE user_id = $1 AND created_at > NOW() - INTERVAL '30 days'
-        """,
-        user_id
-    )
+    try:
+        views = await db.fetchval(
+            """
+            SELECT COALESCE(SUM(views_count), 0)
+            FROM social_posts
+            WHERE user_id = $1 AND created_at > NOW() - INTERVAL '30 days'
+            """,
+            user_id
+        )
+    except Exception:
+        # Fallback if views_count column missing
+        views = 0
 
     return TraderAnalytics(
         total_active_subscribers=total_active_paid,
