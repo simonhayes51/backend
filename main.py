@@ -1236,7 +1236,7 @@ def _session_middleware_kwargs() -> dict:
         "same_site": "none" if IS_PROD else "lax",
         "https_only": IS_PROD,
     }
-    session_domain = os.getenv("SESSION_COOKIE_DOMAIN")
+    session_domain = os.getenv("SESSION_COOKIE_DOMAIN") or COOKIE_DOMAIN
     if session_domain:
         kwargs["domain"] = session_domain
     supported_params = inspect.signature(SessionMiddleware.__init__).parameters
