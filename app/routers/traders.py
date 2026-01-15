@@ -162,19 +162,63 @@ async def update_trader_profile(
         values.append(profile.tier_elite_cap)
         idx += 1
 
-    if not fields:
-        return dict(existing)
+    trader_row = existing
+    if fields:
+        values.append(user_id)
+        query = f"""
+            UPDATE trader_profiles
+            SET {', '.join(fields)}, updated_at = NOW()
+            WHERE user_id = ${idx}
+            RETURNING *
+        """
+        trader_row = await db.fetchrow(query, *values)
 
-    values.append(user_id)
-    query = f"""
-        UPDATE trader_profiles
-        SET {', '.join(fields)}, updated_at = NOW()
-        WHERE user_id = ${idx}
-        RETURNING *
-    """
+    # --- Update user_profiles (Social Links) ---
+    up_fields = []
+    up_values = []
+    up_idx = 1
+
+    if profile.header_image_url is not None:
+        up_fields.append(f"header_image_url = ${up_idx}")
+        up_values.append(profile.header_image_url)
+        up_idx += 1
     
-    row = await db.fetchrow(query, *values)
-    return dict(row)
+    if profile.location is not None:
+        up_fields.append(f"location = ${up_idx}")
+        up_values.append(profile.location)
+        up_idx += 1
+
+    if profile.website_url is not None:
+        up_fields.append(f"website_url = ${up_idx}")
+        up_values.append(profile.website_url)
+        up_idx += 1
+
+    if profile.twitter_url is not None:
+        up_fields.append(f"twitter_url = ${up_idx}")
+        up_values.append(profile.twitter_url)
+        up_idx += 1
+
+    if profile.youtube_url is not None:
+        up_fields.append(f"youtube_url = ${up_idx}")
+        up_values.append(profile.youtube_url)
+        up_idx += 1
+
+    if profile.twitch_url is not None:
+        up_fields.append(f"twitch_url = ${up_idx}")
+        up_values.append(profile.twitch_url)
+        up_idx += 1
+
+    if up_fields:
+        up_values.append(user_id)
+        # Update user_profiles if it exists
+        query = f"""
+            UPDATE user_profiles
+            SET {', '.join(up_fields)}
+            WHERE user_id = ${up_idx}
+        """
+        await db.execute(query, *up_values)
+
+    return dict(trader_row)
 
 
 @router.get("/specialties", response_model=List[str])
@@ -303,7 +347,7 @@ async def get_trader_profile(
             u.created_at as trader_since
         FROM trader_profiles tp
         JOIN users u ON tp.user_id = u.id
-        JOIN user_profiles up ON tp.user_id = up.user_id
+        LEFT JOIN user_profiles up ON tp.user_id = up.user_id
         WHERE tp.user_id = $1
         """, 
         trader_id
@@ -370,7 +414,7 @@ async def browse_traders(
             u.created_at as trader_since
         FROM trader_profiles tp
         JOIN users u ON tp.user_id = u.id
-        JOIN user_profiles up ON tp.user_id = up.user_id
+        LEFT JOIN user_profiles up ON tp.user_id = up.user_id
         WHERE {' AND '.join(where_clauses)}
         ORDER BY tp.total_followers DESC
         LIMIT ${limit_idx} OFFSET ${offset_idx}

@@ -584,7 +584,7 @@ async def subscribe_to_tier(
             INSERT INTO notifications (
                 user_id, notification_type, title, message, related_user_id
             )
-            VALUES ($1, 'new_subscriber', 'New Subscriber!', $2, $3)
+            VALUES ($1, 'subscription', 'New Subscriber!', $2, $3)
             """,
             trader_id,
             f"New {tier_request.tier} subscriber!",
