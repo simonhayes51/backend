@@ -130,13 +130,14 @@ async def _attach_author(db: asyncpg.Connection, post: dict) -> dict:
     author = await db.fetchrow(
         """
         SELECT
-            u.username,
-            u.avatar_url,
+            up.username,
+            up.avatar_url,
             COALESCE(tp.verified, FALSE) as verified,
             tp.bio as trader_bio,
             tp.specialties as trader_specialties,
             tp.subscription_price as trader_subscription_price
         FROM users u
+        LEFT JOIN user_profiles up ON u.id::text = up.user_id::text
         LEFT JOIN trader_profiles tp ON u.id::text = tp.user_id::text
         WHERE u.id::text = $1::text
         """,
@@ -165,17 +166,10 @@ async def create_post(
     user_id = user["id"]
 
     # Ensure user has username populated (fallback to discord username or id)
-    username = await db.fetchval("SELECT username FROM users WHERE id = $1", user_id)
+    username = await db.fetchval("SELECT username FROM user_profiles WHERE user_id = $1", user_id)
     if not username:
-        # Try to get from user_profiles
-        username = await db.fetchval("SELECT username FROM user_profiles WHERE user_id = $1", user_id)
-        if username:
-            # Copy to users table
-            await db.execute("UPDATE users SET username = $1 WHERE id = $2", username, user_id)
-        else:
-            # Fallback to user ID
-            fallback_username = f"User_{str(user_id)[:8]}"
-            await db.execute("UPDATE users SET username = $1 WHERE id = $2", fallback_username, user_id)
+         # Fallback to user ID
+        username = f"User_{str(user_id)[:8]}"
 
     # Check if user is a trader
     account_type = await db.fetchval(
@@ -399,8 +393,8 @@ async def get_feed(
             query = f"""
                 SELECT
                     sp.*,
-                    COALESCE(u.username, 'Anonymous') as username,
-                    u.avatar_url,
+                    COALESCE(up.username, 'Anonymous') as username,
+                    up.avatar_url,
                     COALESCE(tp.verified, FALSE) as verified,
                     COALESCE(tp.avg_rating, 0) as avg_rating,
                     COALESCE(tp.total_followers, 0) as total_followers,
@@ -410,6 +404,7 @@ async def get_feed(
                     CASE WHEN sp.user_id::text = ${param_idx + 2}::text THEN TRUE ELSE FALSE END as is_author
                 FROM social_posts sp
                 LEFT JOIN users u ON sp.user_id::text = u.id::text
+                LEFT JOIN user_profiles up ON sp.user_id::text = up.user_id::text
                 LEFT JOIN trader_profiles tp ON u.id::text = tp.user_id::text
                 WHERE {where_clause}
                 ORDER BY COALESCE(sp.updated_at, sp.created_at) DESC
@@ -565,13 +560,14 @@ async def get_post(
     query = """
         SELECT
             sp.*,
-            u.username,
-            u.avatar_url,
+            up.username,
+            up.avatar_url,
             COALESCE(tp.verified, FALSE) as verified,
             tp.avg_rating,
             tp.total_followers
         FROM social_posts sp
         LEFT JOIN users u ON sp.user_id::text = u.id::text
+        LEFT JOIN user_profiles up ON sp.user_id::text = up.user_id::text
         LEFT JOIN trader_profiles tp ON u.id::text = tp.user_id::text
         WHERE sp.id = $1
     """
