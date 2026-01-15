@@ -1,218 +1,206 @@
 """
-Traders Router - Discover, browse, and manage trader profiles
+Trader Profile Management Router
 """
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from typing import List, Optional
-from pydantic import BaseModel
+from decimal import Decimal
 import asyncpg
 
 from app.models.social import (
+    TraderProfile,
     TraderProfileCreate,
     TraderProfileUpdate,
-    TraderProfile,
     TraderPublicProfile,
-    TraderStats,
+    TraderAnalytics
 )
 from app.db import get_db
 
 router = APIRouter(prefix="/api/traders", tags=["Traders"])
-admin_router = APIRouter(prefix="/api/admin/traders", tags=["Traders"])
-social_router = APIRouter(prefix="/api/social/traders", tags=["Traders"])
 
-
-def get_current_user(request):
+def get_current_user(request: Request):
     """Extract user from session"""
     if "user" not in request.session:
         raise HTTPException(status_code=401, detail="Not authenticated")
     return request.session["user"]
 
 
-class TraderAssignRequest(BaseModel):
-    user_id: str   # was int
-    profile: Optional[TraderProfileCreate] = None
-
-
-async def grant_trader_role(
-    db: asyncpg.Connection,
-    user_id: str,  # was int
-    profile: Optional[TraderProfileCreate] = None
-) -> dict:
-    profile = profile or TraderProfileCreate()
-    user_id = str(user_id)  # safety
-
-    existing_user = await db.fetchrow(
-        "SELECT id, account_type FROM users WHERE id = $1",
-        user_id
-    )
-
-    if not existing_user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    async with db.transaction():
-        await db.execute(
-            "UPDATE users SET account_type = 'trader' WHERE id = $1",
-            user_id
-        )
-        await db.execute(
-            """
-            INSERT INTO trader_profiles (user_id, bio, specialties, subscription_price)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (user_id)
-            DO UPDATE SET
-                bio = EXCLUDED.bio,
-                specialties = EXCLUDED.specialties,
-                subscription_price = EXCLUDED.subscription_price,
-                updated_at = NOW()
-            """,
-            user_id,
-            profile.bio,
-            profile.specialties or [],
-            profile.subscription_price or 0
-        )
-
-    return {"message": "Trader role granted", "user_id": user_id}
-
-
-@router.post("/upgrade-to-trader")
+@router.post("/upgrade", response_model=TraderProfile)
 async def upgrade_to_trader(
     profile: TraderProfileCreate,
     request: Request,
     db: asyncpg.Connection = Depends(get_db)
 ):
     """
-    Upgrade user account to trader account
+    Upgrade current user to trader account
     """
     user = get_current_user(request)
     user_id = user["id"]
 
-    # Check current account type
-    account_type = await db.fetchval(
-        "SELECT account_type FROM users WHERE id = $1",
-        user_id
+    # Check if already a trader
+    current_type = await db.fetchval("SELECT account_type FROM users WHERE id = $1", user_id)
+    if current_type == "trader":
+        # Check if profile exists
+        existing = await db.fetchrow("SELECT * FROM trader_profiles WHERE user_id = $1", user_id)
+        if existing:
+            raise HTTPException(status_code=400, detail="Already a trader")
+
+    # Update user account type
+    await db.execute("UPDATE users SET account_type = 'trader' WHERE id = $1", user_id)
+
+    # Create trader profile
+    query = """
+        INSERT INTO trader_profiles (
+            user_id, bio, specialties, verified, 
+            subscription_price,
+            tier_basic_price, tier_premium_price, tier_elite_price,
+            tier_basic_cap, tier_premium_cap, tier_elite_cap,
+            total_followers, total_posts, avg_rating, total_ratings
+        )
+        VALUES ($1, $2, $3, FALSE, $4, $5, $6, $7, $8, $9, $10, 0, 0, 0, 0)
+        RETURNING *
+    """
+    
+    row = await db.fetchrow(
+        query, 
+        user_id, 
+        profile.bio, 
+        profile.specialties, 
+        profile.subscription_price,
+        profile.tier_basic_price,
+        profile.tier_premium_price,
+        profile.tier_elite_price,
+        profile.tier_basic_cap,
+        profile.tier_premium_cap,
+        profile.tier_elite_cap
     )
 
-    if account_type == "trader":
-        raise HTTPException(status_code=400, detail="Already a trader account")
-
-    # Start transaction
-    async with db.transaction():
-        # Update user account type
-        await db.execute(
-            "UPDATE users SET account_type = 'trader' WHERE id = $1",
-            user_id
-        )
-
-        # Create trader profile
-        row = await db.fetchrow(
-            """
-            INSERT INTO trader_profiles (
-                user_id, bio, specialties, subscription_price
-            )
-            VALUES ($1, $2, $3, $4)
-            RETURNING *
-            """,
-            user_id,
-            profile.bio,
-            profile.specialties or [],
-            profile.subscription_price or 0
-        )
-
-    return {
-        "message": "Successfully upgraded to trader account",
-        "profile": dict(row)
-    }
+    return dict(row)
 
 
-@router.post("/upgrade")
-async def upgrade_to_trader_alias(
-    profile: TraderProfileCreate,
+@router.get("/me", response_model=TraderProfile)
+async def get_current_trader_profile(
     request: Request,
     db: asyncpg.Connection = Depends(get_db)
 ):
     """
-    Alias: Upgrade user account to trader account
+    Get current user's trader profile
     """
-    return await upgrade_to_trader(profile=profile, request=request, db=db)
+    user = get_current_user(request)
+    user_id = user["id"]
+
+    row = await db.fetchrow("SELECT * FROM trader_profiles WHERE user_id = $1", user_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Trader profile not found")
+    
+    return dict(row)
 
 
-@router.post("/request")
-async def request_trader_upgrade(
-    profile: TraderProfileCreate,
-    request: Request,
-    db: asyncpg.Connection = Depends(get_db)
-):
-    """
-    Alias: Request trader upgrade
-    """
-    return await upgrade_to_trader(profile=profile, request=request, db=db)
-
-
-@router.post("/apply")
-async def apply_for_trader_upgrade(
-    profile: TraderProfileCreate,
-    request: Request,
-    db: asyncpg.Connection = Depends(get_db)
-):
-    """
-    Alias: Apply for trader upgrade
-    """
-    return await upgrade_to_trader(profile=profile, request=request, db=db)
-
-
-@router.get("/requests")
-async def list_trader_requests(
-    db: asyncpg.Connection = Depends(get_db)
-):
-    """
-    List pending trader requests (placeholder)
-    """
-    return []
-
-
-@router.post("/requests/{request_id}/approve")
-async def approve_trader_request(
-    request_id: str,
-    db: asyncpg.Connection = Depends(get_db)
-):
-    """
-    Approve a trader request by user id
-    """
-    return await grant_trader_role(db=db, user_id=request_id)
-
-
-@router.post("/requests/{request_id}/reject")
-async def reject_trader_request(
-    request_id: str
-):
-    """
-    Reject a trader request by user id
-    """
-    return {"message": "Trader request rejected", "user_id": request_id}
-
-
-@router.post("/assign")
-async def assign_trader_role(
-    payload: TraderAssignRequest,
-    db: asyncpg.Connection = Depends(get_db)
-):
-    """
-    Assign trader role to a user
-    """
-    return await grant_trader_role(
-        db=db,
-        user_id=payload.user_id,
-        profile=payload.profile
-    )
-
-
-@router.patch("/profile")
+@router.put("/me", response_model=TraderProfile)
 async def update_trader_profile(
-    profile_update: TraderProfileUpdate,
+    profile: TraderProfileUpdate,
     request: Request,
     db: asyncpg.Connection = Depends(get_db)
 ):
     """
-    Update trader profile (traders only)
+    Update current user's trader profile
+    """
+    user = get_current_user(request)
+    user_id = user["id"]
+
+    # Check existence
+    existing = await db.fetchrow("SELECT * FROM trader_profiles WHERE user_id = $1", user_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Trader profile not found")
+
+    # Build dynamic update query
+    fields = []
+    values = []
+    idx = 1
+
+    if profile.bio is not None:
+        fields.append(f"bio = ${idx}")
+        values.append(profile.bio)
+        idx += 1
+    
+    if profile.specialties is not None:
+        fields.append(f"specialties = ${idx}")
+        values.append(profile.specialties)
+        idx += 1
+        
+    if profile.subscription_price is not None:
+        fields.append(f"subscription_price = ${idx}")
+        values.append(profile.subscription_price)
+        idx += 1
+
+    if profile.tier_basic_price is not None:
+        fields.append(f"tier_basic_price = ${idx}")
+        values.append(profile.tier_basic_price)
+        idx += 1
+
+    if profile.tier_premium_price is not None:
+        fields.append(f"tier_premium_price = ${idx}")
+        values.append(profile.tier_premium_price)
+        idx += 1
+
+    if profile.tier_elite_price is not None:
+        fields.append(f"tier_elite_price = ${idx}")
+        values.append(profile.tier_elite_price)
+        idx += 1
+
+    if profile.tier_basic_cap is not None:
+        fields.append(f"tier_basic_cap = ${idx}")
+        values.append(profile.tier_basic_cap)
+        idx += 1
+
+    if profile.tier_premium_cap is not None:
+        fields.append(f"tier_premium_cap = ${idx}")
+        values.append(profile.tier_premium_cap)
+        idx += 1
+
+    if profile.tier_elite_cap is not None:
+        fields.append(f"tier_elite_cap = ${idx}")
+        values.append(profile.tier_elite_cap)
+        idx += 1
+
+    if not fields:
+        return dict(existing)
+
+    values.append(user_id)
+    query = f"""
+        UPDATE trader_profiles
+        SET {', '.join(fields)}, updated_at = NOW()
+        WHERE user_id = ${idx}
+        RETURNING *
+    """
+    
+    row = await db.fetchrow(query, *values)
+    return dict(row)
+
+
+@router.get("/specialties", response_model=List[str])
+async def get_specialties(db: asyncpg.Connection = Depends(get_db)):
+    """
+    Get list of all unique specialties
+    """
+    rows = await db.fetch(
+        """
+        SELECT DISTINCT UNNEST(specialties) as specialty
+        FROM trader_profiles
+        WHERE specialties IS NOT NULL AND ARRAY_LENGTH(specialties, 1) > 0
+        ORDER BY specialty
+        """
+    )
+    
+    return [row["specialty"] for row in rows]
+
+
+@router.get("/analytics", response_model=TraderAnalytics)
+async def get_trader_analytics(
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db)
+):
+    """
+    Get analytics for current trader
     """
     user = get_current_user(request)
     user_id = user["id"]
@@ -224,529 +212,177 @@ async def update_trader_profile(
     )
 
     if account_type != "trader":
-        raise HTTPException(status_code=403, detail="Only traders can update trader profile")
+        raise HTTPException(status_code=403, detail="Only traders can view analytics")
 
-    # Build update query
-    updates = []
-    params = []
-    param_idx = 1
+    # Get subscriber counts by tier
+    rows = await db.fetch(
+        """
+        SELECT subscription_type, COUNT(*) as count
+        FROM trader_subscriptions
+        WHERE trader_id = $1 AND is_active = TRUE
+        GROUP BY subscription_type
+        """,
+        user_id
+    )
+    
+    counts = {
+        'free': 0,
+        'basic': 0,
+        'premium': 0,
+        'elite': 0
+    }
+    
+    for row in rows:
+        stype = row['subscription_type']
+        if stype in counts:
+            counts[stype] = row['count']
 
-    if profile_update.bio is not None:
-        updates.append(f"bio = ${param_idx}")
-        params.append(profile_update.bio)
-        param_idx += 1
-
-    if profile_update.specialties is not None:
-        updates.append(f"specialties = ${param_idx}")
-        params.append(profile_update.specialties)
-        param_idx += 1
-
-    if profile_update.subscription_price is not None:
-        updates.append(f"subscription_price = ${param_idx}")
-        params.append(profile_update.subscription_price)
-        param_idx += 1
-
-    if not updates:
-        raise HTTPException(status_code=400, detail="No updates provided")
-
-    updates.append("updated_at = NOW()")
-    params.append(user_id)
-
-    query = f"""
-        UPDATE trader_profiles
-        SET {', '.join(updates)}
-        WHERE user_id = ${param_idx}
-        RETURNING *
-    """
-
-    row = await db.fetchrow(query, *params)
-
-    if not row:
+    # Get trader prices
+    profile = await db.fetchrow(
+        "SELECT * FROM trader_profiles WHERE user_id = $1",
+        user_id
+    )
+    
+    if not profile:
         raise HTTPException(status_code=404, detail="Trader profile not found")
 
-    return dict(row)
+    # Calculate earnings
+    # Assuming monthly cycle
+    earnings = Decimal(0)
+    if profile['tier_basic_price']:
+        earnings += counts['basic'] * profile['tier_basic_price']
+    if profile['tier_premium_price']:
+        earnings += counts['premium'] * profile['tier_premium_price']
+    if profile['tier_elite_price']:
+        earnings += counts['elite'] * profile['tier_elite_price']
+    
+    # Total followers (active free + active paid)
+    total_followers = sum(counts.values())
+    
+    # Active paid subscribers
+    total_active_paid = counts['basic'] + counts['premium'] + counts['elite']
+
+    # Mock views for now or query posts views
+    # If we have post views in social_posts, we can sum them up for last 30 days
+    views = await db.fetchval(
+        """
+        SELECT COALESCE(SUM(views_count), 0)
+        FROM social_posts
+        WHERE user_id = $1 AND created_at > NOW() - INTERVAL '30 days'
+        """,
+        user_id
+    )
+
+    return TraderAnalytics(
+        total_active_subscribers=total_active_paid,
+        active_basic_subscribers=counts['basic'],
+        active_premium_subscribers=counts['premium'],
+        active_elite_subscribers=counts['elite'],
+        monthly_earnings_estimated=earnings,
+        total_followers=total_followers,
+        views_last_30_days=views or 0
+    )
 
 
-@router.get("/profile/{trader_id}", response_model=TraderPublicProfile)
+@router.get("/{trader_id}", response_model=TraderPublicProfile)
 async def get_trader_profile(
     trader_id: str,
     request: Request,
     db: asyncpg.Connection = Depends(get_db)
 ):
     """
-    Get public profile for a trader
+    Get public trader profile
     """
-    try:
-        user = get_current_user(request)
-        user_id = user["id"]
-        is_authenticated = True
-    except HTTPException:
-        user_id = None
-        is_authenticated = False
-
-    if trader_id in {"undefined", "null", ""}:
-        raise HTTPException(status_code=400, detail="Trader id required")
-
-    query = """
-        SELECT
-            u.id,
-            COALESCE(u.username, up.username, 'Anonymous') as username,
-            COALESCE(u.avatar_url, up.avatar_url) as avatar_url,
-            COALESCE(up.bio, tp.bio) as bio,
-            up.header_image_url,
-            up.location,
-            up.website_url,
-            up.twitter_url,
-            up.youtube_url,
-            up.twitch_url,
-            COALESCE(tp.specialties, ARRAY[]::text[]) as specialties,
-            COALESCE(tp.verified, FALSE) as verified,
-            COALESCE(tp.subscription_price, 0) as subscription_price,
-            COALESCE(tp.total_followers, 0) as total_followers,
-            COALESCE(tp.total_posts, 0) as total_posts,
-            COALESCE(tp.avg_rating, 0)::float as avg_rating,
-            COALESCE(tp.total_ratings, 0) as total_ratings,
-            COALESCE(tp.created_at, u.created_at) as trader_since
-        FROM users u
-        LEFT JOIN user_profiles up ON u.id = up.user_id
-        LEFT JOIN trader_profiles tp ON u.id::text = tp.user_id::text
-        WHERE u.id = $1
-    """
-
-    row = await db.fetchrow(query, trader_id)
-
+    # Check if trader exists
+    row = await db.fetchrow(
+        """
+        SELECT 
+            tp.*, 
+            up.username, up.avatar_url, up.header_image_url, 
+            up.location, up.website_url, up.twitter_url, up.youtube_url, up.twitch_url,
+            u.created_at as trader_since
+        FROM trader_profiles tp
+        JOIN users u ON tp.user_id = u.id
+        JOIN user_profiles up ON tp.user_id = up.user_id
+        WHERE tp.user_id = $1
+        """, 
+        trader_id
+    )
+    
     if not row:
         raise HTTPException(status_code=404, detail="Trader not found")
 
-    trader_dict = dict(row)
-    trader_dict["trader_id"] = str(trader_dict["id"])
-    trader_dict["user_id"] = str(trader_dict["id"])
-
-    # Check if current user is subscribed
-    if is_authenticated:
-        is_subscribed = await db.fetchval(
-            """
-            SELECT EXISTS(
-                SELECT 1 FROM trader_subscriptions
-                WHERE subscriber_id = $1 AND trader_id = $2 AND is_active = TRUE
-            )
-            """,
-            user_id,
-            trader_id
-        )
-        trader_dict["is_subscribed"] = is_subscribed
-    else:
-        trader_dict["is_subscribed"] = False
-
-    return trader_dict
-
-
-@router.get("/browse")
-async def browse_traders(
-    request: Request,
-    search: Optional[str] = Query(None, description="Search by username or bio"),
-    specialty: Optional[str] = Query(None, description="Filter by specialty"),
-    verified_only: bool = Query(False),
-    sort_by: str = Query("followers", description="followers, rating, posts, recent"),
-    offset: int = Query(0, ge=0),
-    limit: int = Query(20, ge=1, le=100),
-    db: asyncpg.Connection = Depends(get_db)
-):
-    """
-    Browse and search traders with filters and sorting
-    """
+    result = dict(row)
+    result["id"] = result["user_id"]
+    
+    # Check subscription status if user logged in
     try:
         user = get_current_user(request)
-        user_id = user["id"]
-        is_authenticated = True
-    except HTTPException:
-        user_id = None
-        is_authenticated = False
+        sub = await db.fetchrow(
+            """
+            SELECT * FROM trader_subscriptions 
+            WHERE subscriber_id = $1 AND trader_id = $2 AND is_active = TRUE
+            """,
+            user["id"], trader_id
+        )
+        result["is_subscribed"] = sub is not None
+    except:
+        result["is_subscribed"] = False
 
-    # Build query conditions
-    conditions = ["u.account_type = 'trader'"]
+    return result
+
+
+@router.get("/", response_model=List[TraderPublicProfile])
+async def browse_traders(
+    request: Request,
+    specialty: Optional[str] = None,
+    search: Optional[str] = None,
+    limit: int = 20,
+    offset: int = 0,
+    db: asyncpg.Connection = Depends(get_db)
+):
+    """
+    Browse and search traders
+    """
     params = []
-    param_idx = 1
-
-    if search:
-        conditions.append(f"(up.username ILIKE ${param_idx} OR tp.bio ILIKE ${param_idx})")
-        params.append(f"%{search}%")
-        param_idx += 1
-
+    where_clauses = ["u.account_type = 'trader'"]
+    
     if specialty:
-        conditions.append(f"${param_idx} = ANY(tp.specialties)")
         params.append(specialty)
-        param_idx += 1
+        where_clauses.append(f"$1 = ANY(tp.specialties)")
+    
+    if search:
+        param_idx = len(params) + 1
+        params.append(f"%{search}%")
+        where_clauses.append(f"(up.username ILIKE ${param_idx} OR tp.bio ILIKE ${param_idx})")
 
-    if verified_only:
-        conditions.append("tp.verified = TRUE")
+    # Pagination
+    limit_idx = len(params) + 1
+    params.append(limit)
+    offset_idx = len(params) + 1
+    params.append(offset)
 
-    where_clause = " AND ".join(conditions)
-
-    # Determine sort order
-    sort_options = {
-        "followers": "tp.total_followers DESC",
-        "rating": "tp.avg_rating DESC, tp.total_ratings DESC",
-        "posts": "tp.total_posts DESC",
-        "recent": "tp.created_at DESC"
-    }
-
-    sort_clause = sort_options.get(sort_by, "tp.total_followers DESC")
-
-    # Get total count
-    count_query = f"""
-        SELECT COUNT(*)
-        FROM users u
-        JOIN trader_profiles tp ON u.id = tp.user_id
-        JOIN user_profiles up ON u.id = up.user_id
-        WHERE {where_clause}
-    """
-
-    total = await db.fetchval(count_query, *params)
-
-    # Get traders
-    params.extend([limit, offset])
     query = f"""
-        SELECT
-            u.id,
-            up.username,
-            up.avatar_url,
-            tp.bio,
-            tp.specialties,
-            tp.verified,
-            tp.subscription_price,
-            tp.total_followers,
-            tp.total_posts,
-            tp.avg_rating,
-            tp.total_ratings,
-            tp.created_at as trader_since
-        FROM users u
-        JOIN user_profiles up ON u.id = up.user_id
-        JOIN trader_profiles tp ON u.id = tp.user_id
-        WHERE {where_clause}
-        ORDER BY {sort_clause}
-        LIMIT ${param_idx} OFFSET ${param_idx + 1}
-    """
-
-    rows = await db.fetch(query, *params)
-
-    traders = []
-    for row in rows:
-        trader_dict = dict(row)
-        trader_dict["trader_id"] = str(trader_dict["id"])
-        trader_dict["user_id"] = str(trader_dict["id"])
-
-        # Check if current user is subscribed
-        if is_authenticated:
-            is_subscribed = await db.fetchval(
-                """
-                SELECT EXISTS(
-                    SELECT 1 FROM trader_subscriptions
-                    WHERE subscriber_id = $1 AND trader_id = $2 AND is_active = TRUE
-                )
-                """,
-                user_id,
-                trader_dict["id"]
-            )
-            trader_dict["is_subscribed"] = is_subscribed
-        else:
-            trader_dict["is_subscribed"] = False
-
-        traders.append(trader_dict)
-
-    return {
-        "traders": traders,
-        "total": total,
-        "has_more": offset + limit < total,
-        "offset": offset,
-        "limit": limit
-    }
-
-
-@router.get("")
-@social_router.get("")
-async def browse_traders_root(
-    request: Request,
-    search: Optional[str] = Query(None, description="Search by username or bio"),
-    specialty: Optional[str] = Query(None, description="Filter by specialty"),
-    verified_only: bool = Query(False),
-    sort_by: str = Query("followers", description="followers, rating, posts, recent"),
-    offset: int = Query(0, ge=0),
-    limit: int = Query(20, ge=1, le=100),
-    db: asyncpg.Connection = Depends(get_db),
-):
-    return await browse_traders(
-        request=request,
-        search=search,
-        specialty=specialty,
-        verified_only=verified_only,
-        sort_by=sort_by,
-        offset=offset,
-        limit=limit,
-        db=db,
-    )
-
-
-@router.get("/stats/{trader_id}", response_model=TraderStats)
-async def get_trader_stats(
-    trader_id: str,
-    db: asyncpg.Connection = Depends(get_db)
-):
-    """
-    Get detailed statistics for a trader
-    """
-    # Check if trader exists
-    trader = await db.fetchrow(
-        """
-        SELECT u.account_type, tp.*
-        FROM users u
-        LEFT JOIN trader_profiles tp ON u.id = tp.user_id
-        WHERE u.id = $1
-        """,
-        trader_id
-    )
-
-    if not trader:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    # Get post count
-    total_posts = await db.fetchval(
-        "SELECT COUNT(*) FROM social_posts WHERE user_id = $1",
-        trader_id
-    )
-
-    # Get total following count
-    total_following = await db.fetchval(
-        """
-        SELECT COUNT(*)
-        FROM trader_subscriptions
-        WHERE subscriber_id = $1 AND is_active = TRUE
-        """,
-        trader_id
-    )
-
-    # Get engagement stats
-    engagement = await db.fetchrow(
-        """
-        SELECT
-            COALESCE(SUM(likes_count), 0) as total_likes_received,
-            COALESCE(SUM(comments_count), 0) as total_comments_received
-        FROM social_posts
-        WHERE user_id = $1
-        """,
-        trader_id
-    )
-
-    stats = {
-        "account_type": trader["account_type"],
-        "total_posts": total_posts,
-        "total_followers": trader.get("total_followers", 0),
-        "total_following": total_following,
-        "total_likes_received": engagement["total_likes_received"],
-        "total_comments_received": engagement["total_comments_received"],
-    }
-
-    # Add trader-specific stats if applicable
-    if trader["account_type"] == "trader":
-        stats.update({
-            "avg_rating": trader["avg_rating"],
-            "total_ratings": trader["total_ratings"],
-            "verified": trader["verified"],
-            "subscription_price": trader["subscription_price"]
-        })
-
-    return stats
-
-
-@router.get("/my-profile")
-async def get_my_profile(
-    request: Request,
-    db: asyncpg.Connection = Depends(get_db)
-):
-    """
-    Get current user's trader profile (if trader)
-    """
-    user = get_current_user(request)
-    user_id = user["id"]
-
-    account_type = await db.fetchval(
-        "SELECT account_type FROM users WHERE id = $1",
-        user_id
-    )
-
-    if account_type != "trader":
-        return {
-            "account_type": account_type,
-            "is_trader": False,
-            "message": "Not a trader account"
-        }
-
-    profile = await db.fetchrow(
-        """
-        SELECT tp.*, up.username, up.avatar_url
+        SELECT 
+            tp.*, 
+            up.username, up.avatar_url, up.header_image_url, 
+            up.location, up.website_url, up.twitter_url, up.youtube_url, up.twitch_url,
+            u.created_at as trader_since
         FROM trader_profiles tp
+        JOIN users u ON tp.user_id = u.id
         JOIN user_profiles up ON tp.user_id = up.user_id
-        WHERE tp.user_id = $1
-        """,
-        user_id
-    )
-
-    return {
-        "account_type": account_type,
-        "is_trader": True,
-        "profile": dict(profile) if profile else None
-    }
-
-
-@router.get("/specialties")
-async def get_available_specialties(
-    db: asyncpg.Connection = Depends(get_db)
-):
+        WHERE {' AND '.join(where_clauses)}
+        ORDER BY tp.total_followers DESC
+        LIMIT ${limit_idx} OFFSET ${offset_idx}
     """
-    Get list of all available trader specialties
-    """
-    # Get unique specialties from all traders
-    rows = await db.fetch(
-        """
-        SELECT DISTINCT UNNEST(specialties) as specialty
-        FROM trader_profiles
-        WHERE specialties IS NOT NULL AND ARRAY_LENGTH(specialties, 1) > 0
-        ORDER BY specialty
-        """
-    )
-
-    specialties = [row["specialty"] for row in rows]
-
-    # Add common specialties if not present
-    common_specialties = [
-        "Quick Flips",
-        "SBC Investments",
-        "Long Term Trading",
-        "Market Analysis",
-        "Budget Trading",
-        "Icon Trading",
-        "Mass Bidding"
-    ]
-
-    for specialty in common_specialties:
-        if specialty not in specialties:
-            specialties.append(specialty)
-
-    return {"specialties": sorted(specialties)}
-
-
-@admin_router.get("/requests")
-async def list_trader_requests_admin(
-    db: asyncpg.Connection = Depends(get_db)
-):
-    """
-    Admin: List pending trader requests (placeholder)
-    """
-    return await list_trader_requests(db=db)
-
-
-@admin_router.post("/requests/{request_id}/approve")
-async def approve_trader_request_admin(
-    request_id: str,
-    db: asyncpg.Connection = Depends(get_db)
-):
-    """
-    Admin: Approve trader request
-    """
-    return await grant_trader_role(db=db, user_id=request_id)
-
-
-@admin_router.post("/requests/{request_id}/reject")
-async def reject_trader_request_admin(
-    request_id: str
-):
-    """
-    Admin: Reject trader request
-    """
-    return {"message": "Trader request rejected", "user_id": request_id}
-
-
-@admin_router.post("/assign")
-async def assign_trader_role_admin(
-    payload: TraderAssignRequest,
-    db: asyncpg.Connection = Depends(get_db)
-):
-    """
-    Admin: Assign trader role to a user
-    """
-    return await grant_trader_role(
-        db=db,
-        user_id=payload.user_id,
-        profile=payload.profile
-    )
-
-
-@social_router.get("/requests")
-async def list_trader_requests_social(
-    db: asyncpg.Connection = Depends(get_db)
-):
-    """
-    Social: List pending trader requests (placeholder)
-    """
-    return await list_trader_requests(db=db)
-
-
-@social_router.post("/requests/{request_id}/approve")
-async def approve_trader_request_social(
-    request_id: str,
-    db: asyncpg.Connection = Depends(get_db)
-):
-    """
-    Social: Approve trader request
-    """
-    return await grant_trader_role(db=db, user_id=request_id)
-
-
-@social_router.post("/requests/{request_id}/reject")
-async def reject_trader_request_social(
-    request_id: str
-):
-    """
-    Social: Reject trader request
-    """
-    return {"message": "Trader request rejected", "user_id": request_id}
-
-
-@social_router.post("/assign")
-async def assign_trader_role_social(
-    payload: TraderAssignRequest,
-    db: asyncpg.Connection = Depends(get_db)
-):
-    """
-    Social: Assign trader role to a user
-    """
-    return await grant_trader_role(
-        db=db,
-        user_id=payload.user_id,
-        profile=payload.profile
-    )
-
-
-@social_router.post("")
-async def social_trader_upgrade(
-    profile: TraderProfileCreate,
-    request: Request,
-    db: asyncpg.Connection = Depends(get_db)
-):
-    """
-    Social: Upgrade user account to trader account
-    """
-    return await upgrade_to_trader(profile=profile, request=request, db=db)
-
-
-# Catch-all route for trader ID (must be last to avoid conflicts)
-@router.get("/{trader_id}", response_model=TraderPublicProfile)
-async def get_trader_profile_alias(
-    trader_id: str,
-    request: Request,
-    db: asyncpg.Connection = Depends(get_db)
-):
-    """
-    Get public profile for a trader (alias route matching /api/traders/{id})
-    """
-    return await get_trader_profile(trader_id=trader_id, request=request, db=db)
+    
+    rows = await db.fetch(query, *params)
+    
+    results = []
+    for row in rows:
+        d = dict(row)
+        d["id"] = d["user_id"]
+        d["is_subscribed"] = False # List view doesn't check sub status per item for perf
+        results.append(d)
+        
+    return results
