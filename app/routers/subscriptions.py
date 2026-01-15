@@ -51,6 +51,10 @@ async def subscribe_to_trader(
     if user_id == subscription.trader_id:
         raise HTTPException(status_code=400, detail="Cannot subscribe to yourself")
 
+    # Validate tier - Paid tiers must go through billing
+    if subscription.tier != 'free':
+        raise HTTPException(status_code=400, detail="Paid subscriptions must be processed via payment gateway")
+
     # Check if trader exists and is actually a trader
     trader = await db.fetchrow(
         "SELECT account_type FROM users WHERE id = $1",
@@ -74,22 +78,28 @@ async def subscribe_to_trader(
     )
 
     if existing:
-        # Reactivate if was unsubscribed
-        if not existing["is_active"]:
-            row = await db.fetchrow(
-                """
-                UPDATE trader_subscriptions
-                SET is_active = TRUE, unsubscribed_at = NULL
-                WHERE id = $1
-                RETURNING *
-                """,
-                existing["id"]
-            )
-            return dict(row)
-        else:
-            raise HTTPException(status_code=400, detail="Already subscribed to this trader")
+        if existing["is_active"]:
+             if existing["subscription_type"] != 'free':
+                 raise HTTPException(status_code=400, detail="You have an active paid subscription. Please manage it via billing settings.")
+             else:
+                 raise HTTPException(status_code=400, detail="Already following this trader")
+        
+        # If inactive, we can reactivate as free
+        row = await db.fetchrow(
+            """
+            UPDATE trader_subscriptions
+            SET is_active = TRUE, 
+                unsubscribed_at = NULL,
+                subscription_type = 'free',
+                updated_at = NOW()
+            WHERE id = $1
+            RETURNING *
+            """,
+            existing["id"]
+        )
+        return dict(row)
 
-    # Create new subscription (free by default)
+    # Create new subscription
     query = """
         INSERT INTO trader_subscriptions (
             subscriber_id, trader_id, is_active, subscription_type
