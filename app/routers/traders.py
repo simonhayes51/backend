@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from typing import List, Optional
 from decimal import Decimal
 import asyncpg
+from asyncpg import exceptions as asyncpg_exceptions
 
 from app.models.social import (
     TraderProfile,
@@ -88,10 +89,35 @@ async def get_current_trader_profile(
     user = get_current_user(request)
     user_id = user["id"]
 
-    row = await db.fetchrow("SELECT * FROM trader_profiles WHERE user_id = $1", user_id)
+    row = await db.fetchrow(
+        """
+        SELECT
+            user_id,
+            bio,
+            specialties,
+            verified,
+            subscription_price,
+            tier_basic_price,
+            tier_premium_price,
+            tier_elite_price,
+            tier_basic_cap,
+            tier_premium_cap,
+            tier_elite_cap,
+            total_followers,
+            total_posts,
+            COALESCE(avg_rating, 0)::float8 AS avg_rating,
+            total_ratings,
+            COALESCE(achievements, '[]'::jsonb) AS achievements,
+            created_at,
+            updated_at
+        FROM trader_profiles
+        WHERE user_id = $1
+        """,
+        user_id,
+    )
     if not row:
         raise HTTPException(status_code=404, detail="Trader profile not found")
-    
+
     return dict(row)
 
 
@@ -246,96 +272,100 @@ async def get_trader_analytics(
     """
     Get analytics for current trader
     """
-    user = get_current_user(request)
-    user_id = user["id"]
-
-    # Check if user is a trader
-    account_type = await db.fetchval(
-        "SELECT account_type FROM users WHERE id = $1",
-        user_id
-    )
-
-    if account_type != "trader":
-        raise HTTPException(status_code=403, detail="Only traders can view analytics")
-
-    # Get subscriber counts by tier
-    rows = await db.fetch(
-        """
-        SELECT subscription_type, COUNT(*) as count
-        FROM trader_subscriptions
-        WHERE trader_id = $1 AND is_active = TRUE
-        GROUP BY subscription_type
-        """,
-        user_id
-    )
-    
-    counts = {
-        'free': 0,
-        'basic': 0,
-        'premium': 0,
-        'elite': 0
-    }
-    
-    for row in rows:
-        stype = row['subscription_type']
-        if stype in counts:
-            counts[stype] = row['count']
-
-    # Get trader prices
-    profile = await db.fetchrow(
-        "SELECT * FROM trader_profiles WHERE user_id = $1",
-        user_id
-    )
-    
-    if not profile:
-        raise HTTPException(status_code=404, detail="Trader profile not found")
-
-    # Calculate earnings
-    # Assuming monthly cycle
-    earnings = Decimal(0)
-    
-    # Use .get() to handle missing columns if migration hasn't run
-    tier_basic_price = profile.get('tier_basic_price')
-    tier_premium_price = profile.get('tier_premium_price')
-    tier_elite_price = profile.get('tier_elite_price')
-
-    if tier_basic_price:
-        earnings += counts['basic'] * tier_basic_price
-    if tier_premium_price:
-        earnings += counts['premium'] * tier_premium_price
-    if tier_elite_price:
-        earnings += counts['elite'] * tier_elite_price
-    
-    # Total followers (active free + active paid)
-    total_followers = sum(counts.values())
-    
-    # Active paid subscribers
-    total_active_paid = counts['basic'] + counts['premium'] + counts['elite']
-
-    # Mock views for now or query posts views
-    # If we have post views in social_posts, we can sum them up for last 30 days
     try:
-        views = await db.fetchval(
-            """
-            SELECT COALESCE(SUM(views_count), 0)
-            FROM social_posts
-            WHERE user_id = $1 AND created_at > NOW() - INTERVAL '30 days'
-            """,
+        user = get_current_user(request)
+        user_id = user["id"]
+
+        # Check if user is a trader
+        account_type = await db.fetchval(
+            "SELECT account_type FROM users WHERE id = $1",
             user_id
         )
-    except Exception:
-        # Fallback if views_count column missing
-        views = 0
 
-    return TraderAnalytics(
-        total_active_subscribers=total_active_paid,
-        active_basic_subscribers=counts['basic'],
-        active_premium_subscribers=counts['premium'],
-        active_elite_subscribers=counts['elite'],
-        monthly_earnings_estimated=earnings,
-        total_followers=total_followers,
-        views_last_30_days=views or 0
-    )
+        if account_type != "trader":
+            raise HTTPException(status_code=403, detail="Only traders can view analytics")
+
+        counts = {
+            "free": 0,
+            "basic": 0,
+            "premium": 0,
+            "elite": 0,
+        }
+
+        try:
+            total = await db.fetchval(
+                """
+                SELECT COUNT(*)
+                FROM trader_subscriptions
+                WHERE trader_id = $1 AND is_active = TRUE
+                """,
+                user_id,
+            )
+            counts["free"] = total or 0
+        except asyncpg_exceptions.UndefinedTableError:
+            pass
+
+        # Get trader prices
+        profile = await db.fetchrow(
+            "SELECT * FROM trader_profiles WHERE user_id = $1",
+            user_id
+        )
+        
+        if not profile:
+            raise HTTPException(status_code=404, detail="Trader profile not found")
+
+        # Calculate earnings
+        # Assuming monthly cycle
+        earnings = Decimal(0)
+        
+        # Use .get() to handle missing columns if migration hasn't run
+        tier_basic_price = profile.get('tier_basic_price')
+        tier_premium_price = profile.get('tier_premium_price')
+        tier_elite_price = profile.get('tier_elite_price')
+
+        if tier_basic_price:
+            earnings += counts['basic'] * tier_basic_price
+        if tier_premium_price:
+            earnings += counts['premium'] * tier_premium_price
+        if tier_elite_price:
+            earnings += counts['elite'] * tier_elite_price
+        
+        # Total followers (active free + active paid)
+        total_followers = sum(counts.values())
+        
+        # Active paid subscribers
+        total_active_paid = counts['basic'] + counts['premium'] + counts['elite']
+
+        # Mock views for now or query posts views
+        # If we have post views in social_posts, we can sum them up for last 30 days
+        try:
+            views = await db.fetchval(
+                """
+                SELECT COALESCE(SUM(views_count), 0)
+                FROM social_posts
+                WHERE user_id = $1 AND created_at > NOW() - INTERVAL '30 days'
+                """,
+                user_id
+            )
+        except Exception:
+            # Fallback if views_count column missing
+            views = 0
+
+        return TraderAnalytics(
+            total_active_subscribers=total_active_paid,
+            active_basic_subscribers=counts['basic'],
+            active_premium_subscribers=counts['premium'],
+            active_elite_subscribers=counts['elite'],
+            monthly_earnings_estimated=earnings,
+            total_followers=total_followers,
+            views_last_30_days=views or 0
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Analytics Error: {str(e)}")
 
 
 @router.get("/earnings", response_model=TraderAnalytics)
