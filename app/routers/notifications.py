@@ -25,7 +25,8 @@ async def get_db():
         yield conn
 
 
-@router.get("/", response_model=List[NotificationWithDetails])
+@router.get("", response_model=List[NotificationWithDetails])
+@router.get("/", response_model=List[NotificationWithDetails], include_in_schema=False)
 async def get_notifications(
     request: Request,
     unread_only: bool = Query(False),
@@ -75,6 +76,7 @@ async def get_notifications(
 
 
 @router.get("/unread-count")
+@router.get("/unread-count/", include_in_schema=False)
 async def get_unread_count(
     request: Request,
     db: asyncpg.Connection = Depends(get_db)
