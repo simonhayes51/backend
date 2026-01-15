@@ -106,7 +106,13 @@ def _format_conversation(row: dict) -> dict:
         "username": conversation.get("other_user_username"),
         "avatar_url": conversation.get("other_user_avatar"),
     }
-    conversation["last_message"] = conversation.get("last_message_content")
+    last_message_content = conversation.get("last_message_content")
+    if isinstance(last_message_content, dict):
+        conversation["last_message"] = last_message_content
+    elif last_message_content is not None:
+        conversation["last_message"] = {"content": last_message_content}
+    else:
+        conversation["last_message"] = None
     return conversation
 
 
@@ -250,7 +256,7 @@ async def send_message(
     Send a direct message to another user
     """
     user = get_current_user(request)
-    user_id = user["id"]
+    user_id = str(user["id"])
 
     # Can't message yourself
     if user_id == message.recipient_id:
@@ -342,7 +348,7 @@ async def get_conversations(
     Get all conversations for the current user
     """
     user = get_current_user(request)
-    user_id = user["id"]
+    user_id = str(user["id"])
 
     columns = await _get_conversation_columns(db)
     profiles_exist = await _user_profiles_exist(db)
@@ -363,9 +369,9 @@ async def get_conversations(
     )
 
     username_select = (
-        "CASE WHEN c.user1_id = $1 THEN up2.username ELSE up1.username END as other_user_username"
+        "COALESCE(CASE WHEN c.user1_id = $1 THEN up2.username ELSE up1.username END, CASE WHEN c.user1_id = $1 THEN c.user2_id ELSE c.user1_id END) as other_user_username"
         if profiles_exist
-        else "NULL as other_user_username"
+        else "CASE WHEN c.user1_id = $1 THEN c.user2_id ELSE c.user1_id END as other_user_username"
     )
     avatar_select = (
         "CASE WHEN c.user1_id = $1 THEN up2.avatar_url ELSE up1.avatar_url END as other_user_avatar"
@@ -415,7 +421,7 @@ async def start_conversation(
     db: asyncpg.Connection = Depends(get_db),
 ):
     user = get_current_user(request)
-    user_id = user["id"]
+    user_id = str(user["id"])
 
     recipient_id = payload.recipient_id
     if not recipient_id:
@@ -481,9 +487,9 @@ async def start_conversation(
         else ""
     )
     username_select = (
-        "CASE WHEN c.user1_id = $1 THEN up2.username ELSE up1.username END as other_user_username"
+        "COALESCE(CASE WHEN c.user1_id = $1 THEN up2.username ELSE up1.username END, CASE WHEN c.user1_id = $1 THEN c.user2_id ELSE c.user1_id END) as other_user_username"
         if profiles_exist
-        else "NULL as other_user_username"
+        else "CASE WHEN c.user1_id = $1 THEN c.user2_id ELSE c.user1_id END as other_user_username"
     )
     avatar_select = (
         "CASE WHEN c.user1_id = $1 THEN up2.avatar_url ELSE up1.avatar_url END as other_user_avatar"
@@ -539,7 +545,7 @@ async def get_conversation_messages(
     Get messages in a conversation with another user
     """
     user = get_current_user(request)
-    user_id = user["id"]
+    user_id = str(user["id"])
 
     # Get conversation ID
     user1_id, user2_id = sorted([user_id, other_user_id])
@@ -574,13 +580,13 @@ async def get_conversation_messages(
         query = """
             SELECT
                 m.*,
-                up1.username as sender_username,
+                COALESCE(up1.username, m.sender_id) as sender_username,
                 up1.avatar_url as sender_avatar,
-                up2.username as recipient_username,
+                COALESCE(up2.username, m.recipient_id) as recipient_username,
                 up2.avatar_url as recipient_avatar
             FROM messages m
-            JOIN user_profiles up1 ON m.sender_id = up1.user_id
-            JOIN user_profiles up2 ON m.recipient_id = up2.user_id
+            LEFT JOIN user_profiles up1 ON m.sender_id = up1.user_id
+            LEFT JOIN user_profiles up2 ON m.recipient_id = up2.user_id
             WHERE m.conversation_id = $1 AND m.deleted_at IS NULL
             ORDER BY m.created_at DESC
             LIMIT $2 OFFSET $3
@@ -589,9 +595,9 @@ async def get_conversation_messages(
         query = """
             SELECT
                 m.*,
-                NULL as sender_username,
+                m.sender_id as sender_username,
                 NULL as sender_avatar,
-                NULL as recipient_username,
+                m.recipient_id as recipient_username,
                 NULL as recipient_avatar
             FROM messages m
             WHERE m.conversation_id = $1 AND m.deleted_at IS NULL
@@ -613,7 +619,7 @@ async def get_conversation_messages_by_id(
     db: asyncpg.Connection = Depends(get_db),
 ):
     user = get_current_user(request)
-    user_id = user["id"]
+    user_id = str(user["id"])
 
     conversation = await _get_conversation(db, conversation_id, user_id)
 
@@ -634,13 +640,13 @@ async def get_conversation_messages_by_id(
         query = """
             SELECT
                 m.*,
-                up1.username as sender_username,
+                COALESCE(up1.username, m.sender_id) as sender_username,
                 up1.avatar_url as sender_avatar,
-                up2.username as recipient_username,
+                COALESCE(up2.username, m.recipient_id) as recipient_username,
                 up2.avatar_url as recipient_avatar
             FROM messages m
-            JOIN user_profiles up1 ON m.sender_id = up1.user_id
-            JOIN user_profiles up2 ON m.recipient_id = up2.user_id
+            LEFT JOIN user_profiles up1 ON m.sender_id = up1.user_id
+            LEFT JOIN user_profiles up2 ON m.recipient_id = up2.user_id
             WHERE m.conversation_id = $1 AND m.deleted_at IS NULL
             ORDER BY m.created_at DESC
             LIMIT $2 OFFSET $3
@@ -649,9 +655,9 @@ async def get_conversation_messages_by_id(
         query = """
             SELECT
                 m.*,
-                NULL as sender_username,
+                m.sender_id as sender_username,
                 NULL as sender_avatar,
-                NULL as recipient_username,
+                m.recipient_id as recipient_username,
                 NULL as recipient_avatar
             FROM messages m
             WHERE m.conversation_id = $1 AND m.deleted_at IS NULL
@@ -672,7 +678,7 @@ async def send_message_in_conversation(
     db: asyncpg.Connection = Depends(get_db),
 ):
     user = get_current_user(request)
-    user_id = user["id"]
+    user_id = str(user["id"])
 
     conversation = await _get_conversation(db, conversation_id, user_id)
     recipient_id = (
@@ -749,7 +755,7 @@ async def delete_message(
     Delete a message (sender only) - soft delete
     """
     user = get_current_user(request)
-    user_id = user["id"]
+    user_id = str(user["id"])
 
     # Check if message belongs to user
     message = await db.fetchrow(
@@ -781,7 +787,7 @@ async def get_unread_count(
     Get total count of unread messages for current user
     """
     user = get_current_user(request)
-    user_id = user["id"]
+    user_id = str(user["id"])
 
     count = await db.fetchval(
         """
@@ -829,7 +835,7 @@ async def mark_conversation_read(
     Mark all messages in a conversation as read
     """
     user = get_current_user(request)
-    user_id = user["id"]
+    user_id = str(user["id"])
 
     # Verify user is part of conversation
     conversation = await db.fetchrow(
@@ -890,7 +896,7 @@ async def search_users_for_messaging(
     Search for users to start a conversation with
     """
     user = get_current_user(request)
-    user_id = user["id"]
+    user_id = str(user["id"])
 
     search_term = (
         query
