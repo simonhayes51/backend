@@ -1271,6 +1271,19 @@ def get_current_user(request: Request) -> str:
         raise HTTPException(status_code=401, detail="Not authenticated")
     return user_id
 
+
+async def _table_exists(conn: asyncpg.Connection, table_name: str) -> bool:
+    return await conn.fetchval(
+        """
+        SELECT EXISTS (
+            SELECT 1
+            FROM information_schema.tables
+            WHERE table_name = $1
+        )
+        """,
+        table_name,
+    )
+
 async def get_discord_user_info(access_token: str):
     async with aiohttp.ClientSession() as session:
         async with session.get(DISCORD_USERS_ME, headers={"Authorization": f"Bearer {access_token}"}) as resp:
@@ -1609,21 +1622,22 @@ async def callback(request: Request):
         )
         global_name = user_data.get('global_name') or user_data.get('username') or "User"
 
-        # Store user profile in database
+        # Store user profile in database (if table exists)
         async with request.app.state.pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO user_profiles (user_id, username, avatar_url, global_name, updated_at)
-                VALUES ($1, $2, $3, $4, NOW())
-                ON CONFLICT (user_id) 
-                DO UPDATE SET 
-                    username = EXCLUDED.username,
-                    avatar_url = EXCLUDED.avatar_url,
-                    global_name = EXCLUDED.global_name,
-                    updated_at = NOW()
-                """,
-                user_id, username, avatar_url, global_name
-            )
+            if await _table_exists(conn, "user_profiles"):
+                await conn.execute(
+                    """
+                    INSERT INTO user_profiles (user_id, username, avatar_url, global_name, updated_at)
+                    VALUES ($1, $2, $3, $4, NOW())
+                    ON CONFLICT (user_id) 
+                    DO UPDATE SET 
+                        username = EXCLUDED.username,
+                        avatar_url = EXCLUDED.avatar_url,
+                        global_name = EXCLUDED.global_name,
+                        updated_at = NOW()
+                    """,
+                    user_id, username, avatar_url, global_name
+                )
 
                # discord_user_id is the snowflake you already have in `user_id` here
         discord_user_id = int(user_id)
@@ -1650,18 +1664,19 @@ async def callback(request: Request):
             app_user_id = str(user_row["id"])
 
             # Upsert user profile (user_profiles.user_id is VARCHAR in your core DB)
-            await conn.execute(
-                """
-                INSERT INTO public.user_profiles (user_id, username, avatar_url, global_name, updated_at)
-                VALUES ($1, $2, $3, $4, NOW())
-                ON CONFLICT (user_id) DO UPDATE SET
-                    username = EXCLUDED.username,
-                    avatar_url = EXCLUDED.avatar_url,
-                    global_name = EXCLUDED.global_name,
-                    updated_at = NOW()
-                """,
-                app_user_id, username, avatar_url, global_name
-            )
+            if await _table_exists(conn, "user_profiles"):
+                await conn.execute(
+                    """
+                    INSERT INTO public.user_profiles (user_id, username, avatar_url, global_name, updated_at)
+                    VALUES ($1, $2, $3, $4, NOW())
+                    ON CONFLICT (user_id) DO UPDATE SET
+                        username = EXCLUDED.username,
+                        avatar_url = EXCLUDED.avatar_url,
+                        global_name = EXCLUDED.global_name,
+                        updated_at = NOW()
+                    """,
+                    app_user_id, username, avatar_url, global_name
+                )
 
         # Session
         request.session["user_id"] = app_user_id
@@ -2584,6 +2599,26 @@ async def get_current_user_info(request: Request, conn=Depends(get_db)):
         }
 
     # Get user profile using UUID (with account_type from users table)
+    if not await _table_exists(conn, "user_profiles"):
+        return {
+            "authenticated": True,
+            "user_id": user_id,
+            "discord_id": int(discord_id),
+            "username": request.session.get("username"),
+            "avatar_url": request.session.get("avatar_url"),
+            "global_name": request.session.get("global_name"),
+            "is_premium": False,
+            "premium_until": None,
+            "last_validated": datetime.now(timezone.utc).isoformat(),
+            "features": [],
+            "limits": {
+                "watchlist_max": 3,
+                "trending": {"timeframes": ["24h"]},
+            },
+            "account_type": "user",
+            "tier": None,
+        }
+
     profile = await conn.fetchrow(
         """
         SELECT 
@@ -2610,8 +2645,24 @@ async def get_current_user_info(request: Request, conn=Depends(get_db)):
 
     if not profile:
         print(f"❌ No profile found for user_id(UUID) {user_id}")
-        request.session.clear()
-        return {"authenticated": False}
+        return {
+            "authenticated": True,
+            "user_id": user_id,
+            "discord_id": int(discord_id),
+            "username": request.session.get("username"),
+            "avatar_url": request.session.get("avatar_url"),
+            "global_name": request.session.get("global_name"),
+            "is_premium": False,
+            "premium_until": None,
+            "last_validated": datetime.now(timezone.utc).isoformat(),
+            "features": [],
+            "limits": {
+                "watchlist_max": 3,
+                "trending": {"timeframes": ["24h"]},
+            },
+            "account_type": "user",
+            "tier": None,
+        }
     
     # Check if user is a trader
     is_trader = profile["account_type"] == "trader"
