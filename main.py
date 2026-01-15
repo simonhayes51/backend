@@ -4237,6 +4237,70 @@ async def create_checkout_session(
     """Create Stripe checkout session"""
     try:
         data = await request.json()
+        
+        # Check for Trader Subscription
+        if data.get("traderId"):
+            trader_id = data.get("traderId")
+            tier = data.get("tier", "basic")
+            billing_cycle = data.get("billingCycle", "month")
+            
+            # Fetch trader profile prices
+            trader = await conn.fetchrow("SELECT * FROM trader_profiles WHERE user_id = $1", trader_id)
+            if not trader:
+                raise HTTPException(status_code=404, detail="Trader not found")
+            
+            price_column = f"tier_{tier}_price"
+            if price_column not in trader:
+                 raise HTTPException(status_code=400, detail="Invalid tier")
+                 
+            price_amount = trader[price_column]
+            if price_amount is None:
+                 raise HTTPException(status_code=400, detail="Tier not available")
+            
+            # Convert to cents/pence (GBP default for now)
+            amount_cents = int(float(price_amount) * 100)
+            
+            # Get user profile for email/name
+            profile = await conn.fetchrow("SELECT * FROM user_profiles WHERE user_id = $1", user_id)
+            
+            session = stripe.checkout.Session.create(
+                customer_email=f"{profile['username']}@discord.local" if profile else None,
+                payment_method_types=['card'],
+                line_items=[{
+                    'price_data': {
+                        'currency': 'gbp', 
+                        'product_data': {
+                            'name': f"Subscription to {trader['user_id']} ({tier.capitalize()})",
+                            'description': f"{tier.capitalize()} tier subscription",
+                        },
+                        'unit_amount': amount_cents,
+                        'recurring': {
+                            'interval': 'month', # could support 'year' if needed
+                        },
+                    },
+                    'quantity': 1,
+                }],
+                mode='subscription',
+                success_url=data.get("successUrl", os.getenv("BILLING_SUCCESS_URL")),
+                cancel_url=data.get("cancelUrl", os.getenv("BILLING_CANCEL_URL")),
+                metadata={
+                    'user_id': user_id,
+                    'type': 'trader_subscription',
+                    'trader_id': trader_id,
+                    'tier': tier
+                },
+                subscription_data={
+                    'metadata': {
+                        'user_id': user_id,
+                        'type': 'trader_subscription',
+                        'trader_id': trader_id,
+                        'tier': tier
+                    }
+                }
+            )
+            return {"sessionId": session.id, "checkoutUrl": session.url}
+
+        # Existing Platform Subscription Logic
         price_id = data.get("priceId")
         billing_cycle = data.get("billingCycle")
         # Map frontend price IDs to Stripe price IDs
@@ -4362,6 +4426,28 @@ async def stripe_webhook(request: Request, conn=Depends(get_db)):
 async def handle_checkout_completed(session, conn):
     """Handle successful checkout"""
     user_id = session.get('metadata', {}).get('user_id')
+    
+    # Handle Trader Subscription
+    sub_type = session.get('metadata', {}).get('type')
+    if sub_type == 'trader_subscription':
+        trader_id = session.get('metadata', {}).get('trader_id')
+        tier = session.get('metadata', {}).get('tier')
+        
+        if user_id and trader_id and tier:
+             await conn.execute("""
+                INSERT INTO trader_subscriptions (subscriber_id, trader_id, is_active, subscription_type, updated_at)
+                VALUES ($1, $2, TRUE, $3, NOW())
+                ON CONFLICT (subscriber_id, trader_id)
+                DO UPDATE SET is_active = TRUE, subscription_type = $3, unsubscribed_at = NULL, updated_at = NOW()
+            """, user_id, trader_id, tier)
+             
+             # Create notification
+             await conn.execute("""
+                INSERT INTO notifications (user_id, notification_type, title, message, related_user_id)
+                VALUES ($1, 'subscription', 'New Subscriber', $2, $3)
+             """, trader_id, f"You have a new {tier} subscriber!", user_id)
+        return
+
     if user_id:
         # Assign Discord role immediately
         await discord_manager.assign_premium_role(user_id)
