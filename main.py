@@ -640,6 +640,8 @@ async def lifespan(app: FastAPI):
           premium_until TIMESTAMPTZ,
           roles JSONB DEFAULT '[]'
         )""")
+        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS account_type VARCHAR(20) DEFAULT 'user'")
+
 
         # portfolio
         await conn.execute("""
@@ -713,6 +715,58 @@ async def lifespan(app: FastAPI):
         await conn.execute("""
         ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS twitch_url TEXT
         """)
+
+        # social trading: profiles/posts/etc
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS trader_profiles (
+            user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+            bio TEXT,
+            specialties TEXT[],
+            verified BOOLEAN DEFAULT FALSE,
+            subscription_price DECIMAL(10, 2) DEFAULT 0,
+            total_followers INTEGER DEFAULT 0,
+            total_posts INTEGER DEFAULT 0,
+            avg_rating DECIMAL(3, 2) DEFAULT 0,
+            total_ratings INTEGER DEFAULT 0,
+            achievements JSONB DEFAULT '[]'::JSONB,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""")
+
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS social_posts (
+            id BIGSERIAL PRIMARY KEY,
+            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            post_type VARCHAR(50) NOT NULL,
+            content TEXT NOT NULL,
+            player_name VARCHAR(255),
+            player_card_id VARCHAR(100),
+            buy_range_min DECIMAL(12, 2),
+            buy_range_max DECIMAL(12, 2),
+            sell_target DECIMAL(12, 2),
+            confidence_level INTEGER,
+            tags TEXT[],
+            is_premium BOOLEAN DEFAULT FALSE,
+            likes_count INTEGER DEFAULT 0,
+            dislikes_count INTEGER DEFAULT 0,
+            comments_count INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            expires_at TIMESTAMP
+        )""")
+
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS post_comments (
+            id BIGSERIAL PRIMARY KEY,
+            post_id BIGINT NOT NULL REFERENCES social_posts(id) ON DELETE CASCADE,
+            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            parent_comment_id BIGINT REFERENCES post_comments(id) ON DELETE CASCADE,
+            content TEXT NOT NULL,
+            likes_count INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            deleted_at TIMESTAMP
+        )""")
 
         # messaging: conversations/messages/notifications
         await conn.execute("""
@@ -1319,9 +1373,7 @@ async def get_member_role_names(discord_user_id: str) -> list[str]:
 DISCORD_PREMIUM_ROLE_ID = os.getenv("DISCORD_PREMIUM_ROLE_ID")
 
 _ROLE_CACHE: dict[str, dict] = {}
-_MEMBERSHIP_CACHE: dict[str, dict] = {}
 ROLE_CACHE_TTL = 300  # 5 minutes
-MEMBERSHIP_CACHE_TTL = 300  # 5 minutes
 
 async def user_has_premium_role(user_id: str) -> bool:
     """Return True if the member has the Premium role in your guild (cached)."""
@@ -1356,34 +1408,17 @@ async def check_server_membership(discord_id: int | str) -> bool:
     if not (DISCORD_BOT_TOKEN and DISCORD_SERVER_ID):
         return True
 
-    now = time.time()
-    discord_id = str(discord_id)  # ensure URL-safe
-    cached = _MEMBERSHIP_CACHE.get(discord_id)
-    if cached and (now - cached["at"] < MEMBERSHIP_CACHE_TTL):
-        return bool(cached["ok"])
-
     try:
+        discord_id = str(discord_id)  # ensure URL-safe
         async with aiohttp.ClientSession() as session:
             async with session.get(
                 f"https://discord.com/api/guilds/{DISCORD_SERVER_ID}/members/{discord_id}",
                 headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}"}
             ) as resp:
-                if resp.status == 200:
-                    ok = True
-                elif resp.status in {429, 500, 502, 503, 504}:
-                    logging.warning(
-                        "Discord membership check failed with %s; using cached result.",
-                        resp.status,
-                    )
-                    ok = bool(cached["ok"]) if cached else True
-                else:
-                    ok = False
+                return resp.status == 200
     except Exception as exc:
-        logging.warning("Discord membership check failed; using cached result: %s", exc)
-        ok = bool(cached["ok"]) if cached else True
-
-    _MEMBERSHIP_CACHE[discord_id] = {"ok": ok, "at": now}
-    return ok
+        logging.warning("Discord membership check failed; skipping enforcement: %s", exc)
+        return True
 
 def issue_extension_token(discord_id: str) -> str:
     now = int(time.time())
