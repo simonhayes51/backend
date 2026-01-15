@@ -773,6 +773,39 @@ async def delete_message(
     return {"message": "Message deleted"}
 
 
+@router.delete("/conversations/{conversation_id}/messages/{message_id}")
+@social_router.delete("/conversations/{conversation_id}/messages/{message_id}")
+async def delete_message_in_conversation(
+    conversation_id: int,
+    message_id: int,
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db),
+):
+    """
+    Delete a message within a specific conversation (sender only) - soft delete
+    """
+    user = get_current_user(request)
+    user_id = str(user["id"])
+
+    message = await db.fetchrow(
+        "SELECT * FROM messages WHERE id = $1",
+        message_id,
+    )
+
+    if not message or message["conversation_id"] != conversation_id:
+        raise HTTPException(status_code=404, detail="Message not found in this conversation")
+
+    if message["sender_id"] != user_id:
+        raise HTTPException(status_code=403, detail="Not authorized to delete this message")
+
+    await db.execute(
+        "UPDATE messages SET deleted_at = NOW() WHERE id = $1",
+        message_id,
+    )
+
+    return {"message": "Message deleted"}
+
+
 @router.get("/unread-count")
 async def get_unread_count(
     request: Request,
@@ -808,7 +841,9 @@ async def get_unread_count(
 
     return {
         "total_unread": count,
-        "by_conversation": [dict(row) for row in conversations]
+        "count": count,
+        "unread_count": count,
+        "by_conversation": [dict(row) for row in conversations],
     }
 
 
@@ -886,6 +921,52 @@ async def mark_conversation_read_get_alias(
         request=request,
         db=db,
     )
+
+
+@router.post("/conversations/{conversation_id}/clear")
+@social_router.post("/conversations/{conversation_id}/clear")
+async def clear_conversation(
+    conversation_id: int,
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db),
+):
+    """
+    Clear all messages in a conversation (soft delete)
+    """
+    user = get_current_user(request)
+    user_id = str(user["id"])
+
+    conversation = await db.fetchrow(
+        "SELECT * FROM conversations WHERE id = $1",
+        conversation_id,
+    )
+
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    if conversation["user1_id"] != user_id and conversation["user2_id"] != user_id:
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+    await db.execute(
+        """
+        UPDATE messages
+        SET deleted_at = NOW()
+        WHERE conversation_id = $1 AND deleted_at IS NULL
+        """,
+        conversation_id,
+    )
+
+    await db.execute(
+        """
+        UPDATE conversations
+        SET last_message_id = NULL,
+            last_message_at = NULL
+        WHERE id = $1
+        """,
+        conversation_id,
+    )
+
+    return {"message": "Conversation cleared"}
 
 
 @router.get("/search")
