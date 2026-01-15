@@ -33,6 +33,13 @@ class TraderProfileUpdate(BaseModel):
     tier_basic_cap: Optional[int] = None
     tier_premium_cap: Optional[int] = None
     tier_elite_cap: Optional[int] = None
+    # User Profile Fields
+    header_image_url: Optional[str] = Field(None, max_length=2000)
+    location: Optional[str] = Field(None, max_length=255)
+    website_url: Optional[str] = Field(None, max_length=2000)
+    twitter_url: Optional[str] = Field(None, max_length=2000)
+    youtube_url: Optional[str] = Field(None, max_length=2000)
+    twitch_url: Optional[str] = Field(None, max_length=2000)
 
 
 class TraderProfile(BaseModel):
