@@ -35,6 +35,37 @@ async def ensure_tables_exist(db: asyncpg.Connection, table_names: List[str]) ->
     return True
 
 
+@router.get("/my-subscribers")
+async def my_subscribers(
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db)
+):
+    """
+    Get list of users subscribed to me
+    """
+    user = get_current_user(request)
+    user_id = user["id"]
+    
+    rows = await db.fetch(
+        """
+        SELECT
+          ts.subscriber_id,
+          ts.is_active,
+          ts.created_at,
+          u.username,
+          u.avatar_url,
+          up.global_name
+        FROM trader_subscriptions ts
+        LEFT JOIN users u ON u.id = ts.subscriber_id
+        LEFT JOIN user_profiles up ON up.user_id = ts.subscriber_id
+        WHERE ts.trader_id = $1
+        ORDER BY ts.created_at DESC
+        """,
+        user_id,
+    )
+    return [dict(r) for r in rows]
+
+
 @router.post("/subscribe", response_model=Subscription)
 async def subscribe_to_trader(
     subscription: SubscriptionCreate,
