@@ -3370,14 +3370,21 @@ async def get_data_summary(
             user_id
         )
 
+        def safe_iso(val):
+            if val is None:
+                return None
+            if hasattr(val, "isoformat"):
+                return val.isoformat()
+            return str(val)
+
         return {
             "trades_count": int(trades_count or 0),
             "goals_count": int(goals_count or 0),
             "starting_balance": int(portfolio["starting_balance"]) if portfolio else 0,
             "total_profit": int(profit_info["total_profit"]) if profit_info else 0,
             "total_tax": int(profit_info["total_tax"]) if profit_info else 0,
-            "earliest_trade": date_range["earliest"].isoformat() if date_range and date_range["earliest"] else None,
-            "latest_trade": date_range["latest"].isoformat() if date_range and date_range["latest"] else None,
+            "earliest_trade": safe_iso(date_range["earliest"]) if date_range else None,
+            "latest_trade": safe_iso(date_range["latest"]) if date_range else None,
         }
 
     except asyncpg_exceptions.UndefinedTableError:
