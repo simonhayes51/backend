@@ -1170,10 +1170,8 @@ async def get_entitlements(request: Request):
 
 ALLOWED_ORIGINS = [
     "https://app.futhub.co.uk",
-    "https://www.futhub.co.uk",
-    "https://futhub.co.uk",
     "http://localhost:5173",
-    "http://localhost:3000",
+    "http://127.0.0.1:5173",
 ]
 ALLOWED_ORIGIN_REGEX = r"^https://.*\\.futhub\\.co\\.uk$"
 
@@ -1238,8 +1236,7 @@ app.add_middleware(CatchExceptionsMiddleware)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS + ["https://api.futhub.co.uk"],
-    allow_origin_regex=ALLOWED_ORIGIN_REGEX,
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
