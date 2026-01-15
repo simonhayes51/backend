@@ -164,6 +164,9 @@ async def subscribe_to_trader_by_id(
     request: Request,
     db: asyncpg.Connection = Depends(get_db),
 ):
+    if trader_id in {"undefined", "null", ""}:
+        raise HTTPException(status_code=400, detail="Trader id required")
+
     subscription = SubscriptionCreate(trader_id=trader_id)
     return await subscribe_to_trader(
         subscription=subscription,
