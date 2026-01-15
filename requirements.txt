@@ -13,3 +13,4 @@ httpx
 PyJWT==2.9.0
 stripe
 lightweight-charts
+email-validator==2.2.0
