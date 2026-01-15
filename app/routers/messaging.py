@@ -528,6 +528,7 @@ async def start_conversation(
 
 
 @router.get("/conversations/{other_user_id}/messages", response_model=List[MessageWithUser])
+@social_router.get("/conversations/{other_user_id}/messages", response_model=List[MessageWithUser])
 async def get_conversation_messages(
     other_user_id: str,
     request: Request,
