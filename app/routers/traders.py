@@ -174,10 +174,10 @@ async def get_current_trader_profile(
             bio,
             specialties,
             verified,
-            subscription_price,
-            tier_basic_price,
-            tier_premium_price,
-            tier_elite_price,
+            COALESCE(subscription_price, 0) as subscription_price,
+            COALESCE(tier_basic_price, 4.99) as tier_basic_price,
+            COALESCE(tier_premium_price, 9.99) as tier_premium_price,
+            COALESCE(tier_elite_price, 19.99) as tier_elite_price,
             tier_basic_cap,
             tier_premium_cap,
             tier_elite_cap,
@@ -322,7 +322,18 @@ async def update_trader_profile(
         """
         await db.execute(query, *up_values)
 
-    return dict(trader_row)
+    result = dict(trader_row)
+    # Ensure required Decimal fields are not None to satisfy Pydantic model
+    if result.get("subscription_price") is None:
+        result["subscription_price"] = Decimal(0)
+    if result.get("tier_basic_price") is None:
+        result["tier_basic_price"] = Decimal("4.99")
+    if result.get("tier_premium_price") is None:
+        result["tier_premium_price"] = Decimal("9.99")
+    if result.get("tier_elite_price") is None:
+        result["tier_elite_price"] = Decimal("19.99")
+
+    return result
 
 
 @router.get("/specialties", response_model=List[str])
