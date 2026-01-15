@@ -30,6 +30,7 @@ from fastapi.responses import RedirectResponse, JSONResponse, StreamingResponse,
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError, ResponseValidationError
 from starlette.middleware.sessions import SessionMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 import inspect
 from pydantic import BaseModel, Field
 
@@ -1246,6 +1247,15 @@ async def response_validation_exception_handler(request: Request, exc: ResponseV
 async def unhandled_exception_handler(request: Request, exc: Exception):
     return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
 
+
+class CatchExceptionsMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        try:
+            return await call_next(request)
+        except Exception as exc:
+            logging.error(f"Unhandled exception: {exc}", exc_info=True)
+            return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
+
 def _session_middleware_kwargs() -> dict:
     kwargs = {
         "secret_key": SECRET_KEY,
@@ -1262,6 +1272,8 @@ app.add_middleware(
     SessionMiddleware,
     **_session_middleware_kwargs(),
 )
+
+app.add_middleware(CatchExceptionsMiddleware)
 
 app.add_middleware(
     CORSMiddleware,
