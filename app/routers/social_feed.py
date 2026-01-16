@@ -65,7 +65,9 @@ class FeedPostCreatePayload(BaseModel):
     sell_target: Optional[Decimal] = None
     sell_at: Optional[datetime] = None
     confidence_level: Optional[int] = Field(None, ge=1, le=100)
-    premium: bool = False
+    premium: bool = False  # Subscriber-only content
+    requires_purchase: bool = False  # One-off purchase content
+    price: Optional[Decimal] = Field(None, ge=0)  # Price for one-off purchase
     expires_in_hours: Optional[int] = None
     image_url: Optional[str] = None  # Add image_url field
     tags: Optional[List[str]] = None  # Add tags field
@@ -84,6 +86,8 @@ class FeedPostUpdatePayload(BaseModel):
     sell_at: Optional[datetime] = None
     confidence_level: Optional[int] = Field(None, ge=1, le=100)
     premium: Optional[bool] = None
+    requires_purchase: Optional[bool] = None
+    price: Optional[Decimal] = Field(None, ge=0)
     expires_in_hours: Optional[int] = None
     image_url: Optional[str] = None
     tags: Optional[List[str]] = None
@@ -205,6 +209,8 @@ async def create_post(
     has_title = await column_exists(db, "social_posts", "title")
     has_sell_at = await column_exists(db, "social_posts", "sell_at")
     has_image_url = await column_exists(db, "social_posts", "image_url")
+    has_requires_purchase = await column_exists(db, "social_posts", "requires_purchase")
+    has_price = await column_exists(db, "social_posts", "price")
 
     columns = [
         "user_id",
@@ -246,6 +252,14 @@ async def create_post(
     if has_image_url:
         columns.append("image_url")
         values.append(post.image_url)
+
+    if has_requires_purchase:
+        columns.append("requires_purchase")
+        values.append(post.requires_purchase)
+
+    if has_price:
+        columns.append("price")
+        values.append(post.price)
 
     placeholders = ", ".join(f"${idx}" for idx in range(1, len(values) + 1))
     query = f"""
@@ -587,29 +601,52 @@ async def get_post(
 
     post_dict = dict(row)
 
-    # Check if post is premium and user has access
-    if post_dict["is_premium"] and is_authenticated:
+    # Check content access (premium subscriber-only OR requires purchase)
+    is_author = is_authenticated and user_id == post_dict["user_id"]
+
+    # Check if content is restricted
+    if (post_dict.get("is_premium") or post_dict.get("requires_purchase")) and not is_author:
+        if not is_authenticated:
+            # Not logged in
+            if post_dict.get("requires_purchase"):
+                raise HTTPException(
+                    status_code=401,
+                    detail="Login to purchase this content"
+                )
+            else:
+                raise HTTPException(
+                    status_code=401,
+                    detail="Login and subscribe to view premium content"
+                )
+
+        # Check access using database function
         has_access = await db.fetchval(
-            """
-            SELECT EXISTS(
-                SELECT 1 FROM trader_subscriptions
-                WHERE subscriber_id = $1 AND trader_id = $2 AND is_active = TRUE
-            )
-            """,
+            "SELECT user_can_access_content($1, $2)",
             user_id,
-            post_dict["user_id"]
+            post_id
         )
 
-        if not has_access and user_id != post_dict["user_id"]:
-            raise HTTPException(
-                status_code=403,
-                detail="Subscribe to this trader to view premium content"
-            )
-    elif post_dict["is_premium"] and not is_authenticated:
-        raise HTTPException(
-            status_code=401,
-            detail="Login and subscribe to view premium content"
-        )
+        if not has_access:
+            # Determine specific error message
+            if post_dict.get("requires_purchase"):
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "error": "purchase_required",
+                        "message": "Purchase required to view this content",
+                        "price": float(post_dict.get("price", 0)),
+                        "currency": "GBP"
+                    }
+                )
+            else:
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "error": "subscription_required",
+                        "message": "Subscribe to this trader to view premium content",
+                        "subscription_price": float(post_dict.get("subscription_price", 0)) if post_dict.get("subscription_price") else None
+                    }
+                )
 
     # Get user's reaction if authenticated
     if is_authenticated:

@@ -69,6 +69,8 @@ from app.routers.ratings import social_router as ratings_social_router
 from app.routers.traders import router as traders_router
 from app.routers.notifications import router as notifications_router
 from app.routers.content_requests import router as content_requests_router
+from app.routers.content_purchases import router as content_purchases_router
+from app.routers.paypal_payments import router as paypal_payments_router
 
 
 # ----------------- BOOTSTRAP -----------------
@@ -1480,6 +1482,8 @@ app.include_router(ratings_social_router)    # /api/social/ratings/*
 app.include_router(traders_router)          # /api/traders/*
 app.include_router(notifications_router)    # /api/notifications/*
 app.include_router(content_requests_router)  # /api/content-requests/*
+app.include_router(content_purchases_router)  # /api/content-purchases/*
+app.include_router(paypal_payments_router)  # /api/paypal/*
 
 # Premium-only — mount at /api/smart-buy
 app.include_router(
@@ -4247,41 +4251,116 @@ async def create_checkout_session(
     """Create Stripe checkout session"""
     try:
         data = await request.json()
-        
-        # Check for Trader Subscription
-        if data.get("traderId"):
-            trader_id = data.get("traderId")
-            tier = data.get("tier", "basic")
-            billing_cycle = data.get("billingCycle", "month")
-            
-            # Fetch trader profile prices
-            trader = await conn.fetchrow("SELECT * FROM trader_profiles WHERE user_id = $1", trader_id)
-            if not trader:
-                raise HTTPException(status_code=404, detail="Trader not found")
-            
-            price_column = f"tier_{tier}_price"
-            if price_column not in trader:
-                 raise HTTPException(status_code=400, detail="Invalid tier")
-                 
-            price_amount = trader[price_column]
-            if price_amount is None:
-                 raise HTTPException(status_code=400, detail="Tier not available")
-            
-            # Convert to cents/pence (GBP default for now)
-            amount_cents = int(float(price_amount) * 100)
-            
-            # Get user profile for email/name
+
+        # Check for One-Off Content Purchase
+        if data.get("postId"):
+            post_id = data.get("postId")
+
+            # Get post details
+            post = await conn.fetchrow(
+                "SELECT * FROM social_posts WHERE id = $1",
+                post_id
+            )
+            if not post:
+                raise HTTPException(status_code=404, detail="Post not found")
+
+            if not post["requires_purchase"] or not post["price"]:
+                raise HTTPException(status_code=400, detail="Post does not require purchase")
+
+            # Check if already purchased
+            existing = await conn.fetchval(
+                "SELECT id FROM content_purchases WHERE user_id = $1 AND post_id = $2 AND status = 'completed'",
+                user_id, post_id
+            )
+            if existing:
+                raise HTTPException(status_code=400, detail="Content already purchased")
+
+            amount_cents = int(float(post["price"]) * 100)
+
+            # Get user profile
             profile = await conn.fetchrow("SELECT * FROM user_profiles WHERE user_id = $1", user_id)
-            
+
             session = stripe.checkout.Session.create(
                 customer_email=f"{profile['username']}@discord.local" if profile else None,
                 payment_method_types=['card'],
                 line_items=[{
                     'price_data': {
-                        'currency': 'gbp', 
+                        'currency': 'gbp',
                         'product_data': {
-                            'name': f"Subscription to {trader['user_id']} ({tier.capitalize()})",
-                            'description': f"{tier.capitalize()} tier subscription",
+                            'name': post["title"] or f"Content: {post['post_type']}",
+                            'description': post["content"][:100] if post["content"] else None,
+                        },
+                        'unit_amount': amount_cents,
+                    },
+                    'quantity': 1,
+                }],
+                mode='payment',
+                success_url=data.get("successUrl", f"{os.getenv('FRONTEND_URL')}/post/{post_id}?purchase=success"),
+                cancel_url=data.get("cancelUrl", f"{os.getenv('FRONTEND_URL')}/post/{post_id}?purchase=cancelled"),
+                metadata={
+                    'user_id': user_id,
+                    'type': 'content_purchase',
+                    'post_id': str(post_id),
+                    'author_id': str(post["user_id"])
+                }
+            )
+
+            # Create pending purchase record
+            await conn.execute(
+                """
+                INSERT INTO content_purchases (
+                    user_id, post_id, amount, currency, payment_provider,
+                    stripe_payment_intent_id, status
+                )
+                VALUES ($1, $2, $3, 'GBP', 'stripe', $4, 'pending')
+                ON CONFLICT (user_id, post_id) DO NOTHING
+                """,
+                user_id, post_id, post["price"], session.payment_intent
+            )
+
+            return {"sessionId": session.id, "checkoutUrl": session.url}
+
+        # Check for Trader Subscription (Single-Tier)
+        if data.get("traderId"):
+            trader_id = data.get("traderId")
+            tier = data.get("tier", "paid")  # Default to 'paid' for single-tier
+            billing_cycle = data.get("billingCycle", "month")
+
+            # Fetch trader profile subscription price (single-tier)
+            trader = await conn.fetchrow("SELECT * FROM trader_profiles WHERE user_id = $1", trader_id)
+            if not trader:
+                raise HTTPException(status_code=404, detail="Trader not found")
+
+            # Use single subscription_price (new system)
+            if trader.get("subscription_price") and float(trader["subscription_price"]) > 0:
+                price_amount = trader["subscription_price"]
+                tier_name = "Subscription"
+            else:
+                # Fallback to old tier system for backward compatibility
+                price_column = f"tier_{tier}_price"
+                if price_column not in trader:
+                    raise HTTPException(status_code=400, detail="Invalid tier")
+
+                price_amount = trader[price_column]
+                if price_amount is None:
+                    raise HTTPException(status_code=400, detail="Tier not available")
+                tier_name = f"{tier.capitalize()} Tier"
+
+            # Convert to cents/pence (GBP default for now)
+            amount_cents = int(float(price_amount) * 100)
+
+            # Get user profile for email/name
+            profile = await conn.fetchrow("SELECT * FROM user_profiles WHERE user_id = $1", user_id)
+
+            session = stripe.checkout.Session.create(
+                customer_email=f"{profile['username']}@discord.local" if profile else None,
+                payment_method_types=['card'],
+                line_items=[{
+                    'price_data': {
+                        'currency': 'gbp',
+                        'product_data': {
+                            'name': f"Subscription to {trader['user_id']}",
+                            'description': f"{tier_name} subscription",
                         },
                         'unit_amount': amount_cents,
                         'recurring': {
@@ -4297,14 +4376,16 @@ async def create_checkout_session(
                     'user_id': user_id,
                     'type': 'trader_subscription',
                     'trader_id': trader_id,
-                    'tier': tier
+                    'tier': 'paid',  # Always use 'paid' for new single-tier system
+                    'amount': str(price_amount)
                 },
                 subscription_data={
                     'metadata': {
                         'user_id': user_id,
                         'type': 'trader_subscription',
                         'trader_id': trader_id,
-                        'tier': tier
+                        'tier': 'paid',
+                        'amount': str(price_amount)
                     }
                 }
             )
@@ -4436,21 +4517,66 @@ async def stripe_webhook(request: Request, conn=Depends(get_db)):
 async def handle_checkout_completed(session, conn):
     """Handle successful checkout"""
     user_id = session.get('metadata', {}).get('user_id')
-    
-    # Handle Trader Subscription
     sub_type = session.get('metadata', {}).get('type')
+
+    # Handle Content Purchase
+    if sub_type == 'content_purchase':
+        post_id = session.get('metadata', {}).get('post_id')
+        author_id = session.get('metadata', {}).get('author_id')
+        payment_intent = session.get('payment_intent')
+
+        if user_id and post_id:
+            # Mark purchase as completed
+            await conn.execute("""
+                UPDATE content_purchases
+                SET status = 'completed',
+                    completed_at = NOW(),
+                    stripe_payment_intent_id = $3
+                WHERE user_id = $1 AND post_id = $2
+            """, user_id, int(post_id), payment_intent)
+
+            # Create notification for author
+            if author_id:
+                await conn.execute("""
+                    INSERT INTO notifications (
+                        user_id, notification_type, title, message,
+                        related_user_id, related_post_id
+                    )
+                    VALUES ($1, 'content_purchase', 'Content Sold!', $2, $3, $4)
+                """, author_id, "Someone purchased your content!", user_id, int(post_id))
+
+            # Create notification for buyer
+            await conn.execute("""
+                INSERT INTO notifications (
+                    user_id, notification_type, title, message, related_post_id
+                )
+                VALUES ($1, 'content_purchase', 'Purchase Complete', $2, $3)
+            """, user_id, "Your content purchase is complete!", int(post_id))
+        return
+
+    # Handle Trader Subscription
     if sub_type == 'trader_subscription':
         trader_id = session.get('metadata', {}).get('trader_id')
-        tier = session.get('metadata', {}).get('tier')
-        
+        tier = session.get('metadata', {}).get('tier', 'paid')
+        amount = session.get('metadata', {}).get('amount')
+
         if user_id and trader_id and tier:
              await conn.execute("""
-                INSERT INTO trader_subscriptions (subscriber_id, trader_id, is_active, subscription_type, updated_at)
-                VALUES ($1, $2, TRUE, $3, NOW())
+                INSERT INTO trader_subscriptions (
+                    subscriber_id, trader_id, is_active, subscription_type,
+                    payment_provider, amount, currency, updated_at
+                )
+                VALUES ($1, $2, TRUE, $3, 'stripe', $4, 'GBP', NOW())
                 ON CONFLICT (subscriber_id, trader_id)
-                DO UPDATE SET is_active = TRUE, subscription_type = $3, unsubscribed_at = NULL, updated_at = NOW()
-            """, user_id, trader_id, tier)
-             
+                DO UPDATE SET
+                    is_active = TRUE,
+                    subscription_type = $3,
+                    payment_provider = 'stripe',
+                    amount = $4,
+                    unsubscribed_at = NULL,
+                    updated_at = NOW()
+            """, user_id, trader_id, tier, amount)
+
              # Create notification
              await conn.execute("""
                 INSERT INTO notifications (user_id, notification_type, title, message, related_user_id)
@@ -4459,7 +4585,7 @@ async def handle_checkout_completed(session, conn):
         return
 
     if user_id:
-        # Assign Discord role immediately
+        # Assign Discord role immediately (for platform subscriptions)
         await discord_manager.assign_premium_role(user_id)
 
 async def handle_subscription_created(subscription, conn):
