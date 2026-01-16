@@ -429,6 +429,12 @@ async def paypal_webhook(
     """
     Handle PayPal webhook events
     """
+    # TODO: Add webhook signature verification for production
+    # webhook_id = os.getenv("PAYPAL_WEBHOOK_ID")
+    # if webhook_id:
+    #     # Verify webhook signature here
+    #     pass
+
     payload = await request.json()
     event_type = payload.get("event_type")
 
