@@ -258,7 +258,9 @@ async def get_my_subscriptions(
             COALESCE(tp.verified, FALSE) as verified,
             ts.is_active,
             ts.subscription_type,
-            ts.subscribed_at
+            ts.subscribed_at,
+            COALESCE(tp.avg_rating, 0)::float8 AS avg_rating,
+            COALESCE(tp.total_ratings, 0) AS total_ratings
         FROM trader_subscriptions ts
         JOIN user_profiles up ON ts.trader_id = up.user_id
         LEFT JOIN trader_profiles tp ON ts.trader_id = tp.user_id
