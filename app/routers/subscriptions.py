@@ -540,6 +540,8 @@ async def subscribe_to_tier(
 ):
     """
     Subscribe to a specific tier (basic/premium/elite) with price locking
+    DEPRECATED: Use /subscribe/{trader_id} for single-tier subscriptions
+    This endpoint is kept for backward compatibility
     """
     user = get_current_user(request)
     user_id = user["id"]
@@ -574,7 +576,7 @@ async def subscribe_to_tier(
     if existing and existing.get("subscription_type") == tier_request.tier:
         raise HTTPException(status_code=400, detail=f"Already subscribed to {tier_request.tier} tier")
 
-    # Get tier pricing
+    # Get tier pricing (backward compatibility)
     tier_prices = {
         "basic": 4.99,
         "premium": 9.99,
@@ -645,6 +647,96 @@ async def subscribe_to_tier(
         "is_founding_subscriber": is_founding or existing.get("is_founding_subscriber", False),
         "price_locked": price,
         "message": f"Successfully subscribed to {tier_request.tier} tier!"
+    }
+
+
+# ============================================================================
+# SINGLE-TIER SUBSCRIPTION (NEW)
+# ============================================================================
+
+@router.post("/subscribe/{trader_id}/paid")
+async def subscribe_paid(
+    trader_id: str,
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db),
+):
+    """
+    Subscribe to a trader's single-tier paid subscription
+    This initiates payment flow - actual subscription created after payment
+    """
+    user = get_current_user(request)
+    user_id = user["id"]
+
+    if user_id == trader_id:
+        raise HTTPException(status_code=400, detail="Cannot subscribe to yourself")
+
+    # Check if trader exists and get their subscription price
+    trader = await db.fetchrow(
+        """
+        SELECT tp.subscription_price, up.username
+        FROM trader_profiles tp
+        JOIN user_profiles up ON tp.user_id = up.user_id
+        WHERE tp.user_id = $1
+        """,
+        trader_id
+    )
+
+    if not trader:
+        raise HTTPException(status_code=404, detail="Trader not found")
+
+    if trader["subscription_price"] is None or float(trader["subscription_price"]) <= 0:
+        raise HTTPException(status_code=400, detail="Trader has not set a subscription price")
+
+    # Check if already subscribed
+    existing = await db.fetchrow(
+        """
+        SELECT * FROM trader_subscriptions
+        WHERE subscriber_id = $1 AND trader_id = $2 AND is_active = TRUE
+        """,
+        user_id,
+        trader_id
+    )
+
+    if existing and existing.get("subscription_type") == "paid":
+        raise HTTPException(status_code=400, detail="Already subscribed to this trader")
+
+    return {
+        "success": True,
+        "trader_id": trader_id,
+        "trader_username": trader["username"],
+        "price": float(trader["subscription_price"]),
+        "currency": "GBP",
+        "message": "Use /api/billing/create-checkout-session with traderId to complete payment"
+    }
+
+
+@router.get("/{trader_id}/subscription-price")
+async def get_subscription_price(
+    trader_id: str,
+    db: asyncpg.Connection = Depends(get_db),
+):
+    """
+    Get trader's subscription price
+    """
+    trader = await db.fetchrow(
+        """
+        SELECT subscription_price, username
+        FROM trader_profiles tp
+        JOIN user_profiles up ON tp.user_id = up.user_id
+        WHERE tp.user_id = $1
+        """,
+        trader_id
+    )
+
+    if not trader:
+        raise HTTPException(status_code=404, detail="Trader not found")
+
+    return {
+        "trader_id": trader_id,
+        "username": trader["username"],
+        "subscription_price": float(trader["subscription_price"]) if trader["subscription_price"] else 0,
+        "currency": "GBP",
+        "has_paid_subscription": trader["subscription_price"] and float(trader["subscription_price"]) > 0
     }
 
 

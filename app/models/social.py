@@ -27,6 +27,7 @@ class TraderProfileCreate(BaseModel):
     bio: Optional[str] = None
     specialties: List[str] = Field(default_factory=list)
     subscription_price: Decimal = Decimal("0")
+    # Deprecated: tier fields kept for backward compatibility
     tier_basic_price: Decimal = Decimal("4.99")
     tier_premium_price: Decimal = Decimal("9.99")
     tier_elite_price: Decimal = Decimal("19.99")
@@ -174,7 +175,9 @@ class SocialPostCreate(BaseModel):
     confidence_level: Optional[int] = Field(None, ge=1, le=100)
     tags: List[str] = Field(default_factory=list)
     image_url: Optional[str] = None
-    is_premium: bool = False
+    is_premium: bool = False  # Subscriber-only content
+    requires_purchase: bool = False  # One-off purchase content
+    price: Optional[Decimal] = Field(None, ge=0)  # Price for one-off purchase
     expires_at: Optional[datetime] = None
 
     @field_validator("post_type")
@@ -184,6 +187,14 @@ class SocialPostCreate(BaseModel):
         if v not in allowed:
             raise ValueError(f"post_type must be one of {sorted(allowed)}")
         return v
+
+    @model_validator(mode="after")
+    def validate_pricing(self):
+        if self.requires_purchase and (self.price is None or self.price <= 0):
+            raise ValueError("price must be set and greater than 0 when requires_purchase is True")
+        if not self.requires_purchase and self.price is not None:
+            raise ValueError("price should be None when requires_purchase is False")
+        return self
 
 
 class SocialPostUpdate(BaseModel):
@@ -203,6 +214,8 @@ class SocialPostUpdate(BaseModel):
     tags: Optional[List[str]] = None
     image_url: Optional[str] = None
     is_premium: Optional[bool] = None
+    requires_purchase: Optional[bool] = None
+    price: Optional[Decimal] = Field(None, ge=0)
     expires_at: Optional[datetime] = None
 
 
@@ -224,6 +237,8 @@ class SocialPost(BaseModel):
     tags: List[str] = Field(default_factory=list)
     image_url: Optional[str] = None
     is_premium: bool = False
+    requires_purchase: bool = False
+    price: Optional[Decimal] = None
     likes_count: int = 0
     dislikes_count: int = 0
     comments_count: int = 0
@@ -273,7 +288,7 @@ class SubscriptionCreate(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     trader_id: str = Field(..., validation_alias=AliasChoices("trader_id", "traderId"))
-    tier: str = "free"  # free, basic, premium, elite
+    tier: str = "free"  # free or paid (basic/premium/elite deprecated but supported)
 
     @field_validator("tier", mode="before")
     @classmethod
@@ -292,6 +307,8 @@ class Subscription(BaseModel):
     is_active: bool
     subscription_type: str
     stripe_subscription_id: Optional[str] = None
+    paypal_subscription_id: Optional[str] = None
+    payment_provider: str = "stripe"
     amount: Optional[Decimal] = None
     currency: str = "GBP"
     subscribed_at: datetime
@@ -573,9 +590,70 @@ class TraderAnalytics(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     total_active_subscribers: int
-    active_basic_subscribers: int
-    active_premium_subscribers: int
-    active_elite_subscribers: int
+    active_basic_subscribers: int  # Deprecated
+    active_premium_subscribers: int  # Deprecated
+    active_elite_subscribers: int  # Deprecated
+    active_paid_subscribers: int = 0  # New: single-tier paid subscribers
     monthly_earnings_estimated: Decimal
+    total_content_revenue: Decimal = Decimal("0")  # New: one-off content sales
+    total_tips_received: Decimal = Decimal("0")  # Tips
     total_followers: int
     views_last_30_days: int = 0
+
+
+# ============================================================================
+# CONTENT PURCHASE MODELS
+# ============================================================================
+
+
+class ContentPurchaseCreate(BaseModel):
+    """
+    Create a content purchase request
+    """
+    model_config = ConfigDict(extra="ignore")
+
+    post_id: int = Field(..., gt=0)
+    payment_provider: str = Field(..., description="stripe or paypal")
+
+    @field_validator("payment_provider")
+    @classmethod
+    def validate_provider(cls, v):
+        if v not in {"stripe", "paypal"}:
+            raise ValueError("payment_provider must be stripe or paypal")
+        return v
+
+
+class ContentPurchase(BaseModel):
+    """
+    Content purchase record
+    """
+    model_config = ConfigDict(extra="ignore")
+
+    id: int
+    user_id: str
+    post_id: int
+    amount: Decimal
+    currency: str = "GBP"
+    payment_provider: str
+    stripe_payment_intent_id: Optional[str] = None
+    paypal_order_id: Optional[str] = None
+    paypal_capture_id: Optional[str] = None
+    status: str  # pending, completed, failed, refunded
+    purchased_at: datetime
+    completed_at: Optional[datetime] = None
+    refunded_at: Optional[datetime] = None
+
+
+class PaymentIntent(BaseModel):
+    """
+    Payment intent for one-off purchase
+    """
+    model_config = ConfigDict(extra="ignore")
+
+    client_secret: Optional[str] = None  # Stripe
+    payment_intent_id: Optional[str] = None  # Stripe
+    order_id: Optional[str] = None  # PayPal
+    approval_url: Optional[str] = None  # PayPal
+    amount: Decimal
+    currency: str = "GBP"
+    provider: str
