@@ -234,6 +234,8 @@ class SubscriptionWithTrader(BaseModel):
     is_active: bool
     subscription_type: str
     subscribed_at: datetime
+    avg_rating: Optional[float] = 0.0
+    total_ratings: int = 0
 
 
 # ============================================================================
