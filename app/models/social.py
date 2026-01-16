@@ -1,10 +1,13 @@
 """
-Pydantic models for social trading feed features
+Pydantic models for social trading feed features (Pydantic v2 compatible)
 """
+from __future__ import annotations
+
 from datetime import datetime
-from typing import Optional, List, Dict, Any
-from pydantic import BaseModel, Field, validator, root_validator
 from decimal import Decimal
+from typing import Optional, List, Dict, Any
+
+from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
 
 
 # ============================================================================
@@ -12,18 +15,22 @@ from decimal import Decimal
 # ============================================================================
 
 class TraderProfileCreate(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     bio: Optional[str] = None
-    specialties: Optional[List[str]] = []
-    subscription_price: Optional[Decimal] = Decimal('0')
-    tier_basic_price: Optional[Decimal] = Decimal('4.99')
-    tier_premium_price: Optional[Decimal] = Decimal('9.99')
-    tier_elite_price: Optional[Decimal] = Decimal('19.99')
+    specialties: List[str] = Field(default_factory=list)
+    subscription_price: Decimal = Decimal("0")
+    tier_basic_price: Decimal = Decimal("4.99")
+    tier_premium_price: Decimal = Decimal("9.99")
+    tier_elite_price: Decimal = Decimal("19.99")
     tier_basic_cap: Optional[int] = None
     tier_premium_cap: Optional[int] = None
     tier_elite_cap: Optional[int] = None
 
 
 class TraderProfileUpdate(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     bio: Optional[str] = None
     specialties: Optional[List[str]] = None
     subscription_price: Optional[Decimal] = None
@@ -33,6 +40,7 @@ class TraderProfileUpdate(BaseModel):
     tier_basic_cap: Optional[int] = None
     tier_premium_cap: Optional[int] = None
     tier_elite_cap: Optional[int] = None
+
     # User Profile Fields
     header_image_url: Optional[str] = Field(None, max_length=2000)
     location: Optional[str] = Field(None, max_length=255)
@@ -43,71 +51,99 @@ class TraderProfileUpdate(BaseModel):
 
 
 class TraderProfile(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     user_id: str
-    bio: Optional[str]
+    bio: Optional[str] = None
     specialties: List[str] = Field(default_factory=list)
-    verified: bool
-    subscription_price: Decimal
-    tier_basic_price: Decimal
-    tier_premium_price: Decimal
-    tier_elite_price: Decimal
-    tier_basic_cap: Optional[int]
-    tier_premium_cap: Optional[int]
-    tier_elite_cap: Optional[int]
-    total_followers: int
-    total_posts: int
-    avg_rating: Optional[float] = 0.0
+    verified: bool = False
+    subscription_price: Decimal = Decimal("0")
+    tier_basic_price: Decimal = Decimal("4.99")
+    tier_premium_price: Decimal = Decimal("9.99")
+    tier_elite_price: Decimal = Decimal("19.99")
+    tier_basic_cap: Optional[int] = None
+    tier_premium_cap: Optional[int] = None
+    tier_elite_cap: Optional[int] = None
+    total_followers: int = 0
+    total_posts: int = 0
+    avg_rating: float = 0.0
     total_ratings: int = 0
-    achievements: Optional[List[dict]] = Field(default_factory=list)
+    achievements: List[dict] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
 
-    @validator("avg_rating", pre=True, always=True)
+    @field_validator("avg_rating", mode="before")
+    @classmethod
     def _default_avg_rating(cls, v):
-        if v is None:
+        if v in (None, ""):
             return 0.0
-        return v
+        try:
+            return float(v)
+        except Exception:
+            return 0.0
 
-    @validator("achievements", pre=True, always=True)
+    @field_validator("achievements", mode="before")
+    @classmethod
     def _coerce_achievements(cls, v):
         if v in (None, ""):
             return []
         if isinstance(v, str):
             try:
                 import json
-
-                return json.loads(v)
+                parsed = json.loads(v)
+                return parsed if isinstance(parsed, list) else []
             except Exception:
                 return []
         return v
 
 
 class TraderPublicProfile(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     id: str
     username: str
-    avatar_url: Optional[str]
-    bio: Optional[str]
+    avatar_url: Optional[str] = None
+    bio: Optional[str] = None
+
     header_image_url: Optional[str] = None
     location: Optional[str] = None
     website_url: Optional[str] = None
     twitter_url: Optional[str] = None
     youtube_url: Optional[str] = None
     twitch_url: Optional[str] = None
-    specialties: List[str]
-    verified: bool
-    subscription_price: Decimal
-    tier_basic_price: Decimal
-    tier_premium_price: Decimal
-    tier_elite_price: Decimal
-    tier_basic_cap: Optional[int]
-    tier_premium_cap: Optional[int]
-    tier_elite_cap: Optional[int]
-    total_followers: int
-    total_posts: int
-    avg_rating: Optional[float] = 0.0
-    total_ratings: int
+
+    specialties: List[str] = Field(default_factory=list)
+    verified: bool = False
+    subscription_price: Decimal = Decimal("0")
+    tier_basic_price: Decimal = Decimal("4.99")
+    tier_premium_price: Decimal = Decimal("9.99")
+    tier_elite_price: Decimal = Decimal("19.99")
+    tier_basic_cap: Optional[int] = None
+    tier_premium_cap: Optional[int] = None
+    tier_elite_cap: Optional[int] = None
+    total_followers: int = 0
+    total_posts: int = 0
+    avg_rating: float = 0.0
+    total_ratings: int = 0
     trader_since: datetime
-    is_subscribed: Optional[bool] = False
+    is_subscribed: bool = False
+
+    @field_validator("avg_rating", mode="before")
+    @classmethod
+    def _avg_rating(cls, v):
+        if v in (None, ""):
+            return 0.0
+        try:
+            return float(v)
+        except Exception:
+            return 0.0
+
+    @field_validator("specialties", mode="before")
+    @classmethod
+    def _specialties(cls, v):
+        if v in (None, ""):
+            return []
+        return v
 
 
 # ============================================================================
@@ -115,6 +151,8 @@ class TraderPublicProfile(BaseModel):
 # ============================================================================
 
 class SocialPostCreate(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     post_type: str = Field(..., description="Type: quick_flip, prediction, tip, analysis")
     title: Optional[str] = None
     content: str = Field(..., min_length=1, max_length=5000)
@@ -125,20 +163,23 @@ class SocialPostCreate(BaseModel):
     sell_target: Optional[Decimal] = None
     sell_at: Optional[datetime] = None
     confidence_level: Optional[int] = Field(None, ge=1, le=100)
-    tags: Optional[List[str]] = []
+    tags: List[str] = Field(default_factory=list)
     image_url: Optional[str] = None
     is_premium: bool = False
     expires_at: Optional[datetime] = None
 
-    @validator('post_type')
+    @field_validator("post_type")
+    @classmethod
     def validate_post_type(cls, v):
-        allowed = ['quick_flip', 'prediction', 'tip', 'analysis']
+        allowed = {"quick_flip", "prediction", "tip", "analysis"}
         if v not in allowed:
-            raise ValueError(f'post_type must be one of {allowed}')
+            raise ValueError(f"post_type must be one of {sorted(allowed)}")
         return v
 
 
 class SocialPostUpdate(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     title: Optional[str] = None
     content: Optional[str] = Field(None, min_length=1, max_length=5000)
     post_type: Optional[str] = None
@@ -157,45 +198,53 @@ class SocialPostUpdate(BaseModel):
 
 
 class SocialPost(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     id: int
     user_id: str
     post_type: str
     title: Optional[str] = None
     content: str
-    player_name: Optional[str]
-    player_card_id: Optional[str]
-    buy_range_min: Optional[Decimal]
-    buy_range_max: Optional[Decimal]
-    sell_target: Optional[Decimal]
+    player_name: Optional[str] = None
+    player_card_id: Optional[str] = None
+    buy_range_min: Optional[Decimal] = None
+    buy_range_max: Optional[Decimal] = None
+    sell_target: Optional[Decimal] = None
     sell_at: Optional[datetime] = None
-    confidence_level: Optional[int]
-    tags: List[str]
-    image_url: Optional[str]
-    is_premium: bool
-    likes_count: int
-    dislikes_count: int
-    comments_count: int
+    confidence_level: Optional[int] = None
+    tags: List[str] = Field(default_factory=list)
+    image_url: Optional[str] = None
+    is_premium: bool = False
+    likes_count: int = 0
+    dislikes_count: int = 0
+    comments_count: int = 0
     views_count: int = 0
     shares_count: int = 0
     created_at: datetime
     updated_at: datetime
-    expires_at: Optional[datetime]
+    expires_at: Optional[datetime] = None
 
 
 class SocialPostWithAuthor(SocialPost):
-    username: Optional[str] = "Anonymous"  # Allow None, default to Anonymous
+    username: Optional[str] = "Anonymous"
     avatar_url: Optional[str] = None
     verified: bool = False
     avg_rating: Optional[Decimal] = None
     total_followers: Optional[int] = None
-    user_reaction: Optional[str] = None  # 'like', 'dislike', or None
-    is_author: bool = False  # True if current user is the author
-    title: Optional[str] = None
+    user_reaction: Optional[str] = None
+    is_author: bool = False
     author: Optional[Dict[str, Any]] = None
     stats: Optional[Dict[str, Any]] = None
 
+    @field_validator("username", mode="before")
+    @classmethod
+    def _username(cls, v):
+        return "Anonymous" if v in (None, "") else v
+
 
 class FeedResponse(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     posts: List[SocialPostWithAuthor]
     total: int
     has_more: bool
@@ -208,33 +257,49 @@ class FeedResponse(BaseModel):
 # ============================================================================
 
 class SubscriptionCreate(BaseModel):
-    trader_id: str
-    tier: str = "free"  # "free", "basic", "premium", "elite"
+    """
+    Accepts both trader_id and traderId (frontend safety).
+    """
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    trader_id: str = Field(..., validation_alias="traderId")
+    tier: str = "free"  # free, basic, premium, elite
+
+    @field_validator("tier", mode="before")
+    @classmethod
+    def _tier(cls, v):
+        if v in (None, ""):
+            return "free"
+        return str(v).lower()
 
 
 class Subscription(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     id: int
     subscriber_id: str
     trader_id: str
     is_active: bool
     subscription_type: str
-    stripe_subscription_id: Optional[str]
-    amount: Optional[Decimal]
-    currency: str
+    stripe_subscription_id: Optional[str] = None
+    amount: Optional[Decimal] = None
+    currency: str = "GBP"
     subscribed_at: datetime
-    unsubscribed_at: Optional[datetime]
+    unsubscribed_at: Optional[datetime] = None
 
 
 class SubscriptionWithTrader(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     id: int
     trader_id: str
     trader_username: str
-    trader_avatar: Optional[str]
-    verified: bool
-    is_active: bool
-    subscription_type: str
+    trader_avatar: Optional[str] = None
+    verified: bool = False
+    is_active: bool = True
+    subscription_type: str = "free"
     subscribed_at: datetime
-    avg_rating: Optional[float] = 0.0
+    avg_rating: float = 0.0
     total_ratings: int = 0
 
 
@@ -243,17 +308,22 @@ class SubscriptionWithTrader(BaseModel):
 # ============================================================================
 
 class PostReactionCreate(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     post_id: int
     reaction_type: str = Field(..., description="like or dislike")
 
-    @validator('reaction_type')
+    @field_validator("reaction_type")
+    @classmethod
     def validate_reaction(cls, v):
-        if v not in ['like', 'dislike']:
-            raise ValueError('reaction_type must be like or dislike')
+        if v not in {"like", "dislike"}:
+            raise ValueError("reaction_type must be like or dislike")
         return v
 
 
 class PostReaction(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     id: int
     user_id: str
     post_id: int
@@ -262,31 +332,37 @@ class PostReaction(BaseModel):
 
 
 class CommentCreate(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     post_id: int
     content: str = Field(..., min_length=1, max_length=2000)
     parent_comment_id: Optional[int] = None
 
 
 class CommentUpdate(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     content: str = Field(..., min_length=1, max_length=2000)
 
 
 class Comment(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     id: int
     post_id: int
     user_id: str
-    parent_comment_id: Optional[int]
+    parent_comment_id: Optional[int] = None
     content: str
-    likes_count: int
+    likes_count: int = 0
     created_at: datetime
     updated_at: datetime
-    deleted_at: Optional[datetime]
+    deleted_at: Optional[datetime] = None
 
 
 class CommentWithAuthor(Comment):
     username: str
-    avatar_url: Optional[str]
-    verified: Optional[bool]
+    avatar_url: Optional[str] = None
+    verified: Optional[bool] = None
     user_has_liked: bool = False
     is_author: bool = False
     author: Optional[Dict[str, Any]] = None
@@ -294,6 +370,7 @@ class CommentWithAuthor(Comment):
 
 
 class CommentLikeCreate(BaseModel):
+    model_config = ConfigDict(extra="ignore")
     comment_id: int
 
 
@@ -302,29 +379,41 @@ class CommentLikeCreate(BaseModel):
 # ============================================================================
 
 class RatingCreate(BaseModel):
-    trader_id: str
-    rating: int = Field(..., ge=1, le=5, description="Rating from 1 to 5 stars")
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    trader_id: str = Field(..., validation_alias="traderId")
+    rating: int = Field(..., ge=1, le=5)
     review: Optional[str] = Field(None, max_length=1000)
+
+    @field_validator("trader_id", mode="before")
+    @classmethod
+    def _trader_id(cls, v):
+        # allow accidental numeric ids to remain as strings
+        return str(v) if v is not None else v
 
 
 class RatingUpdate(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     rating: int = Field(..., ge=1, le=5)
     review: Optional[str] = Field(None, max_length=1000)
 
 
 class Rating(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     id: int
     trader_id: str
     rater_id: str
     rating: int
-    review: Optional[str]
+    review: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
 
 class RatingWithAuthor(Rating):
     rater_username: str
-    rater_avatar: Optional[str]
+    rater_avatar: Optional[str] = None
 
 
 # ============================================================================
@@ -332,29 +421,42 @@ class RatingWithAuthor(Rating):
 # ============================================================================
 
 class MessageCreate(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     recipient_id: str
     content: str = Field(..., min_length=1, max_length=5000)
 
-    @root_validator(pre=True)
+    @model_validator(mode="before")
+    @classmethod
     def normalize_message_fields(cls, values):
+        if not isinstance(values, dict):
+            return values
+
         if values.get("recipient_id") is None:
             for key in ("recipientId", "recipient", "user_id", "userId"):
                 if values.get(key):
                     values["recipient_id"] = values[key]
                     break
+
         if values.get("content") is None:
             for key in ("message", "text"):
                 if values.get(key):
                     values["content"] = values[key]
                     break
+
         return values
 
 
 class MessagePayload(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     content: str
 
-    @root_validator(pre=True)
+    @model_validator(mode="before")
+    @classmethod
     def normalize_payload_fields(cls, values):
+        if not isinstance(values, dict):
+            return values
         if values.get("content") is None:
             for key in ("message", "text"):
                 if values.get(key):
@@ -364,92 +466,12 @@ class MessagePayload(BaseModel):
 
 
 class Message(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     id: int
     conversation_id: int
     sender_id: str
     recipient_id: str
     content: str
-    read_at: Optional[datetime]
-    created_at: datetime
-    deleted_at: Optional[datetime]
-
-
-class MessageWithUser(Message):
-    sender_username: str
-    sender_avatar: Optional[str]
-    recipient_username: str
-    recipient_avatar: Optional[str]
-    is_sender: bool = False
-
-
-class Conversation(BaseModel):
-    id: int
-    user1_id: str
-    user2_id: str
-    last_message_id: Optional[int]
-    last_message_at: Optional[datetime]
-    created_at: datetime
-
-
-class ConversationWithDetails(Conversation):
-    other_user_id: str
-    other_user_username: str
-    other_user_avatar: Optional[str]
-    last_message_content: Optional[str]
-    unread_count: int
-    title: Optional[str] = None
-    participant: Optional[Dict[str, Any]] = None
-    last_message: Optional[Dict[str, Any]] = None
-
-
-# ============================================================================
-# NOTIFICATION MODELS
-# ============================================================================
-
-class Notification(BaseModel):
-    id: int
-    user_id: str
-    notification_type: str
-    title: str
-    message: str
-    related_user_id: Optional[str]
-    related_post_id: Optional[int]
-    related_comment_id: Optional[int]
-    related_message_id: Optional[int]
-    read_at: Optional[datetime]
-    created_at: datetime
-
-
-class NotificationWithDetails(Notification):
-    related_username: Optional[str]
-    related_avatar: Optional[str]
-
-
-# ============================================================================
-# STATISTICS MODELS
-# ============================================================================
-
-class UserStats(BaseModel):
-    account_type: str
-    total_posts: int = 0
-    total_followers: int = 0
-    total_following: int = 0
-    total_likes_received: int = 0
-    total_comments_received: int = 0
-
-
-class TraderStats(UserStats):
-    avg_rating: Decimal = Decimal('0')
-    total_ratings: int = 0
-    verified: bool = False
-    subscription_price: Decimal = Decimal('0')
-
-
-class TraderAnalytics(BaseModel):
-    total_active_subscribers: int
-    active_basic_subscribers: int
-    active_premium_subscribers: int
-    active_elite_subscribers: int
-    monthly_earnings_estimated: Decimal
-    total_followers: int
-    views_last_30_days: int = 0
+    read_at: Optional[datetime] = None
+    created_at:
