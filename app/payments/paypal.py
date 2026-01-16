@@ -188,19 +188,41 @@ class PayPalClient:
         description: str,
         return_url: str,
         cancel_url: str,
-        custom_id: str
+        custom_id: str,
+        payee_email: Optional[str] = None,
+        platform_fee_percent: float = 10.0
     ) -> Dict[str, Any]:
-        """Create a one-time payment order"""
+        """Create a one-time payment order with optional payee routing"""
+        purchase_unit = {
+            "amount": {
+                "currency_code": currency,
+                "value": str(amount)
+            },
+            "description": description,
+            "custom_id": custom_id
+        }
+
+        # Add payee routing if specified
+        if payee_email:
+            purchase_unit["payee"] = {
+                "email_address": payee_email
+            }
+
+            # Calculate platform fee
+            platform_fee = float(amount) * (platform_fee_percent / 100)
+            purchase_unit["payment_instruction"] = {
+                "disbursement_mode": "INSTANT",
+                "platform_fees": [{
+                    "amount": {
+                        "currency_code": currency,
+                        "value": f"{platform_fee:.2f}"
+                    }
+                }]
+            }
+
         data = {
             "intent": "CAPTURE",
-            "purchase_units": [{
-                "amount": {
-                    "currency_code": currency,
-                    "value": str(amount)
-                },
-                "description": description,
-                "custom_id": custom_id
-            }],
+            "purchase_units": [purchase_unit],
             "application_context": {
                 "brand_name": "FutHub",
                 "locale": "en-GB",

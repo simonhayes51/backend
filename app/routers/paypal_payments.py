@@ -49,10 +49,10 @@ async def create_paypal_subscription(
     if user_id == trader_id:
         raise HTTPException(status_code=400, detail="Cannot subscribe to yourself")
 
-    # Get trader details and subscription price
+    # Get trader details, subscription price, and PayPal account
     trader = await db.fetchrow(
         """
-        SELECT tp.subscription_price, up.username
+        SELECT tp.subscription_price, tp.paypal_email, tp.paypal_merchant_status, up.username
         FROM trader_profiles tp
         JOIN user_profiles up ON tp.user_id = up.user_id
         WHERE tp.user_id = $1
@@ -65,6 +65,13 @@ async def create_paypal_subscription(
 
     if not trader["subscription_price"] or float(trader["subscription_price"]) <= 0:
         raise HTTPException(status_code=400, detail="Trader has not set a subscription price")
+
+    # Check if trader has PayPal account set up
+    if not trader["paypal_email"]:
+        raise HTTPException(
+            status_code=400,
+            detail="This trader has not set up their PayPal account yet"
+        )
 
     # Check if already subscribed
     existing = await db.fetchrow(
@@ -251,9 +258,14 @@ async def create_paypal_purchase(
     user_id = user["id"]
     post_id = purchase_request.post_id
 
-    # Get post details
+    # Get post details and author's PayPal account
     post = await db.fetchrow(
-        "SELECT * FROM social_posts WHERE id = $1",
+        """
+        SELECT sp.*, tp.paypal_email, tp.paypal_merchant_status
+        FROM social_posts sp
+        LEFT JOIN trader_profiles tp ON sp.user_id = tp.user_id
+        WHERE sp.id = $1
+        """,
         post_id
     )
 
@@ -262,6 +274,13 @@ async def create_paypal_purchase(
 
     if not post["requires_purchase"] or not post["price"]:
         raise HTTPException(status_code=400, detail="Post does not require purchase")
+
+    # Check if author has PayPal account set up
+    if not post.get("paypal_email"):
+        raise HTTPException(
+            status_code=400,
+            detail="Content creator has not set up their PayPal account yet"
+        )
 
     # Check if already purchased
     existing = await db.fetchval(
@@ -275,13 +294,16 @@ async def create_paypal_purchase(
         frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
         custom_id = f"{user_id}:{post_id}"
 
+        # Create order with payee routing (10% platform fee)
         order = await paypal_client.create_order(
             amount=post["price"],
             currency="GBP",
             description=post["title"] or f"Content: {post['post_type']}",
             return_url=f"{frontend_url}/post/{post_id}?payment=success",
             cancel_url=f"{frontend_url}/post/{post_id}?payment=cancelled",
-            custom_id=custom_id
+            custom_id=custom_id,
+            payee_email=post["paypal_email"],
+            platform_fee_percent=10.0
         )
 
         # Create pending purchase record

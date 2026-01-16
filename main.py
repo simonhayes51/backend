@@ -71,6 +71,7 @@ from app.routers.notifications import router as notifications_router
 from app.routers.content_requests import router as content_requests_router
 from app.routers.content_purchases import router as content_purchases_router
 from app.routers.paypal_payments import router as paypal_payments_router
+from app.routers.payment_accounts import router as payment_accounts_router
 
 
 # ----------------- BOOTSTRAP -----------------
@@ -1484,6 +1485,7 @@ app.include_router(notifications_router)    # /api/notifications/*
 app.include_router(content_requests_router)  # /api/content-requests/*
 app.include_router(content_purchases_router)  # /api/content-purchases/*
 app.include_router(paypal_payments_router)  # /api/paypal/*
+app.include_router(payment_accounts_router)  # /api/payment-accounts/*
 
 # Premium-only — mount at /api/smart-buy
 app.include_router(
@@ -4256,9 +4258,14 @@ async def create_checkout_session(
         if data.get("postId"):
             post_id = data.get("postId")
 
-            # Get post details
+            # Get post details and author's payment account
             post = await conn.fetchrow(
-                "SELECT * FROM social_posts WHERE id = $1",
+                """
+                SELECT sp.*, tp.stripe_connect_account_id, tp.stripe_charges_enabled
+                FROM social_posts sp
+                LEFT JOIN trader_profiles tp ON sp.user_id = tp.user_id
+                WHERE sp.id = $1
+                """,
                 post_id
             )
             if not post:
@@ -4275,11 +4282,25 @@ async def create_checkout_session(
             if existing:
                 raise HTTPException(status_code=400, detail="Content already purchased")
 
+            # Check if author has payment account set up
+            author_id = str(post["user_id"])
+            stripe_account_id = post.get("stripe_connect_account_id")
+
+            if not stripe_account_id or not post.get("stripe_charges_enabled"):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Content creator has not set up their payment account yet"
+                )
+
             amount_cents = int(float(post["price"]) * 100)
+
+            # Calculate platform fee (10%)
+            platform_fee_cents = int(amount_cents * 0.10)
 
             # Get user profile
             profile = await conn.fetchrow("SELECT * FROM user_profiles WHERE user_id = $1", user_id)
 
+            # Create checkout session with Stripe Connect destination charge
             session = stripe.checkout.Session.create(
                 customer_email=f"{profile['username']}@discord.local" if profile else None,
                 payment_method_types=['card'],
@@ -4295,13 +4316,20 @@ async def create_checkout_session(
                     'quantity': 1,
                 }],
                 mode='payment',
+                payment_intent_data={
+                    'application_fee_amount': platform_fee_cents,
+                    'transfer_data': {
+                        'destination': stripe_account_id,
+                    },
+                },
                 success_url=data.get("successUrl", f"{os.getenv('FRONTEND_URL')}/post/{post_id}?purchase=success"),
                 cancel_url=data.get("cancelUrl", f"{os.getenv('FRONTEND_URL')}/post/{post_id}?purchase=cancelled"),
                 metadata={
                     'user_id': user_id,
                     'type': 'content_purchase',
                     'post_id': str(post_id),
-                    'author_id': str(post["user_id"])
+                    'author_id': author_id,
+                    'platform_fee': str(platform_fee_cents / 100)
                 }
             )
 
@@ -4326,10 +4354,18 @@ async def create_checkout_session(
             tier = data.get("tier", "paid")  # Default to 'paid' for single-tier
             billing_cycle = data.get("billingCycle", "month")
 
-            # Fetch trader profile subscription price (single-tier)
+            # Fetch trader profile subscription price (single-tier) and payment account
             trader = await conn.fetchrow("SELECT * FROM trader_profiles WHERE user_id = $1", trader_id)
             if not trader:
                 raise HTTPException(status_code=404, detail="Trader not found")
+
+            # Check if trader has payment account set up
+            stripe_account_id = trader.get("stripe_connect_account_id")
+            if not stripe_account_id or not trader.get("stripe_charges_enabled"):
+                raise HTTPException(
+                    status_code=400,
+                    detail="This trader has not set up their payment account yet"
+                )
 
             # Use single subscription_price (new system)
             if trader.get("subscription_price") and float(trader["subscription_price"]) > 0:
@@ -4349,9 +4385,14 @@ async def create_checkout_session(
             # Convert to cents/pence (GBP default for now)
             amount_cents = int(float(price_amount) * 100)
 
+            # Calculate platform fee (10%)
+            platform_fee_percentage = 10  # 10% platform fee
+
             # Get user profile for email/name
             profile = await conn.fetchrow("SELECT * FROM user_profiles WHERE user_id = $1", user_id)
 
+            # Create checkout session with Stripe Connect
+            # For subscriptions, we use application_fee_percent on subscription_data
             session = stripe.checkout.Session.create(
                 customer_email=f"{profile['username']}@discord.local" if profile else None,
                 payment_method_types=['card'],
@@ -4372,21 +4413,26 @@ async def create_checkout_session(
                 mode='subscription',
                 success_url=data.get("successUrl", os.getenv("BILLING_SUCCESS_URL")),
                 cancel_url=data.get("cancelUrl", os.getenv("BILLING_CANCEL_URL")),
+                subscription_data={
+                    'application_fee_percent': platform_fee_percentage,
+                    'transfer_data': {
+                        'destination': stripe_account_id,
+                    },
+                    'metadata': {
+                        'user_id': user_id,
+                        'type': 'trader_subscription',
+                        'trader_id': trader_id,
+                        'tier': 'paid',
+                        'amount': str(price_amount),
+                        'platform_fee_percentage': str(platform_fee_percentage)
+                    }
+                },
                 metadata={
                     'user_id': user_id,
                     'type': 'trader_subscription',
                     'trader_id': trader_id,
                     'tier': 'paid',  # Always use 'paid' for new single-tier system
                     'amount': str(price_amount)
-                },
-                subscription_data={
-                    'metadata': {
-                        'user_id': user_id,
-                        'type': 'trader_subscription',
-                        'trader_id': trader_id,
-                        'tier': 'paid',
-                        'amount': str(price_amount)
-                    }
                 }
             )
             return {"sessionId": session.id, "checkoutUrl": session.url}
