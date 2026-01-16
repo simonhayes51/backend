@@ -7,12 +7,19 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Optional, List, Dict, Any
 
-from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
-
+from pydantic import (
+    BaseModel,
+    Field,
+    ConfigDict,
+    field_validator,
+    model_validator,
+    AliasChoices,
+)
 
 # ============================================================================
 # USER & TRADER MODELS
 # ============================================================================
+
 
 class TraderProfileCreate(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -90,6 +97,7 @@ class TraderProfile(BaseModel):
         if isinstance(v, str):
             try:
                 import json
+
                 parsed = json.loads(v)
                 return parsed if isinstance(parsed, list) else []
             except Exception:
@@ -149,6 +157,7 @@ class TraderPublicProfile(BaseModel):
 # ============================================================================
 # SOCIAL POST MODELS
 # ============================================================================
+
 
 class SocialPostCreate(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -256,13 +265,14 @@ class FeedResponse(BaseModel):
 # SUBSCRIPTION MODELS
 # ============================================================================
 
+
 class SubscriptionCreate(BaseModel):
     """
     Accepts both trader_id and traderId (frontend safety).
     """
-    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+    model_config = ConfigDict(extra="ignore")
 
-    trader_id: str = Field(..., validation_alias="traderId")
+    trader_id: str = Field(..., validation_alias=AliasChoices("trader_id", "traderId"))
     tier: str = "free"  # free, basic, premium, elite
 
     @field_validator("tier", mode="before")
@@ -306,6 +316,7 @@ class SubscriptionWithTrader(BaseModel):
 # ============================================================================
 # POST INTERACTION MODELS
 # ============================================================================
+
 
 class PostReactionCreate(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -378,17 +389,17 @@ class CommentLikeCreate(BaseModel):
 # RATING MODELS
 # ============================================================================
 
-class RatingCreate(BaseModel):
-    model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
-    trader_id: str = Field(..., validation_alias="traderId")
-    rating: int = Field(..., ge=1, le=5)
+class RatingCreate(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    trader_id: str = Field(..., validation_alias=AliasChoices("trader_id", "traderId"))
+    rating: int = Field(..., ge=1, le=5, description="Rating from 1 to 5 stars")
     review: Optional[str] = Field(None, max_length=1000)
 
     @field_validator("trader_id", mode="before")
     @classmethod
     def _trader_id(cls, v):
-        # allow accidental numeric ids to remain as strings
         return str(v) if v is not None else v
 
 
@@ -419,6 +430,7 @@ class RatingWithAuthor(Rating):
 # ============================================================================
 # MESSAGING MODELS
 # ============================================================================
+
 
 class MessageCreate(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -474,4 +486,96 @@ class Message(BaseModel):
     recipient_id: str
     content: str
     read_at: Optional[datetime] = None
-    created_at:
+    created_at: datetime
+    deleted_at: Optional[datetime] = None
+
+
+class MessageWithUser(Message):
+    sender_username: str
+    sender_avatar: Optional[str] = None
+    recipient_username: str
+    recipient_avatar: Optional[str] = None
+    is_sender: bool = False
+
+
+class Conversation(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    id: int
+    user1_id: str
+    user2_id: str
+    last_message_id: Optional[int] = None
+    last_message_at: Optional[datetime] = None
+    created_at: datetime
+
+
+class ConversationWithDetails(Conversation):
+    other_user_id: str
+    other_user_username: str
+    other_user_avatar: Optional[str] = None
+    last_message_content: Optional[str] = None
+    unread_count: int = 0
+    title: Optional[str] = None
+    participant: Optional[Dict[str, Any]] = None
+    last_message: Optional[Dict[str, Any]] = None
+
+
+# ============================================================================
+# NOTIFICATION MODELS
+# ============================================================================
+
+
+class Notification(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    id: int
+    user_id: str
+    notification_type: str
+    title: str
+    message: str
+    related_user_id: Optional[str] = None
+    related_post_id: Optional[int] = None
+    related_comment_id: Optional[int] = None
+    related_message_id: Optional[int] = None
+    read_at: Optional[datetime] = None
+    created_at: datetime
+
+
+class NotificationWithDetails(Notification):
+    related_username: Optional[str] = None
+    related_avatar: Optional[str] = None
+
+
+# ============================================================================
+# STATISTICS MODELS
+# ============================================================================
+
+
+class UserStats(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    account_type: str
+    total_posts: int = 0
+    total_followers: int = 0
+    total_following: int = 0
+    total_likes_received: int = 0
+    total_comments_received: int = 0
+
+
+class TraderStats(UserStats):
+    avg_rating: Decimal = Decimal("0")
+    total_ratings: int = 0
+    verified: bool = False
+    subscription_price: Decimal = Decimal("0")
+
+
+class TraderAnalytics(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    total_active_subscribers: int
+    active_basic_subscribers: int
+    active_premium_subscribers: int
+    active_elite_subscribers: int
+    monthly_earnings_estimated: Decimal
+    total_followers: int
+    views_last_30_days: int = 0
