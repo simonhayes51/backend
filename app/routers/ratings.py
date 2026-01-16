@@ -114,7 +114,40 @@ async def rate_trader(
             user_id
         )
 
+    # Update trader profile stats
+    await _update_trader_rating_stats(db, rating.trader_id)
+
     return dict(row)
+
+
+async def _update_trader_rating_stats(db: asyncpg.Connection, trader_id: str):
+    """
+    Recalculate and update average rating and total ratings for a trader
+    """
+    stats = await db.fetchrow(
+        """
+        SELECT 
+            COUNT(*) as total_ratings,
+            COALESCE(AVG(rating), 0) as avg_rating
+        FROM trader_ratings
+        WHERE trader_id = $1
+        """,
+        trader_id
+    )
+    
+    total = stats["total_ratings"]
+    avg = float(stats["avg_rating"])
+    
+    await db.execute(
+        """
+        UPDATE trader_profiles
+        SET total_ratings = $1, avg_rating = $2
+        WHERE user_id = $3
+        """,
+        total,
+        avg,
+        trader_id
+    )
 
 
 @router.post("/{trader_id}", response_model=Rating)
@@ -265,6 +298,9 @@ async def delete_rating(
 
     if result == "DELETE 0":
         raise HTTPException(status_code=404, detail="Rating not found")
+
+    # Update trader profile stats
+    await _update_trader_rating_stats(db, trader_id)
 
     return {"message": "Rating deleted"}
 
