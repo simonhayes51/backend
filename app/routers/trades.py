@@ -72,6 +72,102 @@ class TradeItem(BaseModel):
             raise ValueError('Sell price must be positive')
         return v
 
+class TradeCreate(TradeItem):
+    trade_id: int = Field(..., description="Client-side generated ID (timestamp)")
+
+@router.post("/")
+async def create_trade(
+    request: Request,
+    trade: TradeCreate,
+    db=Depends(get_db)
+):
+    """
+    Add a single trade
+    """
+    ent = await compute_entitlements(request)
+    user_id = ent.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    # Calculate profit/tax
+    ea_tax_rate = 0.05
+    sell_after_tax = int(trade.sell * (1 - ea_tax_rate))
+    ea_tax = trade.sell - sell_after_tax
+    profit = (sell_after_tax - trade.buy) * trade.quantity
+    
+    # Calculate tax for the whole quantity
+    total_ea_tax = ea_tax * trade.quantity
+
+    if trade.buy >= trade.sell:
+        raise HTTPException(status_code=400, detail="Buy price must be less than sell price")
+
+    try:
+        await db.execute(
+            """
+            INSERT INTO trades (
+                user_id, player, version, buy, sell, quantity,
+                platform, profit, ea_tax, tag, notes, timestamp, trade_id
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            """,
+            user_id,
+            trade.player.strip(),
+            trade.version,
+            trade.buy,
+            trade.sell,
+            trade.quantity,
+            trade.platform,
+            profit,
+            total_ea_tax,
+            trade.tag or None,
+            trade.notes or None,
+            datetime.utcnow(),
+            trade.trade_id
+        )
+        
+        return {
+            "ok": True, 
+            "message": "Trade added successfully",
+            "profit": profit,
+            "ea_tax": total_ea_tax,
+            "trade_id": trade.trade_id
+        }
+    except Exception as e:
+        import logging
+        logging.error(f"Add trade error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to add trade: {str(e)}")
+
+@router.delete("/{trade_id}")
+async def delete_trade(
+    request: Request,
+    trade_id: int,
+    db=Depends(get_db)
+):
+    """
+    Delete a trade by ID
+    """
+    ent = await compute_entitlements(request)
+    user_id = ent.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+        
+    try:
+        result = await db.execute(
+            "DELETE FROM trades WHERE user_id=$1 AND trade_id=$2",
+            user_id, trade_id
+        )
+        
+        # result is like "DELETE 1"
+        if result == "DELETE 0":
+             raise HTTPException(status_code=404, detail="Trade not found")
+             
+        return {"ok": True, "message": "Trade deleted"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        import logging
+        logging.error(f"Delete trade error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete trade: {str(e)}")
+
 class BulkTradesRequest(BaseModel):
     trades: List[TradeItem] = Field(..., min_items=1, max_items=100)
 
