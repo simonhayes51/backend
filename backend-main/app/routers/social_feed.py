@@ -343,9 +343,13 @@ async def get_feed(
     try:
         user = get_current_user(request)
         user_id = user["id"]
+        username = user.get("username")
+        is_admin = username == "whatthefut#0"
         is_authenticated = True
     except HTTPException:
         user_id = None
+        username = None
+        is_admin = False
         is_authenticated = False
 
     try:
@@ -371,7 +375,7 @@ async def get_feed(
             param_idx += 1
 
         # Filter by subscriptions if authenticated and not viewing a specific trader
-        if is_authenticated and not trader_id and feed_type != "all":
+        if is_authenticated and not is_admin and not trader_id and feed_type != "all":
             conditions.append(f"""
                 sp.user_id IN (
                     SELECT trader_id FROM trader_subscriptions
@@ -382,7 +386,7 @@ async def get_feed(
             param_idx += 1
 
         # Only show non-premium posts or posts from traders user is subscribed to
-        if is_authenticated:
+        if is_authenticated and not is_admin:
             conditions.append(f"""
                 (sp.is_premium = FALSE OR sp.user_id IN (
                     SELECT trader_id FROM trader_subscriptions
@@ -574,9 +578,13 @@ async def get_post(
     try:
         user = get_current_user(request)
         user_id = user["id"]
+        username = user.get("username")
+        is_admin = username == "whatthefut#0"
         is_authenticated = True
     except HTTPException:
         user_id = None
+        username = None
+        is_admin = False
         is_authenticated = False
 
     query = """
@@ -605,7 +613,7 @@ async def get_post(
     is_author = is_authenticated and user_id == post_dict["user_id"]
 
     # Check if content is restricted
-    if (post_dict.get("is_premium") or post_dict.get("requires_purchase")) and not is_author:
+    if (post_dict.get("is_premium") or post_dict.get("requires_purchase")) and not is_author and not is_admin:
         if not is_authenticated:
             # Not logged in
             if post_dict.get("requires_purchase"):
