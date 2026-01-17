@@ -42,6 +42,7 @@ from app.routers.smart_buy import router as smart_buy_router
 from app.routers.trade_finder import router as trade_finder_router
 from app.routers.auth_me import router as auth_me_router
 from app.routers.auth_email import router as auth_email_router
+from app.routers.admin_traders import router as admin_traders_router
 from app.routers.trending import router as trending_router
 from discord_manager import discord_manager
 from app.routers.market import router as market_router
@@ -1449,6 +1450,7 @@ async def ext_add_trade(
 # ---- Router wiring (single, final) ----
 app.include_router(auth_me_router)          # /api/auth/me
 app.include_router(auth_email_router)       # /api/auth/email/*
+app.include_router(admin_traders_router)    # /api/admin/*
 app.include_router(trade_finder_router)     # /api/trade-finder...
 app.include_router(ext_router)              # /ext/...
 
@@ -1599,25 +1601,10 @@ async def callback(request: Request):
         if state:
             OAUTH_STATE.pop(state, None)
 
-        # Discord OAuth user id (snowflake)
         discord_id = int(user_id)
 
-        # CHECK MEMBERSHIP BEFORE SETTING SESSION DATA
-        print(f"🔍 Checking membership for discord_id {discord_id}")
-        is_member = await check_server_membership(discord_id)
-        print(f"🔍 Membership result: {is_member}")
+        print(f"✅ Discord OAuth successful for user {discord_id}, skipping guild membership check")
 
-        if not is_member:
-            print(f"❌ Discord user {discord_id} is NOT a member - clearing session")
-            request.session.clear()
-            print(f"🔍 Redirecting to: {FRONTEND_URL}/#/access-denied")
-            return RedirectResponse(f"{FRONTEND_URL}/#/access-denied")
-
-        
-        print(f"✅ Discord user {discord_id} is a member - proceeding with login")
-
-
-        # ONLY set session data for verified members
         username = user_data.get("global_name") or user_data.get("username") or "User"
         avatar_url = (
             f"https://cdn.discordapp.com/avatars/{user_id}/{user_data['avatar']}.png"

@@ -374,7 +374,7 @@ async def get_feed(
             params.append("prediction")
             param_idx += 1
 
-        # Filter by subscriptions if authenticated and not viewing a specific trader
+        # Filter by subscriptions if authenticated (non-admin) and not viewing a specific trader
         if is_authenticated and not is_admin and not trader_id and feed_type != "all":
             conditions.append(f"""
                 sp.user_id IN (
@@ -386,17 +386,25 @@ async def get_feed(
             param_idx += 1
 
         # Only show non-premium posts or posts from traders user is subscribed to
-        if is_authenticated and not is_admin:
+        # - Unauthenticated users: only free posts
+        # - Authenticated non-admin: free posts, own premium posts, and premium posts
+        #   from traders they are subscribed to
+        # - Admin: no restriction (can see all posts)
+        if not is_authenticated:
+            conditions.append("sp.is_premium = FALSE")
+        elif not is_admin:
             conditions.append(f"""
-                (sp.is_premium = FALSE OR sp.user_id IN (
-                    SELECT trader_id FROM trader_subscriptions
-                    WHERE subscriber_id = ${param_idx} AND is_active = TRUE
-                ))
+                (
+                    sp.is_premium = FALSE
+                    OR sp.user_id = ${param_idx}
+                    OR sp.user_id IN (
+                        SELECT trader_id FROM trader_subscriptions
+                        WHERE subscriber_id = ${param_idx} AND is_active = TRUE
+                    )
+                )
             """)
             params.append(user_id)
             param_idx += 1
-        else:
-            conditions.append("sp.is_premium = FALSE")
 
         # Don't show expired posts
         conditions.append("(sp.expires_at IS NULL OR sp.expires_at > NOW())")
