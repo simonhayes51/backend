@@ -1525,6 +1525,7 @@ async def login():
     OAUTH_STATE[state] = {"flow": "dashboard", "ts": time.time()}
     params = {
         "client_id": DISCORD_CLIENT_ID,
+        "redirect_uri": DISCORD_REDIRECT_URI,
         "response_type": "code",
         "scope": "identify",
         "state": state,
@@ -1772,6 +1773,7 @@ async def oauth_start(redirect_uri: str):
     params = {
         "client_id": DISCORD_CLIENT_ID,
         "response_type": "code",
+        "redirect_uri": DISCORD_REDIRECT_URI,
         "scope": "identify",
         "state": state,
         "prompt": "consent",
