@@ -1516,7 +1516,11 @@ async def admin_debug(request: Request):
     return {
         "user": user,
         "admin_routes": routes,
-        "session_keys": list(request.session.keys()) if request.session else []
+        "session_keys": list(request.session.keys()) if request.session else [],
+        "discord_oauth_config": {
+            "client_id": DISCORD_CLIENT_ID,
+            "redirect_uri": DISCORD_REDIRECT_URI,
+        },
     }
 
 @app.get("/api/login")
@@ -1599,7 +1603,6 @@ async def callback(request: Request):
             raise HTTPException(400, detail="Failed to fetch user data")
         user_id = user_data["id"]
 
-        # Handle extension flow (non-dashboard OAuth)
         if state and state in OAUTH_STATE and OAUTH_STATE.get(state, {}).get("flow") != "dashboard":
             meta = OAUTH_STATE.pop(state, None) or {}
             jwt_token = issue_extension_token(user_id)
@@ -1611,26 +1614,11 @@ async def callback(request: Request):
         if state:
             OAUTH_STATE.pop(state, None)
 
-        # Discord OAuth user id (snowflake)
-        discord_id = int(user_id)
-
-        # CHECK MEMBERSHIP BEFORE SETTING SESSION DATA
-        print(f"🔍 Checking membership for discord_id {discord_id}")
-        is_member = await check_server_membership(discord_id)
-        print(f"🔍 Membership result: {is_member}")
-
+        is_member = await check_server_membership(user_id)
         if not is_member:
-            print(f"❌ Discord user {discord_id} is NOT a member - clearing session")
-            request.session.clear()
-            print(f"🔍 Redirecting to: {FRONTEND_URL}/#/access-denied")
-            return RedirectResponse(f"{FRONTEND_URL}/#/access-denied")
+            return RedirectResponse(f"{FRONTEND_URL}/access-denied")
 
-        
-        print(f"✅ Discord user {discord_id} is a member - proceeding with login")
-
-
-        # ONLY set session data for verified members
-        username = user_data.get("global_name") or user_data.get("username") or "User"
+        username = f"{user_data.get('username','user')}#{user_data.get('discriminator', '0000')}"
         avatar_url = (
             f"https://cdn.discordapp.com/avatars/{user_id}/{user_data['avatar']}.png"
             if user_data.get('avatar')
@@ -1638,96 +1626,13 @@ async def callback(request: Request):
         )
         global_name = user_data.get('global_name') or user_data.get('username') or "User"
 
-        # Store user profile in database (if table exists)
-        # Removed redundant and unsafe DB block here
-        
-        # discord_user_id is the snowflake you already have in `user_id` here
-        discord_user_id = int(user_id)
-        
-        # --- Upsert user + profile, then set session ---
-        user_row = None
-        app_user_id = str(discord_id)
-        try:
-            async with request.app.state.pool.acquire() as conn:
-                # Ensure users row exists (core DB uses TEXT ids; simplest is discord_id as string id)
-                user_row = await conn.fetchrow(
-                    """
-                    INSERT INTO public.users (id, discord_id, username, avatar_url)
-                    VALUES ($1, $2, $3, $4)
-                    ON CONFLICT (discord_id) DO UPDATE SET 
-                        discord_id = EXCLUDED.discord_id,
-                        username = EXCLUDED.username,
-                        avatar_url = EXCLUDED.avatar_url
-                    RETURNING id, discord_id, tier, plan, premium_until, roles
-                    """,
-                    str(discord_id),   # users.id is TEXT
-                    discord_id,        # users.discord_id is BIGINT
-                    username,          # Add username
-                    avatar_url         # Add avatar_url
-                )
-
-                app_user_id = str(user_row["id"])
-
-                # Upsert user profile (user_profiles.user_id is VARCHAR in your core DB)
-                if await _table_exists(conn, "user_profiles"):
-                    await conn.execute(
-                        """
-                        INSERT INTO public.user_profiles (user_id, username, avatar_url, global_name, updated_at)
-                        VALUES ($1, $2, $3, $4, NOW())
-                        ON CONFLICT (user_id) DO UPDATE SET
-                            username = EXCLUDED.username,
-                            avatar_url = EXCLUDED.avatar_url,
-                            global_name = EXCLUDED.global_name,
-                            updated_at = NOW()
-                        """,
-                        app_user_id, username, avatar_url, global_name
-                    )
-        except Exception as exc:
-            logging.warning("User upsert failed; proceeding with session-only login: %s", exc)
-
-        # Parse roles from DB
-        db_roles = []
-        if user_row and user_row.get("roles"):
-            db_roles = user_row["roles"]
-            if isinstance(db_roles, str):
-                import json
-                try:
-                    db_roles = json.loads(db_roles)
-                except:
-                    db_roles = []
-        
-        # Determine primary role (admin takes precedence)
-        user_role = "admin" if "admin" in db_roles else "user"
-
-        # Check for hardcoded admin ID
-        ADMIN_DISCORD_IDS = ["236952702737678337"]
-        if str(discord_id) in ADMIN_DISCORD_IDS:
-            user_role = "admin"
-
-        # Session
-        request.session["user_id"] = app_user_id
-        request.session["discord_id"] = discord_id
+        request.session["user_id"] = user_id
         request.session["username"] = username
         request.session["avatar_url"] = avatar_url
         request.session["global_name"] = global_name
-        request.session["user"] = {
-            "id": app_user_id,
-            "discord_id": discord_id,
-            "username": username,
-            "avatar_url": avatar_url,
-            "global_name": global_name,
-            "role": user_role,
-            "tier": (user_row.get("tier") if isinstance(user_row, dict) else user_row["tier"])
-            if user_row
-            else None,
-        }
+        request.session["roles"] = await get_member_role_names(user_id)
 
-        # Discord roles lookup uses discord_id
-        request.session["roles"] = await get_member_role_names(discord_id)
-
-        return RedirectResponse(f"{FRONTEND_URL}/#/")
-
-
+        return RedirectResponse(f"{FRONTEND_URL}/auth/done")
 
     except HTTPException:
         raise
