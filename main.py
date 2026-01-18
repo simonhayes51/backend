@@ -42,6 +42,7 @@ from app.routers.smart_buy import router as smart_buy_router
 from app.routers.trade_finder import router as trade_finder_router
 from app.routers.auth_me import router as auth_me_router
 from app.routers.auth_email import router as auth_email_router
+from app.routers.admin_traders import router as admin_traders_router
 from app.routers.trending import router as trending_router
 from discord_manager import discord_manager
 from app.routers.market import router as market_router
@@ -54,7 +55,8 @@ from app.services.futgg_history import fetch_futgg_history
 from app.routers.portfolio import router as portfolio_router
 from app.routers.leaderboard import router as leaderboard_router
 from app.routers.referrals import router as referrals_router
-from app.routers.trades import router as trades_router
+from app.routers.traders import router as traders_router
+from app.routers.admin_traders import router as admin_traders_router
 from app.routers.social_feed import router as social_feed_router
 from app.routers.social_feed import social_router as social_feed_social_router
 from app.routers.subscriptions import router as subscriptions_router
@@ -1449,6 +1451,7 @@ async def ext_add_trade(
 # ---- Router wiring (single, final) ----
 app.include_router(auth_me_router)          # /api/auth/me
 app.include_router(auth_email_router)       # /api/auth/email/*
+app.include_router(admin_traders_router)    # /api/admin/*
 app.include_router(trade_finder_router)     # /api/trade-finder...
 app.include_router(ext_router)              # /ext/...
 
@@ -1506,6 +1509,16 @@ async def health_check(request: Request):
         return {"status": "healthy", "database": "connected"}
     except Exception as e:
         return {"status": "unhealthy", "database": "disconnected", "error": str(e)}
+
+@app.get("/api/admin-debug")
+async def admin_debug(request: Request):
+    user = (request.session or {}).get("user")
+    routes = [{"path": route.path, "name": route.name} for route in app.routes if "admin" in str(route.path)]
+    return {
+        "user": user,
+        "admin_routes": routes,
+        "session_keys": list(request.session.keys()) if request.session else []
+    }
 
 @app.get("/api/login")
 async def login():
@@ -1687,6 +1700,20 @@ async def callback(request: Request):
         except Exception as exc:
             logging.warning("User upsert failed; proceeding with session-only login: %s", exc)
 
+        # Parse roles from DB
+        db_roles = []
+        if user_row and user_row.get("roles"):
+            db_roles = user_row["roles"]
+            if isinstance(db_roles, str):
+                import json
+                try:
+                    db_roles = json.loads(db_roles)
+                except:
+                    db_roles = []
+        
+        # Determine primary role (admin takes precedence)
+        user_role = "admin" if "admin" in db_roles else "user"
+
         # Session
         request.session["user_id"] = app_user_id
         request.session["discord_id"] = discord_id
@@ -1699,6 +1726,7 @@ async def callback(request: Request):
             "username": username,
             "avatar_url": avatar_url,
             "global_name": global_name,
+            "role": user_role,
             "tier": (user_row.get("tier") if isinstance(user_row, dict) else user_row["tier"])
             if user_row
             else None,
@@ -2908,16 +2936,17 @@ async def update_user_settings(
         await conn.execute(
             """
             INSERT INTO usersettings (
-                user_id, default_platform, custom_tags, currency_format, theme,
+                user_id, default_platform, custom_tags, currency_format, currency, theme,
                 timezone, date_format, include_tax_in_profit, default_chart_range,
                 visible_widgets, created_at, updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), NOW())
             ON CONFLICT (user_id)
             DO UPDATE SET
                 default_platform     = EXCLUDED.default_platform,
                 custom_tags          = EXCLUDED.custom_tags,
                 currency_format      = EXCLUDED.currency_format,
+                currency             = EXCLUDED.currency,
                 theme                = EXCLUDED.theme,
                 timezone             = EXCLUDED.timezone,
                 date_format          = EXCLUDED.date_format,
@@ -2930,6 +2959,7 @@ async def update_user_settings(
             settings.default_platform,
             json.dumps(settings.custom_tags),
             settings.currency_format,
+            settings.currency,
             settings.theme,
             settings.timezone,
             settings.date_format,

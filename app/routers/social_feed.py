@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 import asyncpg
 from asyncpg import exceptions as asyncpg_exceptions
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, AliasChoices
 
 from app.models.social import (
     SocialPostCreate,
@@ -65,11 +65,16 @@ class FeedPostCreatePayload(BaseModel):
     sell_target: Optional[Decimal] = None
     sell_at: Optional[datetime] = None
     confidence_level: Optional[int] = Field(None, ge=1, le=100)
-    premium: bool = False  # Subscriber-only content
+    premium: bool = Field(
+        False,
+        validation_alias=AliasChoices("premium", "is_premium"),
+        description="Subscriber-only content",
+    )
     requires_purchase: bool = False  # One-off purchase content
     price: Optional[Decimal] = Field(None, ge=0)  # Price for one-off purchase
     expires_in_hours: Optional[int] = None
     image_url: Optional[str] = None  # Add image_url field
+    image_urls: Optional[List[str]] = None  # Add image_urls field
     tags: Optional[List[str]] = None  # Add tags field
 
 
@@ -90,6 +95,7 @@ class FeedPostUpdatePayload(BaseModel):
     price: Optional[Decimal] = Field(None, ge=0)
     expires_in_hours: Optional[int] = None
     image_url: Optional[str] = None
+    image_urls: Optional[List[str]] = None
     tags: Optional[List[str]] = None
 
 
@@ -209,6 +215,7 @@ async def create_post(
     has_title = await column_exists(db, "social_posts", "title")
     has_sell_at = await column_exists(db, "social_posts", "sell_at")
     has_image_url = await column_exists(db, "social_posts", "image_url")
+    has_image_urls = await column_exists(db, "social_posts", "image_urls")
     has_requires_purchase = await column_exists(db, "social_posts", "requires_purchase")
     has_price = await column_exists(db, "social_posts", "price")
 
@@ -253,6 +260,10 @@ async def create_post(
         columns.append("image_url")
         values.append(post.image_url)
 
+    if has_image_urls:
+        columns.append("image_urls")
+        values.append(post.image_urls)
+
     if has_requires_purchase:
         columns.append("requires_purchase")
         values.append(post.requires_purchase)
@@ -295,6 +306,8 @@ async def create_post_root(
         sell_at=payload.sell_at,
         confidence_level=payload.confidence_level,
         is_premium=payload.premium,
+        requires_purchase=payload.requires_purchase,
+        price=payload.price,
         expires_at=_expires_at_from_hours(payload.expires_in_hours),
         image_url=payload.image_url,  # Pass image_url
         tags=payload.tags or [],  # Pass tags
@@ -381,16 +394,20 @@ async def get_feed(
             params.append(user_id)
             param_idx += 1
 
-        # Only show non-premium posts or posts from traders user is subscribed to
+        # Only show non-premium posts, posts authored by the user, or posts from traders the user is subscribed to
         if is_authenticated:
-            conditions.append(f"""
-                (sp.is_premium = FALSE OR sp.user_id IN (
-                    SELECT trader_id FROM trader_subscriptions
-                    WHERE subscriber_id = ${param_idx} AND is_active = TRUE
-                ))
-            """)
-            params.append(user_id)
-            param_idx += 1
+            # Admins can see all premium posts
+            is_admin = user.get("role") == "admin"
+            
+            if not is_admin:
+                conditions.append(f"""
+                    (sp.is_premium = FALSE OR sp.user_id = ${param_idx} OR sp.user_id IN (
+                        SELECT trader_id FROM trader_subscriptions
+                        WHERE subscriber_id = ${param_idx} AND is_active = TRUE
+                    ))
+                """)
+                params.append(user_id)
+                param_idx += 1
         else:
             conditions.append("sp.is_premium = FALSE")
 
@@ -693,7 +710,7 @@ async def update_post(
     updates = []
     params = []
     param_idx = 1
-    allowed_post_types = ["quick_flip", "prediction", "tip", "analysis"]
+    allowed_post_types = ["quick_flip", "prediction", "tip", "analysis", "status"]
     has_title = await column_exists(db, "social_posts", "title")
     has_sell_at = await column_exists(db, "social_posts", "sell_at")
     has_image_url = await column_exists(db, "social_posts", "image_url")
@@ -773,6 +790,11 @@ async def update_post(
     if post_update.image_url is not None and has_image_url:
         updates.append(f"image_url = ${param_idx}")
         params.append(post_update.image_url)
+        param_idx += 1
+
+    if post_update.image_urls is not None and has_image_urls:
+        updates.append(f"image_urls = ${param_idx}")
+        params.append(post_update.image_urls)
         param_idx += 1
 
     if post_update.is_premium is not None:
