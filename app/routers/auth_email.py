@@ -74,13 +74,39 @@ async def register(user: UserRegister, request: Request, db: asyncpg.Connection 
         user.username,
     )
 
-    return {"success": True, "message": "Registered successfully. Please login."}
+    request.session["user_id"] = user_id
+    request.session["username"] = user.username
+    request.session["avatar_url"] = None
+    request.session["global_name"] = user.username
+
+    request.session["user"] = {
+        "id": user_id,
+        "username": user.username,
+        "avatar_url": None,
+        "global_name": user.username,
+        "tier": None,
+        "account_type": "user",
+    }
+
+    return {"success": True, "user_id": user_id}
 
 
 @router.post("/login")
 async def login(user: UserLogin, request: Request, db: asyncpg.Connection = Depends(get_db)):
     row = await db.fetchrow(
-        "SELECT id, password_hash, account_type FROM users WHERE email = $1",
+        """
+        SELECT 
+            u.id,
+            u.password_hash,
+            u.account_type,
+            u.tier,
+            up.username,
+            up.avatar_url,
+            up.global_name
+        FROM users u
+        LEFT JOIN user_profiles up ON up.user_id = u.id
+        WHERE u.email = $1
+        """,
         user.email,
     )
 
@@ -88,6 +114,17 @@ async def login(user: UserLogin, request: Request, db: asyncpg.Connection = Depe
         raise HTTPException(400, "Invalid email or password")
 
     request.session["user_id"] = row["id"]
-    request.session["user"] = {"id": row["id"], "account_type": row["account_type"]}
+    request.session["username"] = row["username"]
+    request.session["avatar_url"] = row["avatar_url"]
+    request.session["global_name"] = row["global_name"]
+
+    request.session["user"] = {
+        "id": row["id"],
+        "username": row["username"],
+        "avatar_url": row["avatar_url"],
+        "global_name": row["global_name"],
+        "tier": row["tier"],
+        "account_type": row["account_type"],
+    }
 
     return {"success": True, "user_id": row["id"]}
