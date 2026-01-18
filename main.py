@@ -1570,12 +1570,17 @@ async def callback(request: Request):
     if not code:
         raise HTTPException(status_code=400, detail="Missing code")
 
+    if not (DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET):
+        logging.error("Discord OAuth is not configured: missing client id/secret.")
+        raise HTTPException(status_code=500, detail="Discord OAuth is not configured")
+
+    redirect_uri = DISCORD_REDIRECT_URI or str(request.url.replace(query=""))
     data = {
         "client_id": DISCORD_CLIENT_ID,
         "client_secret": DISCORD_CLIENT_SECRET,
         "grant_type": "authorization_code",
         "code": code,
-        "redirect_uri": DISCORD_REDIRECT_URI,
+        "redirect_uri": redirect_uri,
     }
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
 
@@ -1584,9 +1589,19 @@ async def callback(request: Request):
             async with session.post(DISCORD_OAUTH_TOKEN, data=data, headers=headers) as resp:
                 txt = await resp.text()
                 if resp.status != 200:
-                    logging.error("Discord token exchange failed (%s): %s", resp.status, txt[:500])
-                    raise HTTPException(400, detail=f"OAuth token exchange failed: {txt}")
-                token_data = json.loads(txt)
+                    logging.error(
+                        "Discord token exchange failed (%s): %s", resp.status, txt[:500]
+                    )
+                    raise HTTPException(
+                        status_code=400, detail="OAuth token exchange failed"
+                    )
+                try:
+                    token_data = json.loads(txt)
+                except json.JSONDecodeError:
+                    logging.error("Discord token response was not JSON: %s", txt[:500])
+                    raise HTTPException(
+                        status_code=400, detail="Invalid token response from Discord"
+                    )
 
         access_token = token_data.get("access_token")
         if not access_token:
