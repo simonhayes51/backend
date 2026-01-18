@@ -107,8 +107,6 @@ def _expires_at_from_hours(expires_in_hours: Optional[int]) -> Optional[datetime
 
 def _format_post(row: dict) -> dict:
     post = dict(row)
-    if post.get("is_author"):
-        post["can_view"] = True
     author_snapshot = {
         "id": post.get("user_id"),
         "trader_id": str(post.get("user_id")) if post.get("user_id") is not None else None,
