@@ -1632,6 +1632,14 @@ async def callback(request: Request):
         request.session["avatar_url"] = avatar_url
         request.session["global_name"] = global_name
         request.session["roles"] = await get_member_role_names(user_id)
+        request.session["user"] = {
+            "id": user_id,
+            "discord_id": int(user_id),
+            "username": username,
+            "avatar_url": avatar_url,
+            "global_name": global_name,
+            "role": "user",
+        }
 
         return RedirectResponse(f"{FRONTEND_URL}/auth/done")
 
