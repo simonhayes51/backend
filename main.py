@@ -1516,7 +1516,11 @@ async def admin_debug(request: Request):
     return {
         "user": user,
         "admin_routes": routes,
-        "session_keys": list(request.session.keys()) if request.session else []
+        "session_keys": list(request.session.keys()) if request.session else [],
+        "discord_oauth_config": {
+            "client_id": DISCORD_CLIENT_ID,
+            "redirect_uri": DISCORD_REDIRECT_URI,
+        },
     }
 
 @app.get("/api/login")
