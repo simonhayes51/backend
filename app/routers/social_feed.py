@@ -492,7 +492,9 @@ async def get_feed(
     for row in rows:
         post_dict = dict(row)
 
-        # Get user's reaction to this post if authenticated
+        if is_authenticated and post_dict.get("is_author"):
+            post_dict["can_view"] = True
+
         if can_read_reactions:
             reaction = await db.fetchval(
                 "SELECT reaction_type FROM post_reactions WHERE user_id = $1 AND post_id = $2",
