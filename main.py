@@ -110,6 +110,11 @@ DISCORD_OAUTH_TOKEN = "https://discord.com/api/oauth2/token"
 DISCORD_USERS_ME = "https://discord.com/api/users/@me"
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 DISCORD_SERVER_ID = os.getenv("DISCORD_SERVER_ID")
+ADMIN_DISCORD_IDS = {
+    s.strip()
+    for s in (os.getenv("ADMIN_DISCORD_IDS") or "").split(",")
+    if s.strip()
+}
 
 # Stripe
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
@@ -1628,17 +1633,35 @@ async def callback(request: Request):
         global_name = display_name
 
         request.session["user_id"] = user_id
+        request.session["discord_id"] = int(user_id)
         request.session["username"] = username
         request.session["avatar_url"] = avatar_url
         request.session["global_name"] = global_name
         request.session["roles"] = await get_member_role_names(user_id)
+
+        account_type = "user"
+        try:
+            if hasattr(app.state, "pool") and app.state.pool is not None:
+                async with app.state.pool.acquire() as conn:
+                    account_type_value = await conn.fetchval(
+                        "SELECT account_type FROM users WHERE discord_id = $1",
+                        int(user_id),
+                    )
+                    if account_type_value:
+                        account_type = account_type_value
+        except Exception:
+            account_type = "user"
+
+        is_admin = str(user_id) in ADMIN_DISCORD_IDS or account_type == "admin"
+
         request.session["user"] = {
             "id": user_id,
             "discord_id": int(user_id),
             "username": username,
             "avatar_url": avatar_url,
             "global_name": global_name,
-            "role": "user",
+            "role": "admin" if is_admin else "user",
+            "account_type": account_type,
         }
 
         return RedirectResponse(f"{FRONTEND_URL}/auth/done")

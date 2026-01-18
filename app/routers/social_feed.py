@@ -386,10 +386,10 @@ async def get_feed(
         # Filter by subscriptions if authenticated and not viewing a specific trader
         if is_authenticated and not trader_id and feed_type != "all":
             conditions.append(f"""
-                sp.user_id IN (
+                (sp.user_id = ${param_idx} OR sp.user_id IN (
                     SELECT trader_id FROM trader_subscriptions
                     WHERE subscriber_id = ${param_idx} AND is_active = TRUE
-                )
+                ))
             """)
             params.append(user_id)
             param_idx += 1
@@ -492,7 +492,9 @@ async def get_feed(
     for row in rows:
         post_dict = dict(row)
 
-        # Get user's reaction to this post if authenticated
+        if is_authenticated and post_dict.get("is_author"):
+            post_dict["can_view"] = True
+
         if can_read_reactions:
             reaction = await db.fetchval(
                 "SELECT reaction_type FROM post_reactions WHERE user_id = $1 AND post_id = $2",
