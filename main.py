@@ -1664,6 +1664,9 @@ async def callback(request: Request):
                     avatar_url         # Add avatar_url
                 )
 
+                if user_row:
+                    user_row = dict(user_row)
+
                 app_user_id = str(user_row["id"])
 
                 # Upsert user profile (user_profiles.user_id is VARCHAR in your core DB)
