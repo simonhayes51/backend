@@ -1525,7 +1525,6 @@ async def login():
     OAUTH_STATE[state] = {"flow": "dashboard", "ts": time.time()}
     params = {
         "client_id": DISCORD_CLIENT_ID,
-        "redirect_uri": DISCORD_REDIRECT_URI,
         "response_type": "code",
         "scope": "identify",
         "state": state,
@@ -1575,7 +1574,6 @@ async def callback(request: Request):
         "client_secret": DISCORD_CLIENT_SECRET,
         "grant_type": "authorization_code",
         "code": code,
-        "redirect_uri": DISCORD_REDIRECT_URI,
     }
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
 
@@ -1755,7 +1753,6 @@ async def oauth_start(redirect_uri: str):
     params = {
         "client_id": DISCORD_CLIENT_ID,
         "response_type": "code",
-        "redirect_uri": DISCORD_REDIRECT_URI,
         "scope": "identify",
         "state": state,
         "prompt": "consent",
