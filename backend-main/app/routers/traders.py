@@ -50,8 +50,8 @@ async def upgrade_to_trader(
         if existing:
             raise HTTPException(status_code=400, detail="Already a trader")
 
-    # Update user account type
-    await db.execute("UPDATE users SET account_type = 'trader' WHERE id = $1", user_id)
+    # Update user account type - MOVED TO ADMIN APPROVAL
+    # await db.execute("UPDATE users SET account_type = 'trader' WHERE id = $1", user_id)
 
     # Create trader profile
     query = """
@@ -555,6 +555,8 @@ async def browse_traders(
     request: Request,
     specialty: Optional[str] = None,
     search: Optional[str] = None,
+    verified: Optional[bool] = None,
+    sort: Optional[str] = "followers",
     limit: int = 20,
     offset: int = 0,
     db: asyncpg.Connection = Depends(get_db)
@@ -574,6 +576,21 @@ async def browse_traders(
         params.append(f"%{search}%")
         where_clauses.append(f"(up.username ILIKE ${param_idx} OR tp.bio ILIKE ${param_idx})")
 
+    if verified is not None:
+        # If verified is requested, filter by it. 
+        # Note: Frontend currently sends verified=true for trending.
+        if verified:
+            where_clauses.append("tp.verified = TRUE")
+        else:
+            where_clauses.append("tp.verified = FALSE")
+
+    # Sort logic
+    order_by = "tp.total_followers DESC"
+    if sort == "rating":
+        order_by = "tp.avg_rating DESC NULLS LAST, tp.total_followers DESC"
+    elif sort == "newest":
+        order_by = "u.created_at DESC"
+
     # Pagination
     limit_idx = len(params) + 1
     params.append(limit)
@@ -590,7 +607,7 @@ async def browse_traders(
         JOIN users u ON tp.user_id = u.id
         LEFT JOIN user_profiles up ON tp.user_id = up.user_id
         WHERE {' AND '.join(where_clauses)}
-        ORDER BY tp.total_followers DESC
+        ORDER BY {order_by}
         LIMIT ${limit_idx} OFFSET ${offset_idx}
     """
     

@@ -12,6 +12,10 @@ def get_admin_user(request: Request) -> dict:
   return user
 
 
+@router.get("/ping")
+async def ping_admin():
+  return {"message": "Admin router is working"}
+
 @router.get("/pending-traders")
 async def get_pending_traders(
   request: Request,
@@ -45,6 +49,17 @@ async def approve_trader(
     """,
     trader_id,
   )
+  
+  # Also update the user's account_type to 'trader'
+  await db.execute(
+    """
+    UPDATE users
+    SET account_type = 'trader'
+    WHERE id = $1
+    """,
+    trader_id
+  )
+
   if result == "UPDATE 0":
     raise HTTPException(status_code=404, detail="Trader profile not found")
   return {"success": True}
