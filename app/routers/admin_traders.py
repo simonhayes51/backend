@@ -6,9 +6,25 @@ router = APIRouter(prefix="/api/admin", tags=["Admin"])
 
 
 def get_admin_user(request: Request) -> dict:
-  user = (request.session or {}).get("user") or {}
-  if not user or user.get("role") != "admin":
+  session = request.session or {}
+  user = session.get("user") or {}
+  roles = session.get("roles") or []
+
+  is_admin = False
+  if user.get("role") == "admin" or user.get("is_admin"):
+    is_admin = True
+  else:
+    role_names = [str(r).lower() for r in roles]
+    if any("admin" in name for name in role_names):
+      is_admin = True
+
+  if not user or not is_admin:
     raise HTTPException(status_code=403, detail="Admin access required")
+
+  if is_admin and not user.get("role"):
+    user["role"] = "admin"
+    session["user"] = user
+
   return user
 
 
@@ -82,4 +98,3 @@ async def reject_trader(
   if result == "DELETE 0":
     raise HTTPException(status_code=404, detail="Trader profile not found or already verified")
   return {"success": True}
-
