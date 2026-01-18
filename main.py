@@ -55,6 +55,7 @@ from app.services.futgg_history import fetch_futgg_history
 from app.routers.portfolio import router as portfolio_router
 from app.routers.leaderboard import router as leaderboard_router
 from app.routers.referrals import router as referrals_router
+from app.routers.trades import router as trades_router
 from app.routers.traders import router as traders_router
 from app.routers.admin_traders import router as admin_traders_router
 from app.routers.social_feed import router as social_feed_router
