@@ -1618,13 +1618,14 @@ async def callback(request: Request):
         if not is_member:
             return RedirectResponse(f"{FRONTEND_URL}/access-denied")
 
-        username = f"{user_data.get('username','user')}#{user_data.get('discriminator', '0000')}"
+        display_name = user_data.get("global_name") or user_data.get("username") or "User"
+        username = display_name
         avatar_url = (
             f"https://cdn.discordapp.com/avatars/{user_id}/{user_data['avatar']}.png"
             if user_data.get('avatar')
             else f"https://cdn.discordapp.com/embed/avatars/{int(user_data.get('discriminator','0') or 0) % 5}.png"
         )
-        global_name = user_data.get('global_name') or user_data.get('username') or "User"
+        global_name = display_name
 
         request.session["user_id"] = user_id
         request.session["username"] = username
