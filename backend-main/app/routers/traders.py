@@ -15,6 +15,11 @@ from app.models.social import (
     TraderAnalytics
 )
 from app.db import get_db
+from app.routers.admin_traders import (
+    get_pending_traders as admin_get_pending_traders,
+    approve_trader as admin_approve_trader,
+    reject_trader as admin_reject_trader,
+)
 
 router = APIRouter(prefix="/api/traders", tags=["Traders"])
 
@@ -469,6 +474,32 @@ async def get_trader_earnings(
     ignore the range parameter and reuse get_trader_analytics.
     """
     return await get_trader_analytics(request, db)
+
+
+@router.get("/pending-traders")
+async def get_pending_traders_alias(
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db),
+):
+    return await admin_get_pending_traders(request=request, db=db)
+
+
+@router.post("/pending-traders/{trader_id}/approve")
+async def approve_trader_alias(
+    trader_id: str,
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db),
+):
+    return await admin_approve_trader(trader_id=trader_id, request=request, db=db)
+
+
+@router.post("/pending-traders/{trader_id}/reject")
+async def reject_trader_alias(
+    trader_id: str,
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db),
+):
+    return await admin_reject_trader(trader_id=trader_id, request=request, db=db)
 
 
 @router.get("/{trader_id}", response_model=TraderPublicProfile)
