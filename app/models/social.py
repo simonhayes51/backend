@@ -183,7 +183,7 @@ class SocialPostCreate(BaseModel):
     @field_validator("post_type")
     @classmethod
     def validate_post_type(cls, v):
-        allowed = {"quick_flip", "prediction", "tip", "analysis", "status"}
+        allowed = {"quick_flip", "prediction", "tip", "analysis"}
         if v not in allowed:
             raise ValueError(f"post_type must be one of {sorted(allowed)}")
         return v

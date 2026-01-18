@@ -56,7 +56,6 @@ from app.routers.portfolio import router as portfolio_router
 from app.routers.leaderboard import router as leaderboard_router
 from app.routers.referrals import router as referrals_router
 from app.routers.trades import router as trades_router
-from app.routers.traders import router as traders_router
 from app.routers.social_feed import router as social_feed_router
 from app.routers.social_feed import social_router as social_feed_social_router
 from app.routers.subscriptions import router as subscriptions_router
@@ -68,6 +67,7 @@ from app.routers.messaging import router as messaging_router
 from app.routers.messaging import social_router as messaging_social_router
 from app.routers.ratings import router as ratings_router
 from app.routers.ratings import social_router as ratings_social_router
+from app.routers.traders import router as traders_router
 from app.routers.notifications import router as notifications_router
 from app.routers.content_requests import router as content_requests_router
 from app.routers.content_purchases import router as content_purchases_router
@@ -110,11 +110,6 @@ DISCORD_OAUTH_TOKEN = "https://discord.com/api/oauth2/token"
 DISCORD_USERS_ME = "https://discord.com/api/users/@me"
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 DISCORD_SERVER_ID = os.getenv("DISCORD_SERVER_ID")
-ADMIN_DISCORD_IDS = {
-    s.strip()
-    for s in (os.getenv("ADMIN_DISCORD_IDS") or "").split(",")
-    if s.strip()
-}
 
 # Stripe
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
@@ -648,7 +643,8 @@ async def lifespan(app: FastAPI):
           id TEXT PRIMARY KEY,
           plan TEXT,
           premium_until TIMESTAMPTZ,
-          roles JSONB DEFAULT '[]'
+          roles JSONB DEFAULT '[]',
+          password_hash TEXT
         )""")
         await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS account_type VARCHAR(20) DEFAULT 'user'")
 
@@ -1055,6 +1051,9 @@ async def lifespan(app: FastAPI):
             """)
             await conn.execute("""
                 ALTER TABLE users ADD COLUMN IF NOT EXISTS email VARCHAR(255)
+            """)
+            await conn.execute("""
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT
             """)
             await conn.execute("""
                 ALTER TABLE users ADD COLUMN IF NOT EXISTS discord_id BIGINT
@@ -1514,20 +1513,6 @@ async def health_check(request: Request):
     except Exception as e:
         return {"status": "unhealthy", "database": "disconnected", "error": str(e)}
 
-@app.get("/api/admin-debug")
-async def admin_debug(request: Request):
-    user = (request.session or {}).get("user")
-    routes = [{"path": route.path, "name": route.name} for route in app.routes if "admin" in str(route.path)]
-    return {
-        "user": user,
-        "admin_routes": routes,
-        "session_keys": list(request.session.keys()) if request.session else [],
-        "discord_oauth_config": {
-            "client_id": DISCORD_CLIENT_ID,
-            "redirect_uri": DISCORD_REDIRECT_URI,
-        },
-    }
-
 @app.get("/api/login")
 async def login():
     state = secrets.token_urlsafe(24)
@@ -1608,6 +1593,7 @@ async def callback(request: Request):
             raise HTTPException(400, detail="Failed to fetch user data")
         user_id = user_data["id"]
 
+        # Handle extension flow (non-dashboard OAuth)
         if state and state in OAUTH_STATE and OAUTH_STATE.get(state, {}).get("flow") != "dashboard":
             meta = OAUTH_STATE.pop(state, None) or {}
             jwt_token = issue_extension_token(user_id)
@@ -1619,52 +1605,102 @@ async def callback(request: Request):
         if state:
             OAUTH_STATE.pop(state, None)
 
-        is_member = await check_server_membership(user_id)
-        if not is_member:
-            return RedirectResponse(f"{FRONTEND_URL}/access-denied")
+        discord_id = int(user_id)
 
-        display_name = user_data.get("global_name") or user_data.get("username") or "User"
-        username = display_name
+        print(f"✅ Discord OAuth successful for user {discord_id}, skipping guild membership check")
+
+        username = user_data.get("global_name") or user_data.get("username") or "User"
         avatar_url = (
             f"https://cdn.discordapp.com/avatars/{user_id}/{user_data['avatar']}.png"
             if user_data.get('avatar')
             else f"https://cdn.discordapp.com/embed/avatars/{int(user_data.get('discriminator','0') or 0) % 5}.png"
         )
-        global_name = display_name
+        global_name = user_data.get('global_name') or user_data.get('username') or "User"
 
-        request.session["user_id"] = user_id
-        request.session["discord_id"] = int(user_id)
+        # Store user profile in database (if table exists)
+        async with request.app.state.pool.acquire() as conn:
+            if await _table_exists(conn, "user_profiles"):
+                await conn.execute(
+                    """
+                    INSERT INTO user_profiles (user_id, username, avatar_url, global_name, updated_at)
+                    VALUES ($1, $2, $3, $4, NOW())
+                    ON CONFLICT (user_id) 
+                    DO UPDATE SET 
+                        username = EXCLUDED.username,
+                        avatar_url = EXCLUDED.avatar_url,
+                        global_name = EXCLUDED.global_name,
+                        updated_at = NOW()
+                    """,
+                    user_id, username, avatar_url, global_name
+                )
+
+               # discord_user_id is the snowflake you already have in `user_id` here
+        discord_user_id = int(user_id)
+        
+                        # --- Upsert user + profile, then set session ---
+        user_row = None
+        app_user_id = str(discord_id)
+        try:
+            async with request.app.state.pool.acquire() as conn:
+                # Ensure users row exists (core DB uses TEXT ids; simplest is discord_id as string id)
+                user_row = await conn.fetchrow(
+                    """
+                    INSERT INTO public.users (id, discord_id, username, avatar_url)
+                    VALUES ($1, $2, $3, $4)
+                    ON CONFLICT (discord_id) DO UPDATE SET 
+                        discord_id = EXCLUDED.discord_id,
+                        username = EXCLUDED.username,
+                        avatar_url = EXCLUDED.avatar_url
+                    RETURNING id, discord_id, tier, plan, premium_until, roles
+                    """,
+                    str(discord_id),   # users.id is TEXT
+                    discord_id,        # users.discord_id is BIGINT
+                    username,          # Add username
+                    avatar_url         # Add avatar_url
+                )
+
+                app_user_id = str(user_row["id"])
+
+                # Upsert user profile (user_profiles.user_id is VARCHAR in your core DB)
+                if await _table_exists(conn, "user_profiles"):
+                    await conn.execute(
+                        """
+                        INSERT INTO public.user_profiles (user_id, username, avatar_url, global_name, updated_at)
+                        VALUES ($1, $2, $3, $4, NOW())
+                        ON CONFLICT (user_id) DO UPDATE SET
+                            username = EXCLUDED.username,
+                            avatar_url = EXCLUDED.avatar_url,
+                            global_name = EXCLUDED.global_name,
+                            updated_at = NOW()
+                        """,
+                        app_user_id, username, avatar_url, global_name
+                    )
+        except Exception as exc:
+            logging.warning("User upsert failed; proceeding with session-only login: %s", exc)
+
+        # Session
+        request.session["user_id"] = app_user_id
+        request.session["discord_id"] = discord_id
         request.session["username"] = username
         request.session["avatar_url"] = avatar_url
         request.session["global_name"] = global_name
-        request.session["roles"] = await get_member_role_names(user_id)
-
-        account_type = "user"
-        try:
-            if hasattr(app.state, "pool") and app.state.pool is not None:
-                async with app.state.pool.acquire() as conn:
-                    account_type_value = await conn.fetchval(
-                        "SELECT account_type FROM users WHERE discord_id = $1",
-                        int(user_id),
-                    )
-                    if account_type_value:
-                        account_type = account_type_value
-        except Exception:
-            account_type = "user"
-
-        is_admin = str(user_id) in ADMIN_DISCORD_IDS or account_type == "admin"
-
         request.session["user"] = {
-            "id": user_id,
-            "discord_id": int(user_id),
+            "id": app_user_id,
+            "discord_id": discord_id,
             "username": username,
             "avatar_url": avatar_url,
             "global_name": global_name,
-            "role": "admin" if is_admin else "user",
-            "account_type": account_type,
+            "tier": (user_row.get("tier") if isinstance(user_row, dict) else user_row["tier"])
+            if user_row
+            else None,
         }
 
-        return RedirectResponse(f"{FRONTEND_URL}/auth/done")
+        # Discord roles lookup uses discord_id
+        request.session["roles"] = await get_member_role_names(discord_id)
+
+        return RedirectResponse(f"{FRONTEND_URL}/#/")
+
+
 
     except HTTPException:
         raise
@@ -2863,17 +2899,16 @@ async def update_user_settings(
         await conn.execute(
             """
             INSERT INTO usersettings (
-                user_id, default_platform, custom_tags, currency_format, currency, theme,
+                user_id, default_platform, custom_tags, currency_format, theme,
                 timezone, date_format, include_tax_in_profit, default_chart_range,
                 visible_widgets, created_at, updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), NOW())
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
             ON CONFLICT (user_id)
             DO UPDATE SET
                 default_platform     = EXCLUDED.default_platform,
                 custom_tags          = EXCLUDED.custom_tags,
                 currency_format      = EXCLUDED.currency_format,
-                currency             = EXCLUDED.currency,
                 theme                = EXCLUDED.theme,
                 timezone             = EXCLUDED.timezone,
                 date_format          = EXCLUDED.date_format,
@@ -2886,7 +2921,6 @@ async def update_user_settings(
             settings.default_platform,
             json.dumps(settings.custom_tags),
             settings.currency_format,
-            settings.currency,
             settings.theme,
             settings.timezone,
             settings.date_format,

@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 import asyncpg
 from asyncpg import exceptions as asyncpg_exceptions
-from pydantic import BaseModel, Field, AliasChoices
+from pydantic import BaseModel, Field
 
 from app.models.social import (
     SocialPostCreate,
@@ -65,16 +65,11 @@ class FeedPostCreatePayload(BaseModel):
     sell_target: Optional[Decimal] = None
     sell_at: Optional[datetime] = None
     confidence_level: Optional[int] = Field(None, ge=1, le=100)
-    premium: bool = Field(
-        False,
-        validation_alias=AliasChoices("premium", "is_premium"),
-        description="Subscriber-only content",
-    )
+    premium: bool = False  # Subscriber-only content
     requires_purchase: bool = False  # One-off purchase content
     price: Optional[Decimal] = Field(None, ge=0)  # Price for one-off purchase
     expires_in_hours: Optional[int] = None
     image_url: Optional[str] = None  # Add image_url field
-    image_urls: Optional[List[str]] = None  # Add image_urls field
     tags: Optional[List[str]] = None  # Add tags field
 
 
@@ -95,7 +90,6 @@ class FeedPostUpdatePayload(BaseModel):
     price: Optional[Decimal] = Field(None, ge=0)
     expires_in_hours: Optional[int] = None
     image_url: Optional[str] = None
-    image_urls: Optional[List[str]] = None
     tags: Optional[List[str]] = None
 
 
@@ -113,6 +107,8 @@ def _expires_at_from_hours(expires_in_hours: Optional[int]) -> Optional[datetime
 
 def _format_post(row: dict) -> dict:
     post = dict(row)
+    if post.get("is_author"):
+        post["can_view"] = True
     author_snapshot = {
         "id": post.get("user_id"),
         "trader_id": str(post.get("user_id")) if post.get("user_id") is not None else None,
@@ -215,7 +211,6 @@ async def create_post(
     has_title = await column_exists(db, "social_posts", "title")
     has_sell_at = await column_exists(db, "social_posts", "sell_at")
     has_image_url = await column_exists(db, "social_posts", "image_url")
-    has_image_urls = await column_exists(db, "social_posts", "image_urls")
     has_requires_purchase = await column_exists(db, "social_posts", "requires_purchase")
     has_price = await column_exists(db, "social_posts", "price")
 
@@ -260,10 +255,6 @@ async def create_post(
         columns.append("image_url")
         values.append(post.image_url)
 
-    if has_image_urls:
-        columns.append("image_urls")
-        values.append(post.image_urls)
-
     if has_requires_purchase:
         columns.append("requires_purchase")
         values.append(post.requires_purchase)
@@ -306,8 +297,6 @@ async def create_post_root(
         sell_at=payload.sell_at,
         confidence_level=payload.confidence_level,
         is_premium=payload.premium,
-        requires_purchase=payload.requires_purchase,
-        price=payload.price,
         expires_at=_expires_at_from_hours(payload.expires_in_hours),
         image_url=payload.image_url,  # Pass image_url
         tags=payload.tags or [],  # Pass tags
@@ -356,9 +345,13 @@ async def get_feed(
     try:
         user = get_current_user(request)
         user_id = user["id"]
+        username = user.get("username")
+        is_admin = username == "whatthefut#0"
         is_authenticated = True
     except HTTPException:
         user_id = None
+        username = None
+        is_admin = False
         is_authenticated = False
 
     try:
@@ -383,33 +376,37 @@ async def get_feed(
             params.append("prediction")
             param_idx += 1
 
-        # Filter by subscriptions if authenticated and not viewing a specific trader
-        if is_authenticated and not trader_id and feed_type != "all":
+        # Filter by subscriptions if authenticated (non-admin) and not viewing a specific trader
+        if is_authenticated and not is_admin and not trader_id and feed_type != "all":
             conditions.append(f"""
-                (sp.user_id = ${param_idx} OR sp.user_id IN (
+                sp.user_id IN (
                     SELECT trader_id FROM trader_subscriptions
                     WHERE subscriber_id = ${param_idx} AND is_active = TRUE
-                ))
+                )
             """)
             params.append(user_id)
             param_idx += 1
 
-        # Only show non-premium posts, posts authored by the user, or posts from traders the user is subscribed to
-        if is_authenticated:
-            # Admins can see all premium posts
-            is_admin = user.get("role") == "admin"
-            
-            if not is_admin:
-                conditions.append(f"""
-                    (sp.is_premium = FALSE OR sp.user_id = ${param_idx} OR sp.user_id IN (
+        # Only show non-premium posts or posts from traders user is subscribed to
+        # - Unauthenticated users: only free posts
+        # - Authenticated non-admin: free posts, own premium posts, and premium posts
+        #   from traders they are subscribed to
+        # - Admin: no restriction (can see all posts)
+        if not is_authenticated:
+            conditions.append("sp.is_premium = FALSE")
+        elif not is_admin:
+            conditions.append(f"""
+                (
+                    sp.is_premium = FALSE
+                    OR sp.user_id = ${param_idx}
+                    OR sp.user_id IN (
                         SELECT trader_id FROM trader_subscriptions
                         WHERE subscriber_id = ${param_idx} AND is_active = TRUE
-                    ))
-                """)
-                params.append(user_id)
-                param_idx += 1
-        else:
-            conditions.append("sp.is_premium = FALSE")
+                    )
+                )
+            """)
+            params.append(user_id)
+            param_idx += 1
 
         # Don't show expired posts
         conditions.append("(sp.expires_at IS NULL OR sp.expires_at > NOW())")
@@ -495,6 +492,7 @@ async def get_feed(
         if is_authenticated and post_dict.get("is_author"):
             post_dict["can_view"] = True
 
+        # Get user's reaction to this post if authenticated
         if can_read_reactions:
             reaction = await db.fetchval(
                 "SELECT reaction_type FROM post_reactions WHERE user_id = $1 AND post_id = $2",
@@ -593,9 +591,13 @@ async def get_post(
     try:
         user = get_current_user(request)
         user_id = user["id"]
+        username = user.get("username")
+        is_admin = username == "whatthefut#0"
         is_authenticated = True
     except HTTPException:
         user_id = None
+        username = None
+        is_admin = False
         is_authenticated = False
 
     query = """
@@ -624,7 +626,7 @@ async def get_post(
     is_author = is_authenticated and user_id == post_dict["user_id"]
 
     # Check if content is restricted
-    if (post_dict.get("is_premium") or post_dict.get("requires_purchase")) and not is_author:
+    if (post_dict.get("is_premium") or post_dict.get("requires_purchase")) and not is_author and not is_admin:
         if not is_authenticated:
             # Not logged in
             if post_dict.get("requires_purchase"):
@@ -712,7 +714,7 @@ async def update_post(
     updates = []
     params = []
     param_idx = 1
-    allowed_post_types = ["quick_flip", "prediction", "tip", "analysis", "status"]
+    allowed_post_types = ["quick_flip", "prediction", "tip", "analysis"]
     has_title = await column_exists(db, "social_posts", "title")
     has_sell_at = await column_exists(db, "social_posts", "sell_at")
     has_image_url = await column_exists(db, "social_posts", "image_url")
@@ -792,11 +794,6 @@ async def update_post(
     if post_update.image_url is not None and has_image_url:
         updates.append(f"image_url = ${param_idx}")
         params.append(post_update.image_url)
-        param_idx += 1
-
-    if post_update.image_urls is not None and has_image_urls:
-        updates.append(f"image_urls = ${param_idx}")
-        params.append(post_update.image_urls)
         param_idx += 1
 
     if post_update.is_premium is not None:

@@ -34,8 +34,12 @@ async def check_content_access(
     try:
         user = get_current_user(request)
         user_id = user["id"]
+        username = user.get("username")
+        is_admin = username == "whatthefut#0"
     except HTTPException:
         user_id = None
+        username = None
+        is_admin = False
 
     # Get post details
     post = await db.fetchrow(
@@ -62,19 +66,24 @@ async def check_content_access(
             "price": float(post["price"]) if post["price"] else None
         }
 
-    # Check access using database function
-    has_access = await db.fetchval(
-        "SELECT user_can_access_content($1, $2)",
-        user_id,
-        post_id
-    )
+    # Check access using database function (skip for admin)
+    if is_admin:
+        has_access = True
+    else:
+        has_access = await db.fetchval(
+            "SELECT user_can_access_content($1, $2)",
+            user_id,
+            post_id
+        )
 
     # Check if user is author
     is_author = (str(post["user_id"]) == str(user_id))
 
     # Determine access type
     access_type = "free"
-    if is_author:
+    if is_admin:
+        access_type = "admin"
+    elif is_author:
         access_type = "author"
     elif post["requires_purchase"]:
         # Check if purchased

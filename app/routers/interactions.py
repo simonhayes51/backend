@@ -168,7 +168,17 @@ async def add_reaction(
             reaction.post_id
         )
 
-        if post_author != user_id:  # Don't notify yourself
+        if post_author != user_id:
+            user_info = await db.fetchrow(
+                """
+                SELECT up.username, up.avatar_url
+                FROM user_profiles up
+                WHERE up.user_id = $1
+                """,
+                user_id
+            )
+
+            username = user_info["username"] if user_info and user_info.get("username") else "Someone"
             await db.execute(
                 """
                 INSERT INTO notifications (
@@ -178,7 +188,7 @@ async def add_reaction(
                 VALUES ($1, 'post_like', 'New Like', $2, $3, $4)
                 """,
                 post_author,
-                f"Someone {'liked' if reaction.reaction_type == 'like' else 'disliked'} your post",
+                f"{username} {'liked' if reaction.reaction_type == 'like' else 'disliked'} your post",
                 user_id,
                 reaction.post_id
             )
