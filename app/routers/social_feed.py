@@ -386,10 +386,10 @@ async def get_feed(
         # Filter by subscriptions if authenticated and not viewing a specific trader
         if is_authenticated and not trader_id and feed_type != "all":
             conditions.append(f"""
-                sp.user_id IN (
+                (sp.user_id = ${param_idx} OR sp.user_id IN (
                     SELECT trader_id FROM trader_subscriptions
                     WHERE subscriber_id = ${param_idx} AND is_active = TRUE
-                )
+                ))
             """)
             params.append(user_id)
             param_idx += 1
