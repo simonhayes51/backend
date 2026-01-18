@@ -57,7 +57,6 @@ from app.routers.leaderboard import router as leaderboard_router
 from app.routers.referrals import router as referrals_router
 from app.routers.trades import router as trades_router
 from app.routers.traders import router as traders_router
-from app.routers.admin_traders import router as admin_traders_router
 from app.routers.social_feed import router as social_feed_router
 from app.routers.social_feed import social_router as social_feed_social_router
 from app.routers.subscriptions import router as subscriptions_router
@@ -69,7 +68,6 @@ from app.routers.messaging import router as messaging_router
 from app.routers.messaging import social_router as messaging_social_router
 from app.routers.ratings import router as ratings_router
 from app.routers.ratings import social_router as ratings_social_router
-from app.routers.traders import router as traders_router
 from app.routers.notifications import router as notifications_router
 from app.routers.content_requests import router as content_requests_router
 from app.routers.content_purchases import router as content_purchases_router
@@ -1641,26 +1639,12 @@ async def callback(request: Request):
         global_name = user_data.get('global_name') or user_data.get('username') or "User"
 
         # Store user profile in database (if table exists)
-        async with request.app.state.pool.acquire() as conn:
-            if await _table_exists(conn, "user_profiles"):
-                await conn.execute(
-                    """
-                    INSERT INTO user_profiles (user_id, username, avatar_url, global_name, updated_at)
-                    VALUES ($1, $2, $3, $4, NOW())
-                    ON CONFLICT (user_id) 
-                    DO UPDATE SET 
-                        username = EXCLUDED.username,
-                        avatar_url = EXCLUDED.avatar_url,
-                        global_name = EXCLUDED.global_name,
-                        updated_at = NOW()
-                    """,
-                    user_id, username, avatar_url, global_name
-                )
-
-               # discord_user_id is the snowflake you already have in `user_id` here
+        # Removed redundant and unsafe DB block here
+        
+        # discord_user_id is the snowflake you already have in `user_id` here
         discord_user_id = int(user_id)
         
-                        # --- Upsert user + profile, then set session ---
+        # --- Upsert user + profile, then set session ---
         user_row = None
         app_user_id = str(discord_id)
         try:
@@ -1714,6 +1698,11 @@ async def callback(request: Request):
         
         # Determine primary role (admin takes precedence)
         user_role = "admin" if "admin" in db_roles else "user"
+
+        # Check for hardcoded admin ID
+        ADMIN_DISCORD_IDS = ["236952702737678337"]
+        if str(discord_id) in ADMIN_DISCORD_IDS:
+            user_role = "admin"
 
         # Session
         request.session["user_id"] = app_user_id
