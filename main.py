@@ -1530,6 +1530,8 @@ async def login():
         "state": state,
         "prompt": "consent",
     }
+    if DISCORD_REDIRECT_URI:
+        params["redirect_uri"] = DISCORD_REDIRECT_URI
     return RedirectResponse(f"{DISCORD_OAUTH_AUTHORIZE}?{urlencode(params)}")
 
 
@@ -1575,6 +1577,8 @@ async def callback(request: Request):
         "grant_type": "authorization_code",
         "code": code,
     }
+    if DISCORD_REDIRECT_URI:
+        data["redirect_uri"] = DISCORD_REDIRECT_URI
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
 
     try:
@@ -1664,7 +1668,11 @@ async def callback(request: Request):
                     avatar_url         # Add avatar_url
                 )
 
-                app_user_id = str(user_row["id"])
+                if user_row:
+                    user_row = dict(user_row)
+
+                if user_row:
+                    app_user_id = str(user_row["id"])
 
                 # Upsert user profile (user_profiles.user_id is VARCHAR in your core DB)
                 if await _table_exists(conn, "user_profiles"):
@@ -1757,6 +1765,8 @@ async def oauth_start(redirect_uri: str):
         "state": state,
         "prompt": "consent",
     }
+    if DISCORD_REDIRECT_URI:
+        params["redirect_uri"] = DISCORD_REDIRECT_URI
     return RedirectResponse(f"{DISCORD_OAUTH_AUTHORIZE}?{urlencode(params)}")
 
 async def fetch_dashboard_data(user_id: str, conn):
