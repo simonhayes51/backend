@@ -51,7 +51,7 @@ from app.routers.players import router as players_router
 from app.routes_ea import router as ea_router
 from app.routes_ingest_sets import router as ingest_router
 from app.routes_sbc_read import router as sbc_read_router
-from app.services.futgg_history import fetch_futgg_history
+from app.services.futgg_history import fetch_futgg_history, _plat
 from app.routers.portfolio import router as portfolio_router
 from app.routers.leaderboard import router as leaderboard_router
 from app.routers.referrals import router as referrals_router
@@ -2042,7 +2042,7 @@ async def get_player_definition(card_id: str):
         return {"error": str(e)}
 
 @app.get("/api/fut-player-price/{card_id}")
-async def get_player_price_proxy(card_id: str):
+async def get_player_price_proxy(card_id: str, platform: str = Query("ps", description="ps|xbox|pc|console")):
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
@@ -2056,7 +2056,18 @@ async def get_player_price_proxy(card_id: str):
                 },
             ) as resp:
                 if resp.status == 200:
-                    return await resp.json()
+                    data = await resp.json()
+                    plat = _plat(platform)
+                    cur = ((data.get("data") or {}).get("currentPrice") or {}) if isinstance(data, dict) else {}
+                    if isinstance(cur, dict) and any(k in cur for k in ("ps", "xbox", "pc", "playstation")):
+                        key_map = {"ps": "ps", "xbox": "xbox", "pc": "pc", "console": "ps"}
+                        k = key_map.get(plat, "ps")
+                        node = cur.get(k) or (cur.get("playstation") if k == "ps" else {})
+                        if isinstance(data, dict):
+                            if "data" not in data or not isinstance(data["data"], dict):
+                                data["data"] = {}
+                            data["data"]["currentPrice"] = node or {}
+                    return data
                 return {"error": f"API returned status {resp.status}"}
     except Exception as e:
         logging.error(f"Player price fetch error: {e}")
@@ -3510,15 +3521,17 @@ async def _enrich_with_meta(items: list[dict]) -> list[dict]:
         )
     return out
 
-async def _attach_prices_ps(items: list[dict]) -> list[dict]:
+async def _attach_prices(items: list[dict], platform: str = "ps") -> list[dict]:
     # Use our unified FUT.GG fetcher for consistency
-    tasks = [fetch_price(it["pid"], "ps") for it in items]
+    tasks = [fetch_price(it["pid"], platform) for it in items]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     for it, val in zip(items, results):
         if isinstance(val, dict) and isinstance(val.get("price"), (int, float)):
-            it["price_ps"] = int(val["price"])
+            it[f"price_{platform}"] = int(val["price"])
+            it["price"] = int(val["price"])
         else:
-            it["price_ps"] = None
+            it[f"price_{platform}"] = None
+            it["price"] = None
     return items
 
 @app.get("/api/ai/top-buys")
@@ -3710,6 +3723,7 @@ async def api_trending(
     trend_type: Optional[Literal["risers","fallers","smart"]] = None,
     tf: Optional[str] = "24",
     limit: int = Query(10, ge=1, le=50),
+    platform: str = "ps",
 ):
     tf_norm = _norm_tf(tf)
     limited = False
@@ -3739,7 +3753,7 @@ async def api_trending(
             pick = items[:limit]
 
         enriched = await _enrich_with_meta(pick)
-        enriched = await _attach_prices_ps(enriched)
+        enriched = await _attach_prices(enriched, platform)
         return {"type": kind, "timeframe": f"{tf_norm}h", "items": enriched, "limited": limited}
 
     # ---------- SMART MOVERS (6h vs 24h) ----------
@@ -3838,7 +3852,7 @@ async def api_trending(
             meta_map[pid]["percent_24h"] = raw["percent_24h"]
             meta_map[pid]["percent"] = raw["percent"]
 
-    enriched = await _attach_prices_ps(list(meta_map.values()))
+    enriched = await _attach_prices(list(meta_map.values()), platform)
     return {"type": "smart", "timeframe": "6h_vs_24h", "items": enriched, "limited": limited}
 
 

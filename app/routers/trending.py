@@ -30,6 +30,17 @@ CACHE_TTL = 120  # seconds
 _26_SEGMENT_RE = re.compile(r"/players/[^?#]*/26-(\d+)(?:[/?#]|$)", re.IGNORECASE)
 PCT_RE = re.compile(r"([+\-]?\s?\d+(?:\.\d+)?)\s*%")
 
+
+def _plat(p: str) -> str:
+    p = (p or "").lower()
+    if p in ("ps", "ps4", "ps5", "playstation", "console"):
+        return "ps"
+    if p in ("xbox", "xb", "xone", "xsx"):
+        return "xbox"
+    if p in ("pc", "origin", "windows"):
+        return "pc"
+    return "ps"
+
 def _cid_from_href(href: str) -> Optional[int]:
     """
     Extract ONLY the FUT item card_id from FUT.GG player urls.
@@ -252,11 +263,8 @@ async def _page_items(tf: str, page: int) -> List[dict]:
 
 # ------------------ Prices ------------------
 async def _get_console_price(card_id: int, platform: str = "ps") -> Optional[int]:
-    """
-    FUT.GG shape:
-      { "data": { "currentPrice": { "platform": "ps5", "price": 15000, ... } } }
-    """
     url = FUTGG_PRICE_URL.format(card_id=card_id)
+    plat = _plat(platform)
     timeout = aiohttp.ClientTimeout(total=10)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as sess:
@@ -268,6 +276,11 @@ async def _get_console_price(card_id: int, platform: str = "ps") -> Optional[int
         return None
 
     cp = ((payload or {}).get("data") or {}).get("currentPrice") or {}
+    if isinstance(cp, dict) and any(k in cp for k in ("ps", "xbox", "pc", "playstation")):
+        key_map = {"ps": "ps", "xbox": "xbox", "pc": "pc", "console": "ps"}
+        k = key_map.get(plat, "ps")
+        node = cp.get(k) or (cp.get("playstation") if k == "ps" else {})
+        cp = node or {}
     try:
         price = int(cp.get("price"))
         return price if price > 0 else None
@@ -324,7 +337,7 @@ async def _attach_prices(items: List[dict], platform: str = "ps") -> List[dict]:
     """Adds platform + price_console + nested prices.console."""
     async def one(it: dict) -> dict:
         p = await _get_console_price(int(it["card_id"]), platform)
-        it["platform"] = platform
+        it["platform"] = _plat(platform)
         it["price_console"] = p
         it["prices"] = {"console": p, "pc": None}
         return it
@@ -377,9 +390,11 @@ async def trending(
     tf_raw: str = Query("24h", alias="tf"),
     limit: int = Query(10, ge=1, le=50),
     debug: bool = Query(False),
+    platform: str = Query("ps", description="ps|xbox|pc|console"),
 ):
     tf_num = _norm_tf(tf_raw)
     tf_human = _human_tf(tf_num)
+    plat = _plat(platform)
 
     # ---- SMART ----
     if type_ == "smart":
@@ -407,7 +422,7 @@ async def trending(
         raw = [{"card_id": cid, "pid": cid, "percent": smart_map[cid]["chg6hPct"], "name_hint": None} for cid in smart_map.keys()]
 
         enriched = await _enrich_meta(req, raw)
-        enriched = await _attach_prices(enriched, platform="ps")
+        enriched = await _attach_prices(enriched, platform=plat)
         enriched = _dedupe_final(enriched)
 
         for e in enriched:
@@ -428,7 +443,7 @@ async def trending(
     # ---- RISERS / FALLERS ----
     raw = await _fetch_trending(kind=type_, tf=tf_num, limit=limit)
     enriched = await _enrich_meta(req, raw)
-    enriched = await _attach_prices(enriched, platform="ps")
+    enriched = await _attach_prices(enriched, platform=plat)
     enriched = _dedupe_final(enriched)
 
     if debug:

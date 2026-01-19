@@ -7,6 +7,7 @@ from __future__ import annotations
 import aiohttp
 from typing import Optional
 from app.services.price_history import get_price_history
+from app.services.futgg_history import _plat
 
 GG_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
@@ -18,7 +19,7 @@ GG_HEADERS = {
 
 API_URL_TEMPLATE = "https://www.fut.gg/api/fut/player-prices/25/{card_id}"
 
-async def _live_price(card_id: int) -> int:
+async def _live_price(card_id: int, platform: str = "ps") -> int:
     url = API_URL_TEMPLATE.format(card_id=card_id)
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout, headers=GG_HEADERS) as sess:
@@ -27,6 +28,12 @@ async def _live_price(card_id: int) -> int:
                 return 0
             data = await r.json()
             cur = (data.get("data") or {}).get("currentPrice") or {}
+            plat = _plat(platform)
+            if isinstance(cur, dict) and any(k in cur for k in ("ps", "xbox", "pc", "playstation")):
+                key_map = {"ps": "ps", "xbox": "xbox", "pc": "pc", "console": "ps"}
+                k = key_map.get(plat, "ps")
+                node = cur.get(k) or (cur.get("playstation") if k == "ps" else {})
+                cur = node or {}
             val = cur.get("price")
             if isinstance(val, (int, float)):
                 return int(val)
@@ -35,10 +42,10 @@ async def _live_price(card_id: int) -> int:
             except Exception:
                 return 0
 
-async def _fallback_from_history(card_id: int) -> int:
+async def _fallback_from_history(card_id: int, platform: str) -> int:
     # Try the latest point from the "today" history
     try:
-        hist = await get_price_history(card_id, "ps", "today")
+        hist = await get_price_history(card_id, platform, "today")
         pts = hist.get("points") or []
         if pts:
             last = next((p for p in reversed(pts) if isinstance(p.get("price"), int)), None)
@@ -52,8 +59,7 @@ async def get_player_price(card_id: int, platform: str = "ps") -> int:
     Return current BIN price for a card (PS by default).
     If live endpoint fails, fall back to last point from history.
     """
-    price = await _live_price(card_id)
+    price = await _live_price(card_id, platform)
     if price > 0:
         return price
-    # fallback
-    return await _fallback_from_history(card_id)
+    return await _fallback_from_history(card_id, platform)
