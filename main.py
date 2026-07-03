@@ -52,6 +52,7 @@ from app.routes_ea import router as ea_router
 from app.routes_ingest_sets import router as ingest_router
 from app.routes_sbc_read import router as sbc_read_router
 from app.services.futgg_history import fetch_futgg_history, _plat
+from app.futbin_client import fetch_price_by_url
 from app.routers.portfolio import router as portfolio_router
 from app.routers.leaderboard import router as leaderboard_router
 from app.routers.referrals import router as referrals_router
@@ -2022,56 +2023,89 @@ async def delete_trade(trade_id: int, user_id: str = Depends(get_current_user), 
 
 @app.get("/api/fut-player-definition/{card_id}")
 async def get_player_definition(card_id: str):
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"https://www.fut.gg/api/fut/player-item-definitions/26/{card_id}/",
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                    "Accept": "application/json, text/plain, */*",
-                    "Accept-Language": "en-GB,en;q=0.9",
-                    "Referer": "https://www.fut.gg/",
-                    "Origin": "https://www.fut.gg",
-                },
-            ) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                return {"error": f"API returned status {resp.status}"}
-    except Exception as e:
-        logging.error(f"Player definition fetch error: {e}")
-        return {"error": str(e)}
+    """
+    Player metadata for the Player Search page. Used to hit fut.gg's own
+    definition API directly, but fut.gg now blocks scrapers with Cloudflare
+    - this reads from our own DB (populated by the futbin catalog crawl)
+    instead, reshaped into the same {"data": {...}} shape the frontend
+    already expects so no client-side contract change is needed.
+    """
+    row = await player_pool.fetchrow(
+        """
+        SELECT name, rating, version, position, altposition,
+               club, nation, league, club_image, nation_image, league_image,
+               foot, skill_moves, weak_foot, pace, shooting, passing,
+               dribbling, defending, physicality, accelerate_type
+        FROM fut_players
+        WHERE card_id = $1::text
+        """,
+        str(card_id),
+    )
+    if not row:
+        return {"error": "Player not found"}
+
+    return {
+        "data": {
+            "commonName": row["name"],
+            "overall": row["rating"],
+            "rarity": {"name": row["version"]},
+            "club": {"name": row["club"], "imagePath": row["club_image"]},
+            "nation": {"name": row["nation"], "imagePath": row["nation_image"]},
+            "league": {"name": row["league"], "imagePath": row["league_image"]},
+            "skillMoves": row["skill_moves"],
+            "weakFoot": row["weak_foot"],
+            "foot": row["foot"],
+            "accelerateType": row["accelerate_type"],
+            "facePace": row["pace"],
+            "faceShooting": row["shooting"],
+            "facePassing": row["passing"],
+            "faceDribbling": row["dribbling"],
+            "faceDefending": row["defending"],
+            "facePhysicality": row["physicality"],
+        }
+    }
 
 @app.get("/api/fut-player-price/{card_id}")
 async def get_player_price_proxy(card_id: str, platform: str = Query("ps", description="ps|xbox|pc|console")):
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"https://www.fut.gg/api/fut/player-prices/26/{card_id}",
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                    "Accept": "application/json, text/plain, */*",
-                    "Accept-Language": "en-GB,en;q=0.9",
-                    "Referer": "https://www.fut.gg/",
-                    "Origin": "https://www.fut.gg",
-                },
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    plat = _plat(platform)
-                    cur = ((data.get("data") or {}).get("currentPrice") or {}) if isinstance(data, dict) else {}
-                    if isinstance(cur, dict) and any(k in cur for k in ("ps", "xbox", "pc", "playstation")):
-                        key_map = {"ps": "ps", "xbox": "xbox", "pc": "pc", "console": "ps"}
-                        k = key_map.get(plat, "ps")
-                        node = cur.get(k) or (cur.get("playstation") if k == "ps" else {})
-                        if isinstance(data, dict):
-                            if "data" not in data or not isinstance(data["data"], dict):
-                                data["data"] = {}
-                            data["data"]["currentPrice"] = node or {}
-                    return data
-                return {"error": f"API returned status {resp.status}"}
-    except Exception as e:
-        logging.error(f"Player price fetch error: {e}")
-        return {"error": str(e)}
+    """
+    Live price for the Player Search page. Used to hit fut.gg's own price
+    API directly, but fut.gg now blocks scrapers with Cloudflare - this
+    fetches live from futbin.com (no bot protection there) with a DB
+    snapshot fallback, reshaped into the same {"data": {"currentPrice":
+    {...}}} shape the frontend already expects.
+    """
+    plat = _plat(platform)
+    row = await player_pool.fetchrow(
+        "SELECT player_url, price_num, price_updated_at FROM fut_players WHERE card_id = $1::text",
+        str(card_id),
+    )
+    if not row:
+        return {"error": "Player not found"}
+
+    price = None
+    updated_at = None
+    if row["player_url"]:
+        try:
+            price = await fetch_price_by_url(row["player_url"], plat)
+            if price is not None:
+                updated_at = datetime.now(timezone.utc).isoformat()
+        except Exception:
+            price = None
+
+    if price is None and row["price_num"] is not None:
+        price = row["price_num"]
+        updated_at = row["price_updated_at"].isoformat() if row["price_updated_at"] else None
+
+    return {
+        "data": {
+            "currentPrice": {
+                "price": price,
+                "isExtinct": price is None,
+                "priceUpdatedAt": updated_at,
+            },
+            "completedAuctions": [],
+        }
+    }
 
 @app.get("/api/sbc/candidates")
 async def sbc_candidates(
