@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import aiohttp
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -10,13 +9,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 # If you already have this service, it's safe to import (it doesn't import main)
 from app.services.price_history import get_price_history
 from app.db import get_player_db
+from app.ea_client import ea_lowest_bin_price, get_configured_sid
 
 router = APIRouter(prefix="/api/players", tags=["players"])
 
 # ------------------------------
 # Helpers
 # ------------------------------
-FUTGG_BASE = "https://www.fut.gg/api/fut/player-prices/26"
 
 def _plat(p: str) -> str:
     p = (p or "").lower()
@@ -27,17 +26,6 @@ def _plat(p: str) -> str:
     if p in ("pc", "origin"):
         return "pc"
     return "ps"
-
-def _pick_platform_node(current: Dict[str, Any], platform: str) -> Dict[str, Any]:
-    # supports both flat and per-platform shapes
-    if any(k in current for k in ("ps", "xbox", "pc", "playstation")):
-        key_map = {"ps": "ps", "xbox": "xbox", "pc": "pc", "console": "ps"}
-        k = key_map.get(platform, "ps")
-        node = current.get(k)
-        if not node and k == "ps":
-            node = current.get("playstation")
-        return node or {}
-    return current
 
 # ------------------------------
 # Endpoints
@@ -338,33 +326,24 @@ async def get_player_price_route(
     except Exception:
         pass
 
-    # 3) FUT.GG fallback
-    try:
-        url = f"{FUTGG_BASE}/{card_id}"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "en-GB,en;q=0.9",
-            "Referer": "https://www.fut.gg/",
-            "Origin": "https://www.fut.gg",
-        }
-        timeout = aiohttp.ClientTimeout(total=10)
-        async with aiohttp.ClientSession(timeout=timeout) as sess:
-            async with sess.get(url, headers=headers) as r:
-                if r.status == 200:
-                    js = await r.json()
-                    current = (js.get("data") or {}).get("currentPrice") or {}
-                    node = _pick_platform_node(current, plat)
-                    return {
-                        "card_id": card_id,
-                        "platform": plat,
-                        "price": node.get("price"),
-                        "isExtinct": node.get("isExtinct", False),
-                        "updatedAt": node.get("priceUpdatedAt") or current.get("priceUpdatedAt"),
-                        "source": "futgg",
-                    }
-    except Exception:
-        pass
+    # 3) EA official transfer-market fallback (live).
+    # PS and Xbox share one FUT market, so this covers both; PC prices differ
+    # and aren't available here since our EA session is a console account.
+    sid = get_configured_sid()
+    if sid and plat != "pc":
+        try:
+            price = await ea_lowest_bin_price(card_id, sid)
+            if price is not None:
+                return {
+                    "card_id": card_id,
+                    "platform": plat,
+                    "price": price,
+                    "isExtinct": False,
+                    "updatedAt": None,
+                    "source": "ea",
+                }
+        except Exception:
+            pass
 
     return {
         "card_id": card_id,

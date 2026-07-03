@@ -5,12 +5,12 @@ import asyncio
 import time
 from typing import Any, Dict, Optional, AsyncGenerator
 
-import aiohttp
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from app.auth.entitlements import compute_entitlements
 from app.db import get_watchlist_db
+from app.ea_client import ea_lowest_bin_price, get_configured_sid
 
 router = APIRouter(prefix="/api/watchlist", tags=["watchlist"])
 
@@ -26,8 +26,9 @@ def _uid_param(request: Request) -> str:
         raise HTTPException(401, "Not authenticated")
     return str(uid)
 
-# ------------ FUT.GG price fetch (self-contained; no import from main) --------
-FUTGG_BASE = "https://www.fut.gg/api/fut/player-prices/26"
+# ------------ EA official price fetch (self-contained; no import from main) ---
+# PS and Xbox share one FUT market, so a single console EA session covers both;
+# PC prices differ and aren't available from a console account.
 PRICE_CACHE_TTL = 5
 _price_cache: Dict[str, Dict[str, Any]] = {}
 
@@ -38,13 +39,6 @@ def _plat(p: str) -> str:
     if p in ("pc", "origin"): return "pc"
     return "ps"
 
-def _pick_platform_node(current: Dict[str, Any], platform: str) -> Dict[str, Any]:
-    if any(k in current for k in ("ps", "xbox", "pc", "playstation")):
-        k = {"ps":"ps","xbox":"xbox","pc":"pc","console":"ps"}.get(platform, "ps")
-        node = current.get(k) or (current.get("playstation") if k == "ps" else None)
-        return node or {}
-    return current
-
 async def _fetch_price(card_id: int, platform: str) -> Dict[str, Any]:
     key = f"{card_id}|{platform}"
     now = time.time()
@@ -52,32 +46,24 @@ async def _fetch_price(card_id: int, platform: str) -> Dict[str, Any]:
         c = _price_cache[key]
         return {"price": c["price"], "isExtinct": c["isExtinct"], "updatedAt": c["updatedAt"]}
 
-    url = f"{FUTGG_BASE}/{card_id}"
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json, text/plain, */*",
-        "Referer": "https://www.fut.gg/",
-        "Origin": "https://www.fut.gg",
-    }
-    timeout = aiohttp.ClientTimeout(total=12)
+    sid = get_configured_sid()
+    if not sid or platform == "pc":
+        cached = _price_cache.get(key)
+        if cached:
+            return {"price": cached["price"], "isExtinct": cached["isExtinct"], "updatedAt": cached["updatedAt"]}
+        raise HTTPException(502, "Failed to fetch price: no EA session configured")
+
     last_err = None
-    async with aiohttp.ClientSession(timeout=timeout) as sess:
-        for attempt in (0, 1, 2):
-            try:
-                async with sess.get(url, headers=headers) as r:
-                    if r.status == 200:
-                        js = await r.json()
-                        cur = (js.get("data") or {}).get("currentPrice") or {}
-                        node = _pick_platform_node(cur, platform)
-                        price = node.get("price")
-                        extinct = node.get("isExtinct", False)
-                        updated = node.get("priceUpdatedAt") or cur.get("priceUpdatedAt")
-                        _price_cache[key] = {"at": now, "price": price, "isExtinct": extinct, "updatedAt": updated}
-                        return {"price": price, "isExtinct": extinct, "updatedAt": updated}
-                    last_err = f"HTTP {r.status}"
-            except Exception as e:
-                last_err = str(e)
-            await asyncio.sleep(0.2 * (3 ** attempt))
+    for attempt in (0, 1, 2):
+        try:
+            price = await ea_lowest_bin_price(card_id, sid)
+            updated = time.time()
+            _price_cache[key] = {"at": now, "price": price, "isExtinct": price is None, "updatedAt": updated}
+            return {"price": price, "isExtinct": price is None, "updatedAt": updated}
+        except Exception as e:
+            last_err = str(e)
+        await asyncio.sleep(0.2 * (3 ** attempt))
+
     cached = _price_cache.get(key)
     if cached:
         return {"price": cached["price"], "isExtinct": cached["isExtinct"], "updatedAt": cached["updatedAt"]}
