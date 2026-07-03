@@ -230,3 +230,38 @@ async def fetch_recent_sales(player_url: str, platform: str, limit: int = 20) ->
     except Exception:
         return []
     return parse_sales_history(html, limit=limit)
+
+
+# --- Card image layers -----------------------------------------------------
+# futbin has no server-rendered flat card image - the card seen on the site
+# is assembled client-side from a card-template background PNG and a
+# separate player cutout PNG (their own "download card" button works by
+# rasterizing the live DOM with domtoimage, not by fetching one image).
+# Confirmed against a real player page: the background sits behind an
+# `<img class="playercard-26-bg">` and the cutout is either
+# `playercard-26-special-img` (special/non-base cards) or
+# `playercard-26-base-img` (base gold cards) - both plain <img src=...>.
+def parse_card_layers(html: str) -> Dict[str, Optional[str]]:
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html, "html.parser")
+    bg = soup.find("img", class_=re.compile(r"\bplayercard-26-bg\b"))
+    cutout = soup.find("img", class_=re.compile(r"\bplayercard-26-special-img\b")) or soup.find(
+        "img", class_=re.compile(r"\bplayercard-26-base-img\b")
+    )
+    return {
+        "bgImageUrl": bg.get("src") if bg else None,
+        "cutoutImageUrl": cutout.get("src") if cutout else None,
+    }
+
+
+async def fetch_card_layers(player_url: str) -> Dict[str, Optional[str]]:
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(player_url, headers=HEADERS, timeout=REQUEST_TIMEOUT) as r:
+                if r.status != 200:
+                    return {"bgImageUrl": None, "cutoutImageUrl": None}
+                html = await r.text()
+    except Exception:
+        return {"bgImageUrl": None, "cutoutImageUrl": None}
+    return parse_card_layers(html)

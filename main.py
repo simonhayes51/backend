@@ -51,8 +51,8 @@ from app.routers.players import router as players_router
 from app.routes_ea import router as ea_router
 from app.routes_ingest_sets import router as ingest_router
 from app.routes_sbc_read import router as sbc_read_router
-from app.services.futgg_history import fetch_futgg_history, _plat
-from app.futbin_client import fetch_price_by_url, fetch_recent_sales
+from app.services.futgg_history import _plat
+from app.futbin_client import fetch_price_by_url, fetch_recent_sales, fetch_card_layers
 from app.routers.portfolio import router as portfolio_router
 from app.routers.leaderboard import router as leaderboard_router
 from app.routers.referrals import router as referrals_router
@@ -1531,24 +1531,19 @@ async def login():
 
 @app.get("/api/price-history")
 async def price_history(playerId: int, platform: str = "ps", tf: str = "today"):
+    """
+    Price history for the Player Search chart, built from futbin's own
+    sales history (real timestamped sales) - fut.gg's price-history API is
+    Cloudflare-blocked and unreachable, same reason price/definition moved
+    off it. (The old fallback here called that same dead API, and the
+    primary path was reading the wrong dict key - "history" instead of
+    "points" - so it always fell through to the dead fallback anyway.)
+    """
     if playerId <= 0:
         raise HTTPException(status_code=400, detail="playerId must be a positive integer")
     try:
-        base = await get_price_history(playerId, platform, tf)  # existing flow (DB / internal)  
-
-        # Normalize to list for safety
-        history = base if isinstance(base, list) else (base.get("history") or [])
-
-        # Fallback: if stale/sparse, use Fut.GG's 3-day series
-        if not history or len(history) < 2:
-            try:
-                history = await fetch_futgg_history(playerId, platform, "3d")
-                return {"history": history}
-            except Exception:
-                # If Fut.GG fails too, return whatever we had (even empty) to keep contract
-                return {"history": history}
-
-        # Your existing shape sometimes returns list directly; wrap consistently
+        base = await get_price_history(playerId, platform, tf)
+        history = base if isinstance(base, list) else (base.get("points") or [])
         return {"history": history}
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Upstream error: {e}")
@@ -2035,7 +2030,7 @@ async def get_player_definition(card_id: str):
         SELECT name, rating, version, position, altposition,
                club, nation, league, club_image, nation_image, league_image,
                foot, skill_moves, weak_foot, pace, shooting, passing,
-               dribbling, defending, physicality, accelerate_type
+               dribbling, defending, physicality, accelerate_type, player_url
         FROM fut_players
         WHERE card_id::text = $1
         """,
@@ -2043,6 +2038,13 @@ async def get_player_definition(card_id: str):
     )
     if not row:
         return {"error": "Player not found"}
+
+    layers = {"bgImageUrl": None, "cutoutImageUrl": None}
+    if row["player_url"]:
+        try:
+            layers = await fetch_card_layers(row["player_url"])
+        except Exception:
+            pass
 
     return {
         "data": {
@@ -2062,6 +2064,8 @@ async def get_player_definition(card_id: str):
             "faceDribbling": row["dribbling"],
             "faceDefending": row["defending"],
             "facePhysicality": row["physicality"],
+            "bgImageUrl": layers["bgImageUrl"],
+            "cutoutImageUrl": layers["cutoutImageUrl"],
         }
     }
 
