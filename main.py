@@ -2037,7 +2037,7 @@ async def get_player_definition(card_id: str):
                foot, skill_moves, weak_foot, pace, shooting, passing,
                dribbling, defending, physicality, accelerate_type
         FROM fut_players
-        WHERE card_id = $1::text
+        WHERE card_id::text = $1
         """,
         str(card_id),
     )
@@ -2076,7 +2076,7 @@ async def get_player_price_proxy(card_id: str, platform: str = Query("ps", descr
     """
     plat = _plat(platform)
     row = await player_pool.fetchrow(
-        "SELECT player_url, price_num, price_updated_at FROM fut_players WHERE card_id = $1::text",
+        "SELECT player_url, price_num, price_updated_at FROM fut_players WHERE card_id::text = $1",
         str(card_id),
     )
     if not row:
@@ -2301,7 +2301,7 @@ async def refresh_watch_item(
                 """
                 SELECT card_id, name, rating, club, nation
                 FROM fut_players
-                WHERE card_id = $1::text
+                WHERE card_id::text = $1
                 """,
                 str(w["card_id"]),
             )
@@ -3531,7 +3531,7 @@ async def _enrich_with_meta(items: list[dict]) -> list[dict]:
             """
             SELECT card_id, name, rating, version, image_url, club, league
               FROM fut_players
-             WHERE card_id = ANY($1::text[])
+             WHERE card_id::text = ANY($1::text[])
         """,
             ids,
         )
@@ -4000,7 +4000,7 @@ async def player_compare(
         meta_rows = await pconn.fetch("""
             SELECT card_id, name, rating, position, league, nation, club, image_url
             FROM fut_players
-            WHERE card_id = ANY($1::text[])
+            WHERE card_id::text = ANY($1::text[])
         """, raw_ids)
     meta = {str(r["card_id"]): dict(r) for r in meta_rows}
 
