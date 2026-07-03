@@ -100,7 +100,7 @@ async def get_player_url(card_id: int) -> Optional[str]:
     pool = await get_player_pool()
     async with pool.acquire() as conn:
         return await conn.fetchval(
-            "SELECT player_url FROM fut_players WHERE card_id = $1::text", str(card_id)
+            "SELECT player_url FROM fut_players WHERE card_id::text = $1", str(card_id)
         )
 
 

@@ -242,7 +242,7 @@ async def get_player(card_id: str, conn = Depends(get_player_db)):
         """
         SELECT card_id, name, rating, version, image_url, club, league, nation, position, altposition, price, price_num
         FROM fut_players
-        WHERE card_id = $1::text
+        WHERE card_id::text = $1
         """,
         str(card_id),
     )
@@ -275,7 +275,7 @@ async def get_player_price_route(
 
     # 1) Try fut_candles (latest close) with correct per-platform filter
     try:
-        where: List[str] = ["player_card_id = $1::text"]
+        where: List[str] = ["player_card_id::text = $1"]
         params: List[Any] = [str(card_id)]
 
         if plat == "ps":
@@ -310,7 +310,7 @@ async def get_player_price_route(
             """
             SELECT price_num, updated_at
             FROM fut_players
-            WHERE card_id = $1::text
+            WHERE card_id::text = $1
             """,
             str(card_id),
         )
@@ -329,7 +329,7 @@ async def get_player_price_route(
     # 3) futbin.com live fetch (on-demand, freshest available - seconds old).
     try:
         player_url = await conn.fetchval(
-            "SELECT player_url FROM fut_players WHERE card_id = $1::text",
+            "SELECT player_url FROM fut_players WHERE card_id::text = $1",
             str(card_id),
         )
         if player_url:
@@ -395,7 +395,7 @@ async def get_player_history_route(
         }
         window = tf_map.get(tf, "2 days")
 
-        where: List[str] = ["player_card_id = $1::text"]
+        where: List[str] = ["player_card_id::text = $1"]
         params: List[Any] = [str(card_id)]
 
         if plat == "ps":
@@ -431,7 +431,7 @@ async def get_player_history_route(
         ]
 
         if not candles:
-            where2: List[str] = ["player_card_id = $1::text"]
+            where2: List[str] = ["player_card_id::text = $1"]
             params2: List[Any] = [str(card_id)]
             if plat == "ps":
                 where2.append("platform IN ('ps','playstation','console')")
@@ -485,7 +485,7 @@ async def batch_meta(
         """
         SELECT card_id, name, rating, version, image_url, club, league, nation, position, altposition, price, price_num
         FROM fut_players
-        WHERE card_id = ANY($1::text[])
+        WHERE card_id::text = ANY($1::text[])
         """,
         raw_ids,
     )
