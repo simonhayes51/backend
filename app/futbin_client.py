@@ -10,7 +10,8 @@ fut.gg, so this is a plain unauthenticated GET + HTML parse - no session,
 proxy, or rendering service required.
 """
 import re
-from typing import Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional
 
 import aiohttp
 
@@ -111,3 +112,89 @@ async def fetch_price_by_card_id(card_id: int, platform: str) -> Optional[int]:
     if not player_url:
         return None
     return await fetch_price_by_url(player_url, platform)
+
+
+# --- Sales history --------------------------------------------------------
+# futbin's price chart on /market is a client-rendered Highcharts SVG, not a
+# clean JSON endpoint - not worth reverse-engineering pixel paths for. But
+# the same player has a plain server-rendered "Player Sales History" table
+# at /sales/{futbin_id}/{slug}?platform=ps|pc with real timestamped sales,
+# confirmed against a real page - that's what we use for recent sales,
+# price range, and trend instead.
+_SALE_DATE_RE = re.compile(r"[A-Za-z]{3} \d{1,2}, \d{1,2}:\d{2} [AP]M")
+
+
+def _sales_url(player_url: str, platform: str) -> Optional[str]:
+    if "/player/" not in player_url:
+        return None
+    fb_plat = "pc" if platform == "pc" else "ps"
+    sales_base = player_url.replace("/player/", "/sales/")
+    return f"{sales_base}?platform={fb_plat}"
+
+
+def _parse_sale_date(date_text: str, now: Optional[datetime] = None) -> Optional[str]:
+    if not date_text:
+        return None
+    now = now or datetime.now(timezone.utc)
+    try:
+        dt = datetime.strptime(f"{date_text} {now.year}", "%b %d, %I:%M %p %Y")
+    except ValueError:
+        return None
+    dt = dt.replace(tzinfo=timezone.utc)
+    if dt > now + timedelta(days=1):
+        dt = dt.replace(year=now.year - 1)
+    return dt.isoformat()
+
+
+def parse_sales_history(html: str, limit: int = 20) -> List[Dict[str, Any]]:
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html, "html.parser")
+    table = soup.find("table", class_="auctions-table")
+    if not table:
+        return []
+    body = table.find("tbody")
+    if not body:
+        return []
+
+    sales: List[Dict[str, Any]] = []
+    for row in body.find_all("tr"):
+        if len(sales) >= limit:
+            break
+        tds = row.find_all("td")
+        if len(tds) < 5:
+            continue
+
+        date_div = tds[0].find("div")
+        icon = date_div.find("i") if date_div else None
+        sold = bool(icon and any("fa-check" in c for c in icon.get("class", [])))
+        if not sold:
+            continue
+
+        date_span = date_div.find("span", class_="sales-date-time") if date_div else None
+        date_text = date_span.get_text(strip=True) if date_span else None
+        m = _SALE_DATE_RE.search(date_text or "")
+        sold_date = _parse_sale_date(m.group(0)) if m else None
+
+        sold_price = _num(tds[2].get_text(strip=True))
+        if not sold_price:
+            continue
+
+        sales.append({"soldDate": sold_date, "soldPrice": sold_price})
+
+    return sales
+
+
+async def fetch_recent_sales(player_url: str, platform: str, limit: int = 20) -> List[Dict[str, Any]]:
+    url = _sales_url(player_url, platform)
+    if not url:
+        return []
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT) as r:
+                if r.status != 200:
+                    return []
+                html = await r.text()
+    except Exception:
+        return []
+    return parse_sales_history(html, limit=limit)
