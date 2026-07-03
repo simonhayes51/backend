@@ -52,7 +52,7 @@ from app.routes_ea import router as ea_router
 from app.routes_ingest_sets import router as ingest_router
 from app.routes_sbc_read import router as sbc_read_router
 from app.services.futgg_history import fetch_futgg_history, _plat
-from app.futbin_client import fetch_price_by_url
+from app.futbin_client import fetch_price_by_url, fetch_recent_sales
 from app.routers.portfolio import router as portfolio_router
 from app.routers.leaderboard import router as leaderboard_router
 from app.routers.referrals import router as referrals_router
@@ -2096,6 +2096,13 @@ async def get_player_price_proxy(card_id: str, platform: str = Query("ps", descr
         price = row["price_num"]
         updated_at = row["price_updated_at"].isoformat() if row["price_updated_at"] else None
 
+    sales: list = []
+    if row["player_url"]:
+        try:
+            sales = await fetch_recent_sales(row["player_url"], plat)
+        except Exception:
+            sales = []
+
     return {
         "data": {
             "currentPrice": {
@@ -2103,7 +2110,7 @@ async def get_player_price_proxy(card_id: str, platform: str = Query("ps", descr
                 "isExtinct": price is None,
                 "priceUpdatedAt": updated_at,
             },
-            "completedAuctions": [],
+            "completedAuctions": sales,
         }
     }
 
