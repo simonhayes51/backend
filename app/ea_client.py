@@ -8,6 +8,10 @@ class ExpiredEA(Exception): pass
 class RateLimitedEA(Exception):
     def __init__(self, retry_after: Optional[int]): self.retry_after = retry_after
 
+def get_configured_sid() -> Optional[str]:
+    """Returns the configured EA session token, or None if not set."""
+    return os.getenv("EA_X_UT_SID")
+
 async def ea_get(path: str, sid: str, params=None):
     url = f"{EA_BASE}/{path.lstrip('/')}"
     headers = {
@@ -28,3 +32,17 @@ async def ea_get(path: str, sid: str, params=None):
         raise RateLimitedEA(retry_after)
     r.raise_for_status()
     return r.json()
+
+async def ea_lowest_bin_price(card_id: int, sid: str) -> Optional[int]:
+    """Lowest active buyNowPrice for a card from EA's transfer market, or None if no live listings."""
+    data = await ea_get(
+        "transfermarket",
+        sid,
+        params={"start": 0, "num": 21, "type": "player", "maskedDefId": card_id},
+    )
+    prices = [
+        a["buyNowPrice"]
+        for a in (data.get("auctionInfo") or [])
+        if a.get("tradeState") == "active" and isinstance(a.get("buyNowPrice"), (int, float))
+    ]
+    return min(prices) if prices else None
