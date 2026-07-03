@@ -10,7 +10,7 @@ from pydantic import BaseModel
 
 from app.auth.entitlements import compute_entitlements
 from app.db import get_watchlist_db
-from app.ea_client import ea_lowest_bin_price, get_configured_sid
+from app.futbin_client import fetch_price_by_card_id
 
 router = APIRouter(prefix="/api/watchlist", tags=["watchlist"])
 
@@ -26,9 +26,10 @@ def _uid_param(request: Request) -> str:
         raise HTTPException(401, "Not authenticated")
     return str(uid)
 
-# ------------ EA official price fetch (self-contained; no import from main) ---
-# PS and Xbox share one FUT market, so a single console EA session covers both;
-# PC prices differ and aren't available from a console account.
+# ------------ futbin.com live price fetch, behind a short cache --------------
+# 5-second in-process cache so bursts of requests for the same card+platform
+# (e.g. list_watch_items fanning out over several rows) don't refetch futbin
+# redundantly; still effectively "live" for a user-facing price.
 PRICE_CACHE_TTL = 5
 _price_cache: Dict[str, Dict[str, Any]] = {}
 
@@ -46,17 +47,10 @@ async def _fetch_price(card_id: int, platform: str) -> Dict[str, Any]:
         c = _price_cache[key]
         return {"price": c["price"], "isExtinct": c["isExtinct"], "updatedAt": c["updatedAt"]}
 
-    sid = get_configured_sid()
-    if not sid or platform == "pc":
-        cached = _price_cache.get(key)
-        if cached:
-            return {"price": cached["price"], "isExtinct": cached["isExtinct"], "updatedAt": cached["updatedAt"]}
-        raise HTTPException(502, "Failed to fetch price: no EA session configured")
-
     last_err = None
     for attempt in (0, 1, 2):
         try:
-            price = await ea_lowest_bin_price(card_id, sid)
+            price = await fetch_price_by_card_id(card_id, platform)
             updated = time.time()
             _price_cache[key] = {"at": now, "price": price, "isExtinct": price is None, "updatedAt": updated}
             return {"price": price, "isExtinct": price is None, "updatedAt": updated}
