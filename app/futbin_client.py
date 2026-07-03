@@ -121,15 +121,47 @@ async def fetch_price_by_card_id(card_id: int, platform: str) -> Optional[int]:
 # at /sales/{futbin_id}/{slug}?platform=ps|pc with real timestamped sales,
 # confirmed against a real page - that's what we use for recent sales,
 # price range, and trend instead.
+#
+# The sales page's slug doesn't match the player page's slug (e.g.
+# "aitana-bonmati" vs "aitana-bonmati-conca" for the same card), so it
+# can't be derived by substring substitution on player_url - confirmed by
+# inspecting a real /market page's "Full History" link, which is the
+# reliable source for the correct path.
 _SALE_DATE_RE = re.compile(r"[A-Za-z]{3} \d{1,2}, \d{1,2}:\d{2} [AP]M")
 
 
-def _sales_url(player_url: str, platform: str) -> Optional[str]:
-    if "/player/" not in player_url:
+async def _resolve_sales_path(player_url: str) -> Optional[str]:
+    market_url = player_url.rstrip("/") + "/market"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(market_url, headers=HEADERS, timeout=REQUEST_TIMEOUT) as r:
+                if r.status != 200:
+                    return None
+                html = await r.text()
+    except Exception:
         return None
+
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html, "html.parser")
+    a = soup.find("a", class_=re.compile(r"\bmarket-grid-lates-sale-link\b"))
+    if not a or not a.get("href"):
+        return None
+    return a["href"].split("?")[0]
+
+
+async def _sales_url(player_url: str, platform: str) -> Optional[str]:
     fb_plat = "pc" if platform == "pc" else "ps"
-    sales_base = player_url.replace("/player/", "/sales/")
-    return f"{sales_base}?platform={fb_plat}"
+    path = await _resolve_sales_path(player_url)
+    if path:
+        return f"https://www.futbin.com{path}?platform={fb_plat}"
+    # Fallback if the market page lookup fails for any reason - wrong slug
+    # text but the same numeric id, which futbin appears to route by
+    # regardless of slug.
+    if "/player/" in player_url:
+        sales_base = player_url.replace("/player/", "/sales/")
+        return f"{sales_base}?platform={fb_plat}"
+    return None
 
 
 def _parse_sale_date(date_text: str, now: Optional[datetime] = None) -> Optional[str]:
@@ -186,7 +218,7 @@ def parse_sales_history(html: str, limit: int = 20) -> List[Dict[str, Any]]:
 
 
 async def fetch_recent_sales(player_url: str, platform: str, limit: int = 20) -> List[Dict[str, Any]]:
-    url = _sales_url(player_url, platform)
+    url = await _sales_url(player_url, platform)
     if not url:
         return []
     try:
