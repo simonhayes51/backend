@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 # If you already have this service, it's safe to import (it doesn't import main)
 from app.services.price_history import get_price_history
 from app.db import get_player_db
-from app.ea_client import ea_lowest_bin_price, get_configured_sid
+from app.futbin_client import fetch_price_by_url
 
 router = APIRouter(prefix="/api/players", tags=["players"])
 
@@ -326,13 +326,14 @@ async def get_player_price_route(
     except Exception:
         pass
 
-    # 3) EA official transfer-market fallback (live).
-    # PS and Xbox share one FUT market, so this covers both; PC prices differ
-    # and aren't available here since our EA session is a console account.
-    sid = get_configured_sid()
-    if sid and plat != "pc":
-        try:
-            price = await ea_lowest_bin_price(card_id, sid)
+    # 3) futbin.com live fetch (on-demand, freshest available - seconds old).
+    try:
+        player_url = await conn.fetchval(
+            "SELECT player_url FROM fut_players WHERE card_id = $1::text",
+            str(card_id),
+        )
+        if player_url:
+            price = await fetch_price_by_url(player_url, plat)
             if price is not None:
                 return {
                     "card_id": card_id,
@@ -340,10 +341,10 @@ async def get_player_price_route(
                     "price": price,
                     "isExtinct": False,
                     "updatedAt": None,
-                    "source": "ea",
+                    "source": "futbin",
                 }
-        except Exception:
-            pass
+    except Exception:
+        pass
 
     return {
         "card_id": card_id,
