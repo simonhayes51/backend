@@ -259,9 +259,16 @@ def parse_card_layers(html: str) -> Dict[str, Optional[str]]:
     cutout = scope.find("img", class_=re.compile(r"\bplayercard-26-special-img\b")) or scope.find(
         "img", class_=re.compile(r"\bplayercard-26-base-img\b")
     )
+    # futbin's own short display name (e.g. "Cristiano Ronaldo" rather than
+    # the full legal name "Cristiano Ronaldo dos Santos Aveiro") - no
+    # word-position heuristic on the full name is reliable (this exact
+    # player is a counterexample: "Ronaldo" is neither the first nor last
+    # word), so read what futbin itself renders on the card face instead.
+    name_el = scope.find("div", class_=re.compile(r"\bplayercard-26-name\b"))
     return {
         "bgImageUrl": bg.get("src") if bg else None,
         "cutoutImageUrl": cutout.get("src") if cutout else None,
+        "cardName": name_el.get_text(strip=True) if name_el else None,
     }
 
 
@@ -270,10 +277,10 @@ async def fetch_card_layers(player_url: str) -> Dict[str, Optional[str]]:
         async with aiohttp.ClientSession() as session:
             async with session.get(player_url, headers=HEADERS, timeout=REQUEST_TIMEOUT) as r:
                 if r.status != 200:
-                    return {"bgImageUrl": None, "cutoutImageUrl": None}
+                    return {"bgImageUrl": None, "cutoutImageUrl": None, "cardName": None}
                 html = await r.text()
     except Exception:
-        return {"bgImageUrl": None, "cutoutImageUrl": None}
+        return {"bgImageUrl": None, "cutoutImageUrl": None, "cardName": None}
     return parse_card_layers(html)
 
 
