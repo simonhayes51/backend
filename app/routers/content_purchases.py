@@ -11,6 +11,7 @@ from app.models.social import (
     ContentPurchase,
 )
 from app.db import get_db
+from app.routers.admin_traders import get_admin_user
 
 router = APIRouter(prefix="/api/content-purchases", tags=["Content Purchases"])
 
@@ -20,6 +21,15 @@ def get_current_user(request: Request):
     if "user" not in request.session:
         raise HTTPException(status_code=401, detail="Not authenticated")
     return request.session["user"]
+
+
+def _is_admin(request: Request) -> bool:
+    """Role-based admin check (same gate used by app/routers/admin_traders.py)"""
+    try:
+        get_admin_user(request)
+        return True
+    except HTTPException:
+        return False
 
 
 @router.post("/check-access/{post_id}")
@@ -34,11 +44,9 @@ async def check_content_access(
     try:
         user = get_current_user(request)
         user_id = user["id"]
-        username = user.get("username")
-        is_admin = username == "whatthefut#0"
+        is_admin = _is_admin(request)
     except HTTPException:
         user_id = None
-        username = None
         is_admin = False
 
     # Get post details

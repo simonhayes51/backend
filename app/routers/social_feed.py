@@ -17,6 +17,7 @@ from app.models.social import (
     FeedResponse,
 )
 from app.db import get_db
+from app.routers.admin_traders import get_admin_user
 
 router = APIRouter(prefix="/api/feed", tags=["Social Feed"])
 social_router = APIRouter(prefix="/api/social", tags=["Social Feed"])
@@ -27,6 +28,15 @@ def get_current_user(request: Request):
     if "user" not in request.session:
         raise HTTPException(status_code=401, detail="Not authenticated")
     return request.session["user"]
+
+
+def _is_admin(request: Request) -> bool:
+    """Role-based admin check (same gate used by app/routers/admin_traders.py)"""
+    try:
+        get_admin_user(request)
+        return True
+    except HTTPException:
+        return False
 
 
 async def table_exists(db: asyncpg.Connection, table_name: str) -> bool:
@@ -343,12 +353,10 @@ async def get_feed(
     try:
         user = get_current_user(request)
         user_id = user["id"]
-        username = user.get("username")
-        is_admin = username == "whatthefut#0"
+        is_admin = _is_admin(request)
         is_authenticated = True
     except HTTPException:
         user_id = None
-        username = None
         is_admin = False
         is_authenticated = False
 
@@ -589,12 +597,10 @@ async def get_post(
     try:
         user = get_current_user(request)
         user_id = user["id"]
-        username = user.get("username")
-        is_admin = username == "whatthefut#0"
+        is_admin = _is_admin(request)
         is_authenticated = True
     except HTTPException:
         user_id = None
-        username = None
         is_admin = False
         is_authenticated = False
 
@@ -1084,33 +1090,4 @@ async def get_post_stats(
             (post["likes_count"] + post["comments_count"] + post["shares_count"]) /
             max(post["likes_count"] + post["dislikes_count"] + post["comments_count"] + post["shares_count"], 1)
         )
-    }
-
-
-@router.get("/debug/posts")
-async def debug_posts(db: asyncpg.Connection = Depends(get_db)):
-    """
-    Debug endpoint to check social_posts table contents
-    """
-    rows = await db.fetch("""
-        SELECT 
-            id, 
-            user_id, 
-            post_type, 
-            LEFT(content, 50) as content_preview,
-            CASE 
-                WHEN image_url IS NULL THEN 'NULL'
-                WHEN image_url = '' THEN 'EMPTY'
-                WHEN LENGTH(image_url) > 100 THEN 'HAS_IMAGE (' || LENGTH(image_url) || ' chars)'
-                ELSE image_url
-            END as image_status,
-            created_at
-        FROM social_posts
-        ORDER BY created_at DESC
-        LIMIT 10
-    """)
-    
-    return {
-        "total_posts": len(rows),
-        "posts": [dict(row) for row in rows]
     }

@@ -281,9 +281,18 @@ async def paypal_connect(
     db: asyncpg.Connection = Depends(get_db)
 ):
     """
-    Connect PayPal account by email
-    For simplified integration, we just store the PayPal email
-    For full marketplace features, you'd use PayPal Partner API
+    Connect PayPal account by email.
+
+    We have no way to verify a trader actually owns a given PayPal email
+    address (no PayPal Partner API integration, no email-sending
+    infrastructure in this codebase to send a confirmation link). Marking
+    payment_setup_completed = TRUE here immediately would let a trader
+    silently redirect buyer payouts to an email they don't control.
+
+    Instead this just records the email as "pending" - it is NOT usable for
+    payouts (payment_setup_completed stays FALSE) until the same
+    authenticated user explicitly re-confirms it via
+    POST /paypal/connect/confirm.
     """
     user = get_current_user(request)
     user_id = user["id"]
@@ -304,14 +313,18 @@ async def paypal_connect(
     if "@" not in paypal_email or "." not in paypal_email:
         raise HTTPException(status_code=400, detail="Invalid email format")
 
-    # For now, we'll just store the email
-    # In production, you'd verify this with PayPal API
+    # Store the email as pending verification. payment_setup_completed only
+    # reflects providers that are actually confirmed (e.g. an already-active
+    # Stripe Connect account), never this unconfirmed PayPal email.
     await db.execute(
         """
         UPDATE trader_profiles
         SET paypal_email = $1,
-            paypal_merchant_status = 'active',
-            payment_setup_completed = TRUE,
+            paypal_merchant_status = 'pending',
+            payment_setup_completed = CASE
+                WHEN stripe_connect_account_id IS NOT NULL AND stripe_charges_enabled = TRUE THEN TRUE
+                ELSE FALSE
+            END,
             payment_accounts_updated_at = NOW()
         WHERE user_id = $2
         """,
@@ -322,8 +335,62 @@ async def paypal_connect(
     return {
         "success": True,
         "paypal_email": paypal_email,
+        "status": "pending",
+        "message": "PayPal email saved. Confirm it via /paypal/connect/confirm before it can receive payouts."
+    }
+
+
+@router.post("/paypal/connect/confirm")
+async def paypal_connect_confirm(
+    paypal_email: str,
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db)
+):
+    """
+    Second explicit confirmation step for a pending PayPal payout email.
+
+    This codebase has no email/SMTP/SendGrid/Mailgun infrastructure to send a
+    "confirm this is your PayPal email" link, so rather than inventing new
+    infrastructure we require the same authenticated user to explicitly
+    re-submit the exact email they connected. Only then do we mark it active
+    and eligible to receive buyer payouts.
+    """
+    user = get_current_user(request)
+    user_id = user["id"]
+
+    trader = await db.fetchrow(
+        "SELECT paypal_email, paypal_merchant_status FROM trader_profiles WHERE user_id = $1",
+        user_id
+    )
+
+    if not trader or not trader["paypal_email"]:
+        raise HTTPException(status_code=400, detail="No pending PayPal email to confirm")
+
+    if trader["paypal_merchant_status"] == "active":
+        raise HTTPException(status_code=400, detail="PayPal account is already confirmed")
+
+    if paypal_email.strip().lower() != trader["paypal_email"].strip().lower():
+        raise HTTPException(
+            status_code=400,
+            detail="Confirmation email does not match the PayPal email on file"
+        )
+
+    await db.execute(
+        """
+        UPDATE trader_profiles
+        SET paypal_merchant_status = 'active',
+            payment_setup_completed = TRUE,
+            payment_accounts_updated_at = NOW()
+        WHERE user_id = $1
+        """,
+        user_id
+    )
+
+    return {
+        "success": True,
+        "paypal_email": trader["paypal_email"],
         "status": "active",
-        "message": "PayPal account connected successfully"
+        "message": "PayPal account confirmed successfully"
     }
 
 
