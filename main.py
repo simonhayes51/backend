@@ -2060,7 +2060,7 @@ async def get_player_definition(card_id: str):
     if not row:
         return {"error": "Player not found"}
 
-    layers = {"bgImageUrl": None, "cutoutImageUrl": None, "cardName": None}
+    layers = {"bgImageUrl": None, "cutoutImageUrl": None, "cutoutType": None, "cardName": None}
     if row["player_url"]:
         try:
             layers = await fetch_card_layers(row["player_url"])
@@ -2087,6 +2087,7 @@ async def get_player_definition(card_id: str):
             "facePhysicality": row["physicality"],
             "bgImageUrl": layers["bgImageUrl"],
             "cutoutImageUrl": layers["cutoutImageUrl"],
+            "cutoutType": layers.get("cutoutType"),
             "cardName": layers.get("cardName"),
         }
     }

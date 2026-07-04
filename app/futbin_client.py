@@ -263,9 +263,15 @@ def parse_card_layers(html: str) -> Dict[str, Optional[str]]:
     hero = soup.find("div", class_="playercard-l")
     scope = hero or soup
     bg = scope.find("img", class_="playercard-26-bg")
-    cutout = scope.find("img", class_="playercard-26-special-img") or scope.find(
-        "img", class_="playercard-26-base-img"
-    )
+    special_cutout = scope.find("img", class_="playercard-26-special-img")
+    cutout = special_cutout or scope.find("img", class_="playercard-26-base-img")
+    # Special and base cards use visibly different-looking cutout assets on
+    # futbin (special ones read as pre-scaled to fill the card frame; base
+    # gold/silver/bronze cutouts are a closer, more generic headshot crop
+    # that renders far too large if stretched to fill the same frame the
+    # same way) - pass which kind matched through so the frontend can size
+    # each differently instead of treating every cutout the same.
+    cutout_type = "special" if special_cutout else ("base" if cutout else None)
     # futbin's own short display name (e.g. "Cristiano Ronaldo" rather than
     # the full legal name "Cristiano Ronaldo dos Santos Aveiro") - no
     # word-position heuristic on the full name is reliable (this exact
@@ -275,19 +281,23 @@ def parse_card_layers(html: str) -> Dict[str, Optional[str]]:
     return {
         "bgImageUrl": bg.get("src") if bg else None,
         "cutoutImageUrl": cutout.get("src") if cutout else None,
+        "cutoutType": cutout_type,
         "cardName": name_el.get_text(strip=True) if name_el else None,
     }
 
 
-async def fetch_card_layers(player_url: str) -> Dict[str, Optional[str]]:
+_EMPTY_LAYERS = {"bgImageUrl": None, "cutoutImageUrl": None, "cutoutType": None, "cardName": None}
+
+
+async def fetch_card_layers(player_url: str) -> Dict[str, Any]:
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(player_url, headers=HEADERS, timeout=REQUEST_TIMEOUT) as r:
                 if r.status != 200:
-                    return {"bgImageUrl": None, "cutoutImageUrl": None, "cardName": None}
+                    return dict(_EMPTY_LAYERS)
                 html = await r.text()
     except Exception:
-        return {"bgImageUrl": None, "cutoutImageUrl": None, "cardName": None}
+        return dict(_EMPTY_LAYERS)
     return parse_card_layers(html)
 
 
