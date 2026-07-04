@@ -253,18 +253,25 @@ def parse_card_layers(html: str) -> Dict[str, Optional[str]]:
     # templates are identical across cards, but cutout came back as a
     # completely different player). The hero's wrapper is the only one
     # marked "playercard-l" (large) - other instances use a smaller variant.
-    hero = soup.find("div", class_=re.compile(r"\bplayercard-l\b"))
+    # Exact-token string matches, not regex: bs4 already matches a plain
+    # string against individual tokens of a multi-valued class attribute,
+    # which a "\bword\b" regex does NOT reliably narrow to - a hyphen counts
+    # as a word-boundary character, so e.g. r"\bplayercard-26-name\b" also
+    # matches "playercard-26-name-stats-info-wrapper" (confirmed live: that
+    # wrapper matched first, and .get_text() on it concatenated the name
+    # with every stat number/label inside it - "Cristiano Ronaldo94Pac...").
+    hero = soup.find("div", class_="playercard-l")
     scope = hero or soup
-    bg = scope.find("img", class_=re.compile(r"\bplayercard-26-bg\b"))
-    cutout = scope.find("img", class_=re.compile(r"\bplayercard-26-special-img\b")) or scope.find(
-        "img", class_=re.compile(r"\bplayercard-26-base-img\b")
+    bg = scope.find("img", class_="playercard-26-bg")
+    cutout = scope.find("img", class_="playercard-26-special-img") or scope.find(
+        "img", class_="playercard-26-base-img"
     )
     # futbin's own short display name (e.g. "Cristiano Ronaldo" rather than
     # the full legal name "Cristiano Ronaldo dos Santos Aveiro") - no
     # word-position heuristic on the full name is reliable (this exact
     # player is a counterexample: "Ronaldo" is neither the first nor last
     # word), so read what futbin itself renders on the card face instead.
-    name_el = scope.find("div", class_=re.compile(r"\bplayercard-26-name\b"))
+    name_el = scope.find("div", class_="playercard-26-name")
     return {
         "bgImageUrl": bg.get("src") if bg else None,
         "cutoutImageUrl": cutout.get("src") if cutout else None,
