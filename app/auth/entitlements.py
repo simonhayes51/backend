@@ -19,6 +19,8 @@ Feature = Literal[
     "portfolio_optimizer",
     "ai_copilot",
     "market_sentiment",
+    "market_maker",
+    "advanced_analytics",
     "leaderboard",
     "referrals",
     "bulk_trades",
@@ -71,6 +73,8 @@ FEATURE_MATRIX: Dict[Feature, Dict[str, Any]] = {
     "portfolio_optimizer": {"roles": {"Premium"}, "plans": {"pro", "premium", "elite"}},  # Pro+
     "ai_copilot":          {"roles": set(), "plans": {"basic", "pro", "premium", "elite"}},  # All tiers
     "market_sentiment":    {"roles": set(), "plans": {"basic", "pro", "premium", "elite"}},  # All tiers
+    "market_maker":        {"roles": {"Premium"}, "plans": {"elite"}},  # Elite only
+    "advanced_analytics":  {"roles": {"Premium"}, "plans": {"pro", "premium", "elite"}},  # Pro+
     "leaderboard":         {"roles": set(), "plans": {"basic", "pro", "premium", "elite"}},  # All tiers
     "referrals":           {"roles": set(), "plans": {"basic", "pro", "premium", "elite"}},  # All tiers
     "bulk_trades":         {"roles": {"Premium"}, "plans": {"elite"}},  # Elite only
