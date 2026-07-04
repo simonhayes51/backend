@@ -274,8 +274,25 @@ async def ai_copilot(
         # Pattern matching for common questions
         response = ""
 
+        # Live price/value questions - this bot only has static advice text, no
+        # live pricing lookup, so "how much are TOTW cards" or "what's X worth"
+        # must NOT fall through to the generic investment-budget branch below
+        # (it used to, since that branch's "how much" keyword matches almost
+        # any price question too, making unrelated questions return identical
+        # canned text). Answer honestly instead of guessing a number.
+        if any(keyword in message for keyword in [
+            "how much is", "how much are", "how much will", "price of", "current price",
+            "cost of", "worth now", "value of", "totw price", "rise to", "going up", "going to rise",
+        ]):
+            response = "I can't pull live prices in this chat - I only give trading strategy advice, not real-time card values.\n\n"
+            response += "For actual current prices and trends, use:\n"
+            response += "• **Player Search** to look up any card's live price\n"
+            response += "• **Trending** for what's rising/falling right now\n"
+            response += "• **Best Buys** or **Smart Buy** for suggested opportunities\n\n"
+            response += "Ask me about strategy, timing, risk, or your own performance instead!"
+
         # Investment questions
-        if any(keyword in message for keyword in ["invest", "how much", "budget", "coins"]):
+        elif any(keyword in message for keyword in ["how much should i invest", "how much per trade", "invest", "budget", "coins"]):
             if stats and stats["total_profit"] > 0:
                 response = f"Based on your trading history ({stats['total_trades']} trades, {stats['total_profit']:,} profit), I recommend:\n\n"
                 if stats["total_profit"] < 50000:

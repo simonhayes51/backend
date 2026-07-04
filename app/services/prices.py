@@ -1,49 +1,38 @@
 # app/services/prices.py
-# Fast current price from FUT.GG with robust headers.
-# Falls back to the most recent price from price_history if the live endpoint fails.
+# Current BIN price for a card, used by several services (watchlist polling,
+# deal confidence, trending, trade finder). Used to hit fut.gg's price API
+# first with a 10s timeout on every single call - fut.gg 403s scrapers now,
+# so every call paid that full dead-host latency before ever falling back.
+# At the concurrency these callers run at (some scan 100+ candidates), that
+# was minutes of pure timeout before anything could return - the likely
+# cause of pages built on this (e.g. Trade Finder) appearing to never load.
+#
+# Now prefers fut_players.price_num (no network call at all - kept current
+# by the futbin sync crawl), then a live futbin.com fetch, then the most
+# recent point from bucketed sales history. Never touches fut.gg.
 
 from __future__ import annotations
 
-import aiohttp
 from typing import Optional
+
+from app.db import get_player_pool
+from app.futbin_client import fetch_price_by_card_id
 from app.services.price_history import get_price_history
-from app.services.futgg_history import _plat
 
-GG_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-GB,en;q=0.9",
-    "Origin": "https://www.fut.gg",
-    "Referer": "https://www.fut.gg/",
-}
 
-API_URL_TEMPLATE = "https://www.fut.gg/api/fut/player-prices/25/{card_id}"
+async def _db_price(card_id: int) -> int:
+    try:
+        pool = await get_player_pool()
+        async with pool.acquire() as conn:
+            val = await conn.fetchval(
+                "SELECT price_num FROM fut_players WHERE card_id = $1", card_id
+            )
+        return int(val) if val else 0
+    except Exception:
+        return 0
 
-async def _live_price(card_id: int, platform: str = "ps") -> int:
-    url = API_URL_TEMPLATE.format(card_id=card_id)
-    timeout = aiohttp.ClientTimeout(total=10)
-    async with aiohttp.ClientSession(timeout=timeout, headers=GG_HEADERS) as sess:
-        async with sess.get(url) as r:
-            if r.status != 200:
-                return 0
-            data = await r.json()
-            cur = (data.get("data") or {}).get("currentPrice") or {}
-            plat = _plat(platform)
-            if isinstance(cur, dict) and any(k in cur for k in ("ps", "xbox", "pc", "playstation")):
-                key_map = {"ps": "ps", "xbox": "xbox", "pc": "pc", "console": "ps"}
-                k = key_map.get(plat, "ps")
-                node = cur.get(k) or (cur.get("playstation") if k == "ps" else {})
-                cur = node or {}
-            val = cur.get("price")
-            if isinstance(val, (int, float)):
-                return int(val)
-            try:
-                return int(str(val).replace(",", "")) if val is not None else 0
-            except Exception:
-                return 0
 
 async def _fallback_from_history(card_id: int, platform: str) -> int:
-    # Try the latest point from the "today" history
     try:
         hist = await get_price_history(card_id, platform, "today")
         pts = hist.get("points") or []
@@ -54,12 +43,21 @@ async def _fallback_from_history(card_id: int, platform: str) -> int:
     except Exception:
         return 0
 
+
 async def get_player_price(card_id: int, platform: str = "ps") -> int:
     """
     Return current BIN price for a card (PS by default).
-    If live endpoint fails, fall back to last point from history.
+    DB price_num first (fast), then a live futbin fetch, then history.
     """
-    price = await _live_price(card_id, platform)
+    price = await _db_price(card_id)
     if price > 0:
         return price
+
+    try:
+        live = await fetch_price_by_card_id(card_id, platform)
+        if live:
+            return int(live)
+    except Exception:
+        pass
+
     return await _fallback_from_history(card_id, platform)
