@@ -1535,16 +1535,20 @@ async def price_history(playerId: int, platform: str = "ps", tf: str = "today"):
     Price history for the Player Search chart, built from futbin's own
     sales history (real timestamped sales) - fut.gg's price-history API is
     Cloudflare-blocked and unreachable, same reason price/definition moved
-    off it. (The old fallback here called that same dead API, and the
-    primary path was reading the wrong dict key - "history" instead of
-    "points" - so it always fell through to the dead fallback anyway.)
+    off it.
+
+    Response key is "points" (a list of {"t", "price"}), matching what
+    PriceTrendChart.jsx's normalizePoints() actually reads - a previous
+    version of this route wrapped the result as {"history": [...]} instead,
+    which normalizePoints() doesn't recognize, so the chart always rendered
+    empty even once the underlying data was fixed.
     """
     if playerId <= 0:
         raise HTTPException(status_code=400, detail="playerId must be a positive integer")
     try:
         base = await get_price_history(playerId, platform, tf)
-        history = base if isinstance(base, list) else (base.get("points") or [])
-        return {"history": history}
+        points = base if isinstance(base, list) else (base.get("points") or [])
+        return {"points": points}
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Upstream error: {e}")
 
