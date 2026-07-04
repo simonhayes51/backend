@@ -9,7 +9,6 @@ from datetime import datetime, timedelta
 
 # we’ll use your existing services
 from app.services.price_history import get_price_history
-from app.services.prices import get_player_price
 
 router = APIRouter(prefix="/api/trade-finder")
 
@@ -184,7 +183,7 @@ async def trade_finder(
             )""")
 
         sql = f"""
-            SELECT card_id, name, rating, version, image_url, club, league, nation, position, altposition
+            SELECT card_id, name, rating, version, image_url, club, league, nation, position, altposition, price_num
             FROM fut_players
             WHERE {' AND '.join(where)}
             ORDER BY rating DESC NULLS LAST
@@ -197,23 +196,16 @@ async def trade_finder(
         if not meta_rows:
             return {"items": [], "meta": {"catalog_count": 0, "after_live_price_count": 0, "returned": 0, "platform_price_source": plat_live}}
 
-        # ---------------- Live price + history (batched) ----------------
-        # We’ll fetch live price first, then history for those that pass budget.
-        async def _live(cid: int):
-            try:
-                v = await get_player_price(cid, plat_live)
-                return int(v) if isinstance(v, (int, float)) else None
-            except Exception:
-                return None
-
-        # Run live price calls with concurrency
-        sem = asyncio.Semaphore(10)
-        async def _throttled_live(cid: int):
-            async with sem:
-                return await _live(cid)
-
+        # ---------------- Current price (from our own synced DB, not a live call) ----------------
+        # This used to call get_player_price() per candidate, which tries fut.gg's
+        # dead price API first with a 10s timeout before falling back - for up to
+        # 400 candidates at 10-way concurrency that's minutes of pure dead-host
+        # latency before this endpoint could ever return anything, which is why
+        # Trade Finder never appeared to load. fut_players.price_num is kept
+        # current by the futbin sync crawl and needs no per-card network call.
         card_ids: List[int] = []
         metas: Dict[int, Dict[str, Any]] = {}
+        live_prices: List[Optional[int]] = []
         for r in meta_rows:
             try:
                 cid = int(r["card_id"])
@@ -221,10 +213,10 @@ async def trade_finder(
                 continue
             metas[cid] = dict(r)
             card_ids.append(cid)
+            pn = r["price_num"]
+            live_prices.append(int(pn) if pn is not None else None)
 
-        live_prices = await asyncio.gather(*[_throttled_live(cid) for cid in card_ids])
-
-        # Filter by budget + extinct if price None (treat None as unknown)
+        # Filter by budget (treat missing price as unknown, skip)
         candidates: List[int] = []
         after_live = 0
         for cid, price in zip(card_ids, live_prices):
