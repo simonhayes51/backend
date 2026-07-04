@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from app.auth.entitlements import compute_entitlements
-from app.db import get_watchlist_db
+from app.db import get_watchlist_db, get_player_db
 from app.futbin_client import fetch_price_by_card_id
 
 router = APIRouter(prefix="/api/watchlist", tags=["watchlist"])
@@ -76,6 +76,7 @@ class WatchlistCreate(BaseModel):
 async def list_watch_items(
     request: Request,
     wdb = Depends(get_watch_db),
+    pdb = Depends(get_player_db),
 ):
     uid = _uid_param(request)
     rows = await wdb.fetch(
@@ -85,6 +86,26 @@ async def list_watch_items(
     items = [dict(r) for r in rows]
     if not items:
         return {"ok": True, "items": []}
+
+    # Batch meta lookup (card_id is BIGINT)
+    card_ids = [int(it["card_id"]) for it in items if it.get("card_id") is not None]
+    meta_rows = await pdb.fetch(
+        """
+        SELECT card_id, name, rating, club, nation
+        FROM fut_players
+        WHERE card_id = ANY($1::bigint[])
+        """,
+        card_ids,
+    )
+    meta_map = {
+        int(m["card_id"]): {
+            "name": m["name"],
+            "rating": m["rating"],
+            "club": m["club"],
+            "nation": m["nation"],
+        }
+        for m in meta_rows
+    }
 
     # live prices (console by row platform)
     tasks = [_fetch_price(int(it["card_id"]), _plat(it["platform"])) for it in items]
@@ -104,6 +125,7 @@ async def list_watch_items(
             except Exception:
                 pass
 
+        m = meta_map.get(int(it["card_id"]), {}) if it.get("card_id") is not None else {}
         enriched.append({
             "id": it["id"],
             "card_id": it["card_id"],
@@ -118,10 +140,10 @@ async def list_watch_items(
             "change": change,
             "change_pct": change_pct,
             "notes": it["notes"],
-            "name": None,
-            "rating": None,
-            "club": None,
-            "nation": None,
+            "name": m.get("name"),
+            "rating": m.get("rating"),
+            "club": m.get("club"),
+            "nation": m.get("nation"),
         })
 
     return {"ok": True, "items": enriched}
@@ -216,6 +238,7 @@ async def refresh_watch_item(
     watch_id: int,
     request: Request,
     wdb = Depends(get_watch_db),
+    pdb = Depends(get_player_db),
 ):
     uid = _uid_param(request)
     w = await wdb.fetchrow(
@@ -242,6 +265,16 @@ async def refresh_watch_item(
         change = int(live_price) - int(w["started_price"])
         change_pct = round((change / int(w["started_price"])) * 100, 2)
 
+    meta = await pdb.fetchrow(
+        """
+        SELECT card_id, name, rating, club, nation
+        FROM fut_players
+        WHERE card_id::text = $1
+        """,
+        str(w["card_id"]),
+    )
+    meta_dict = dict(meta) if meta else {}
+
     return {
         "ok": True,
         "item": {
@@ -258,9 +291,9 @@ async def refresh_watch_item(
             "change": change,
             "change_pct": change_pct,
             "notes": w["notes"],
-            "name": None,
-            "rating": None,
-            "club": None,
-            "nation": None,
+            "name": meta_dict.get("name"),
+            "rating": meta_dict.get("rating"),
+            "club": meta_dict.get("club"),
+            "nation": meta_dict.get("nation"),
         },
     }
