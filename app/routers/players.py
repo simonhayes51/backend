@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -365,22 +366,43 @@ async def get_player_history_route(
 ):
     """
     Return OHLC candles for a player.
-    Order: FUT.GG service first; if empty, fall back to fut_candles.
+    Order: futbin-backed service first; if empty, fall back to fut_candles.
     Includes 'ts' (epoch seconds) + 'iso' for robust client parsing.
     """
     plat = _plat(platform)
 
-    # 1) Try FUT.GG-backed service
+    # 1) Try futbin-backed service (get_price_history returns {"points": [...]})
     try:
         data = await get_price_history(card_id, plat, tf)
-        if isinstance(data, list) and data:
-            return {
-                "card_id": card_id,
-                "platform": plat,
-                "tf": tf,
-                "history": data,
-                "source": "futgg",
-            }
+        points = data.get("points") if isinstance(data, dict) else None
+        if points:
+            candles = []
+            for pt in points:
+                price = pt.get("price")
+                iso = pt.get("t")
+                if price is None or not iso:
+                    continue
+                try:
+                    ts = int(datetime.fromisoformat(iso).timestamp())
+                except Exception:
+                    continue
+                candles.append({
+                    "ts": ts,
+                    "iso": iso,
+                    "open_time": iso,  # compat
+                    "open": int(price),
+                    "high": int(price),
+                    "low": int(price),
+                    "close": int(price),
+                })
+            if candles:
+                return {
+                    "card_id": card_id,
+                    "platform": plat,
+                    "tf": tf,
+                    "history": candles,
+                    "source": "futbin",
+                }
     except Exception:
         pass  # fall through
 

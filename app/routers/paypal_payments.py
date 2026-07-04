@@ -421,6 +421,49 @@ async def complete_paypal_purchase(
 # PAYPAL WEBHOOKS
 # ============================================================================
 
+async def _verify_paypal_webhook_signature(request: Request, payload: dict) -> bool:
+    """
+    Verify a PayPal webhook using PayPal's verify-webhook-signature API.
+    https://developer.paypal.com/api/rest/webhooks/rest/#link-verifywebhooksignature
+    """
+    webhook_id = os.getenv("PAYPAL_WEBHOOK_ID")
+    if not webhook_id:
+        # Refuse to trust unverifiable webhooks rather than silently accepting them
+        return False
+
+    headers = request.headers
+    transmission_id = headers.get("paypal-transmission-id")
+    transmission_time = headers.get("paypal-transmission-time")
+    transmission_sig = headers.get("paypal-transmission-sig")
+    cert_url = headers.get("paypal-cert-url")
+    auth_algo = headers.get("paypal-auth-algo")
+
+    if not all([transmission_id, transmission_time, transmission_sig, cert_url, auth_algo]):
+        return False
+
+    verification_request = {
+        "auth_algo": auth_algo,
+        "cert_url": cert_url,
+        "transmission_id": transmission_id,
+        "transmission_sig": transmission_sig,
+        "transmission_time": transmission_time,
+        "webhook_id": webhook_id,
+        "webhook_event": payload,
+    }
+
+    try:
+        result = await paypal_client._make_request(
+            "POST",
+            "/v1/notifications/verify-webhook-signature",
+            verification_request,
+        )
+    except Exception as e:
+        print(f"PayPal webhook signature verification failed: {e}")
+        return False
+
+    return result.get("verification_status") == "SUCCESS"
+
+
 @router.post("/webhooks")
 async def paypal_webhook(
     request: Request,
@@ -429,13 +472,11 @@ async def paypal_webhook(
     """
     Handle PayPal webhook events
     """
-    # TODO: Add webhook signature verification for production
-    # webhook_id = os.getenv("PAYPAL_WEBHOOK_ID")
-    # if webhook_id:
-    #     # Verify webhook signature here
-    #     pass
-
     payload = await request.json()
+
+    if not await _verify_paypal_webhook_signature(request, payload):
+        raise HTTPException(status_code=401, detail="Webhook signature verification failed")
+
     event_type = payload.get("event_type")
 
     try:

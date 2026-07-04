@@ -3,7 +3,9 @@ Trader Subscriptions Router - Follow and subscribe to traders
 """
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from typing import List
+import os
 import asyncpg
+import stripe
 from asyncpg import exceptions as asyncpg_exceptions
 
 from app.models.social import (
@@ -520,139 +522,10 @@ async def get_social_recommended_traders(
 
 
 # ============================================================================
-# ONLYFANS-STYLE TIER SUBSCRIPTIONS
+# SINGLE-TIER SUBSCRIPTION (NEW)
 # ============================================================================
 
 from pydantic import BaseModel
-from typing import Optional
-
-
-class TierSubscribeRequest(BaseModel):
-    tier: str  # basic, premium, elite
-
-
-@router.post("/tier/{trader_id}")
-async def subscribe_to_tier(
-    trader_id: str,
-    tier_request: TierSubscribeRequest,
-    request: Request,
-    db: asyncpg.Connection = Depends(get_db),
-):
-    """
-    Subscribe to a specific tier (basic/premium/elite) with price locking
-    DEPRECATED: Use /subscribe/{trader_id} for single-tier subscriptions
-    This endpoint is kept for backward compatibility
-    """
-    user = get_current_user(request)
-    user_id = user["id"]
-
-    if user_id == trader_id:
-        raise HTTPException(status_code=400, detail="Cannot subscribe to yourself")
-
-    # Check if trader exists
-    trader = await db.fetchrow(
-        """
-        SELECT tp.*, up.username
-        FROM trader_profiles tp
-        JOIN user_profiles up ON tp.user_id = up.user_id
-        WHERE tp.user_id = $1
-        """,
-        trader_id
-    )
-
-    if not trader:
-        raise HTTPException(status_code=404, detail="Trader not found")
-
-    # Check if already subscribed to this tier
-    existing = await db.fetchrow(
-        """
-        SELECT * FROM trader_subscriptions
-        WHERE subscriber_id = $1 AND trader_id = $2 AND is_active = TRUE
-        """,
-        user_id,
-        trader_id
-    )
-
-    if existing and existing.get("subscription_type") == tier_request.tier:
-        raise HTTPException(status_code=400, detail=f"Already subscribed to {tier_request.tier} tier")
-
-    # Get tier pricing (backward compatibility)
-    tier_prices = {
-        "basic": 4.99,
-        "premium": 9.99,
-        "elite": 19.99,
-    }
-
-    if tier_request.tier not in tier_prices:
-        raise HTTPException(status_code=400, detail="Invalid tier")
-
-    price = tier_prices[tier_request.tier]
-
-    # Check if founding subscriber (first 100)
-    total_subs = await db.fetchval(
-        "SELECT COUNT(*) FROM trader_subscriptions WHERE trader_id = $1",
-        trader_id
-    )
-
-    is_founding = total_subs < 100
-
-    # Update or create subscription
-    if existing:
-        row = await db.fetchrow(
-            """
-            UPDATE trader_subscriptions
-            SET subscription_type = $1, price_locked = $2,
-                is_founding_subscriber = $3, subscribed_at = NOW()
-            WHERE id = $4
-            RETURNING *
-            """,
-            tier_request.tier,
-            price,
-            is_founding or existing.get("is_founding_subscriber", False),
-            existing["id"]
-        )
-    else:
-        row = await db.fetchrow(
-            """
-            INSERT INTO trader_subscriptions (
-                subscriber_id, trader_id, subscription_type,
-                price_locked, is_founding_subscriber, is_active
-            )
-            VALUES ($1, $2, $3, $4, $5, TRUE)
-            RETURNING *
-            """,
-            user_id,
-            trader_id,
-            tier_request.tier,
-            price,
-            is_founding
-        )
-
-        # Notification for new subscriber
-        await db.execute(
-            """
-            INSERT INTO notifications (
-                user_id, notification_type, title, message, related_user_id
-            )
-            VALUES ($1, 'subscription', 'New Subscriber!', $2, $3)
-            """,
-            trader_id,
-            f"New {tier_request.tier} subscriber!",
-            user_id
-        )
-
-    return {
-        "success": True,
-        "subscription": dict(row),
-        "is_founding_subscriber": is_founding or existing.get("is_founding_subscriber", False),
-        "price_locked": price,
-        "message": f"Successfully subscribed to {tier_request.tier} tier!"
-    }
-
-
-# ============================================================================
-# SINGLE-TIER SUBSCRIPTION (NEW)
-# ============================================================================
 
 @router.post("/subscribe/{trader_id}/paid")
 async def subscribe_paid(
@@ -822,6 +695,10 @@ class TipRequest(BaseModel):
     amount: float
 
 
+class TipConfirmRequest(BaseModel):
+    session_id: str
+
+
 @router.post("/tip")
 async def tip_post(
     tip: TipRequest,
@@ -829,7 +706,13 @@ async def tip_post(
     db: asyncpg.Connection = Depends(get_db),
 ):
     """
-    Tip/boost a trader's post
+    Start a tip/boost payment for a trader's post.
+
+    This used to write straight to post_tips with no charge ever taking
+    place. It now mirrors the Stripe Connect checkout-session pattern used
+    by the real paid-subscription/content-purchase flows: we create a
+    Checkout Session for the tip amount and only record the tip (via
+    /tip/confirm) once Stripe confirms the payment actually happened.
     """
     user = get_current_user(request)
     user_id = user["id"]
@@ -837,53 +720,159 @@ async def tip_post(
     if tip.amount <= 0 or tip.amount > 100:
         raise HTTPException(status_code=400, detail="Tip amount must be between 0 and 100")
 
-    # Get post author
-    post_author = await db.fetchval(
-        "SELECT user_id FROM social_posts WHERE id = $1",
+    # Get post author and their payment account
+    post = await db.fetchrow(
+        """
+        SELECT sp.user_id, tp.stripe_connect_account_id, tp.stripe_charges_enabled
+        FROM social_posts sp
+        LEFT JOIN trader_profiles tp ON sp.user_id = tp.user_id
+        WHERE sp.id = $1
+        """,
         tip.post_id
     )
 
-    if not post_author:
+    if not post:
         raise HTTPException(status_code=404, detail="Post not found")
 
-    if post_author == user_id:
+    post_author = post["user_id"]
+
+    if str(post_author) == str(user_id):
         raise HTTPException(status_code=400, detail="Cannot tip your own post")
 
-    # Record tip
-    await db.execute(
-        """
-        INSERT INTO post_tips (post_id, from_user_id, to_user_id, amount)
-        VALUES ($1, $2, $3, $4)
-        """,
-        tip.post_id,
-        user_id,
-        post_author,
-        tip.amount
+    if not post["stripe_connect_account_id"] or not post["stripe_charges_enabled"]:
+        raise HTTPException(
+            status_code=400,
+            detail="This creator has not set up their payment account yet"
+        )
+
+    amount_cents = int(round(tip.amount * 100))
+    # Matches the 'tip' row in platform_fees (5%)
+    platform_fee_cents = int(round(amount_cents * 0.05))
+
+    frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
+
+    try:
+        session = stripe.checkout.Session.create(
+            payment_method_types=['card'],
+            line_items=[{
+                'price_data': {
+                    'currency': 'gbp',
+                    'product_data': {
+                        'name': f"Tip for post #{tip.post_id}",
+                    },
+                    'unit_amount': amount_cents,
+                },
+                'quantity': 1,
+            }],
+            mode='payment',
+            payment_intent_data={
+                'application_fee_amount': platform_fee_cents,
+                'transfer_data': {
+                    'destination': post["stripe_connect_account_id"],
+                },
+            },
+            success_url=f"{frontend_url}/trader/{post_author}?tipSession={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{frontend_url}/trader/{post_author}?tip=cancelled",
+            metadata={
+                'type': 'post_tip',
+                'post_id': str(tip.post_id),
+                'from_user_id': str(user_id),
+                'to_user_id': str(post_author),
+                'amount': str(tip.amount),
+            }
+        )
+    except stripe.error.StripeError as e:
+        raise HTTPException(status_code=500, detail=f"Stripe error: {str(e)}")
+
+    return {
+        "success": True,
+        "checkoutUrl": session.url,
+        "sessionId": session.id,
+        "message": "Redirect user to checkoutUrl to complete the tip payment"
+    }
+
+
+@router.post("/tip/confirm")
+async def confirm_tip(
+    payload: TipConfirmRequest,
+    request: Request,
+    db: asyncpg.Connection = Depends(get_db),
+):
+    """
+    Confirm a tip payment after the user returns from Stripe Checkout and
+    record it in post_tips. Payment is verified directly against Stripe's
+    API (never trusted from the client), and confirmation is idempotent so
+    a repeated/duplicate call can't double-credit the tip.
+    """
+    user = get_current_user(request)
+    user_id = user["id"]
+
+    try:
+        session = stripe.checkout.Session.retrieve(payload.session_id)
+    except stripe.error.StripeError as e:
+        raise HTTPException(status_code=400, detail=f"Stripe error: {str(e)}")
+
+    if session.payment_status != "paid":
+        raise HTTPException(status_code=400, detail="Payment not completed")
+
+    metadata = session.metadata or {}
+    if metadata.get("type") != "post_tip":
+        raise HTTPException(status_code=400, detail="Invalid checkout session")
+
+    if metadata.get("from_user_id") != str(user_id):
+        raise HTTPException(status_code=403, detail="This checkout session does not belong to you")
+
+    post_id = int(metadata["post_id"])
+    post_author = metadata["to_user_id"]
+    amount = float(metadata["amount"])
+    payment_intent_id = session.payment_intent
+
+    # Idempotent insert - avoid double-crediting if confirm is called more than once
+    existing = await db.fetchval(
+        "SELECT id FROM post_tips WHERE stripe_payment_intent_id = $1",
+        payment_intent_id
     )
 
-    # Notification
-    await db.execute(
-        """
-        INSERT INTO notifications (
-            user_id, notification_type, title, message,
-            related_user_id, related_post_id
+    if not existing:
+        await db.execute(
+            """
+            INSERT INTO post_tips (
+                post_id, from_user_id, to_user_id, amount,
+                processed, stripe_payment_intent_id
+            )
+            VALUES ($1, $2, $3, $4, TRUE, $5)
+            """,
+            post_id,
+            user_id,
+            post_author,
+            amount,
+            payment_intent_id
         )
-        VALUES ($1, 'post_tip', 'New Tip!', $2, $3, $4)
-        """,
-        post_author,
-        f"Someone tipped you ${tip.amount:.2f}!",
-        user_id,
-        tip.post_id
-    )
+
+        # Notification
+        await db.execute(
+            """
+            INSERT INTO notifications (
+                user_id, notification_type, title, message,
+                related_user_id, related_post_id
+            )
+            VALUES ($1, 'post_tip', 'New Tip!', $2, $3, $4)
+            """,
+            post_author,
+            f"Someone tipped you ${amount:.2f}!",
+            user_id,
+            post_id
+        )
 
     # Get total tips for post
     total_tips = await db.fetchval(
         "SELECT COALESCE(SUM(amount), 0) FROM post_tips WHERE post_id = $1",
-        tip.post_id
+        post_id
     )
 
     return {
         "success": True,
+        "post_id": post_id,
         "total_tips": float(total_tips),
         "message": "Tip sent!"
     }

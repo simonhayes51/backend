@@ -178,12 +178,19 @@ async def get_trader_content_requests(
 
     where_clause = " AND ".join(where_clauses)
 
+    if is_authenticated:
+        param_count += 1
+        user_vote_select = f"EXISTS(SELECT 1 FROM content_request_votes WHERE request_id = cr.id AND user_id = ${param_count}) as user_has_voted"
+        params.append(user_id)
+    else:
+        user_vote_select = "FALSE as user_has_voted"
+
     query = f"""
         SELECT
             cr.*,
             up.username as requester_username,
             up.avatar_url as requester_avatar,
-            {f"EXISTS(SELECT 1 FROM content_request_votes WHERE request_id = cr.id AND user_id = '{user_id}') as user_has_voted" if is_authenticated else "FALSE as user_has_voted"}
+            {user_vote_select}
         FROM content_requests cr
         JOIN user_profiles up ON cr.requester_id = up.user_id
         WHERE {where_clause}
