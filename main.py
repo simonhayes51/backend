@@ -52,7 +52,7 @@ from app.routes_ea import router as ea_router
 from app.routes_ingest_sets import router as ingest_router
 from app.routes_sbc_read import router as sbc_read_router
 from app.services.futgg_history import _plat
-from app.futbin_client import fetch_price_by_url, fetch_recent_sales, fetch_card_layers, debug_fetch_player_page
+from app.futbin_client import fetch_price_by_url, fetch_recent_sales, fetch_card_layers
 from app.routers.portfolio import router as portfolio_router
 from app.routers.leaderboard import router as leaderboard_router
 from app.routers.referrals import router as referrals_router
@@ -2019,23 +2019,6 @@ async def delete_trade(trade_id: int, user_id: str = Depends(get_current_user), 
     if result == "DELETE 0":
         raise HTTPException(status_code=404, detail="Trade not found")
     return {"message": "Trade deleted successfully"}
-
-@app.get("/api/_debug/card-layers/{card_id}")
-async def debug_card_layers(card_id: str):
-    """
-    TEMPORARY diagnostic - open this URL directly in a browser for a given
-    card_id. Reports exactly what our own futbin request receives (status,
-    length, whether the card markup is present at all) so we can tell apart
-    "our parser is wrong" from "we're getting a different page than a
-    browser gets" without needing terminal/curl access. Safe to delete once
-    the card-image issue is resolved.
-    """
-    row = await player_pool.fetchrow(
-        "SELECT player_url FROM fut_players WHERE card_id::text = $1", str(card_id)
-    )
-    if not row or not row["player_url"]:
-        return {"error": "no player_url on file for this card_id", "card_id": card_id}
-    return await debug_fetch_player_page(row["player_url"])
 
 @app.get("/api/fut-player-definition/{card_id}")
 async def get_player_definition(card_id: str):
