@@ -245,8 +245,18 @@ def parse_card_layers(html: str) -> Dict[str, Optional[str]]:
     from bs4 import BeautifulSoup
 
     soup = BeautifulSoup(html, "html.parser")
-    bg = soup.find("img", class_=re.compile(r"\bplayercard-26-bg\b"))
-    cutout = soup.find("img", class_=re.compile(r"\bplayercard-26-special-img\b")) or soup.find(
+    # A player page has many playercard-26 instances beyond the hero card -
+    # similar players, other versions, comment avatars - each with their own
+    # playercard-26-bg/-special-img/-base-img. An unscoped search grabs
+    # whichever comes first in DOM order, which is often one of those, not
+    # the hero (confirmed live: bg happened to match since gold-rarity
+    # templates are identical across cards, but cutout came back as a
+    # completely different player). The hero's wrapper is the only one
+    # marked "playercard-l" (large) - other instances use a smaller variant.
+    hero = soup.find("div", class_=re.compile(r"\bplayercard-l\b"))
+    scope = hero or soup
+    bg = scope.find("img", class_=re.compile(r"\bplayercard-26-bg\b"))
+    cutout = scope.find("img", class_=re.compile(r"\bplayercard-26-special-img\b")) or scope.find(
         "img", class_=re.compile(r"\bplayercard-26-base-img\b")
     )
     return {
