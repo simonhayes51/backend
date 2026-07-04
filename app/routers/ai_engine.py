@@ -1,14 +1,25 @@
 # app/routers/ai_engine.py
+import asyncio
+import statistics
 from fastapi import APIRouter, Depends, Request, HTTPException
 from typing import Dict, Any, List
 from pydantic import BaseModel
 from app.db import get_db
 from app.auth.entitlements import compute_entitlements
+from app.services.price_history import get_price_history
 
 router = APIRouter(prefix="/api/ai", tags=["AI Engine"])
 
+class CopilotChatMessage(BaseModel):
+    role: str
+    content: str
+
 class CopilotMessage(BaseModel):
-    message: str
+    # Frontend (TradeCopilot.jsx) POSTs the full running chat transcript as
+    # `messages: [{role, content}, ...]` plus a `context` object - it never
+    # sends a single top-level `message` string, so that shape 422'd every
+    # request before the handler ran.
+    messages: List[CopilotChatMessage] = []
     context: Dict[str, Any] = {}
 
 def _pct(a: float, b: float) -> float:
@@ -61,33 +72,73 @@ async def top_buys(
                 limit
             )
         
-        results = []
+        # Keep only rows with a usable current price before doing any
+        # network work for history.
+        candidates = []
         for row in rows:
-            # Get the actual price value
             if row["price_num"]:
                 current_price = int(row["price_num"])
             elif row["price"] and str(row["price"]).isdigit():
                 current_price = int(row["price"])
             else:
                 continue  # Skip if no valid price
-            
-            # Mock some analysis data based on price patterns
-            card_id_int = int(row["card_id"])
-            price_variance = (card_id_int % 100) / 1000  # Mock variance 0-0.1
-            
-            # Simulate median price (slightly different from current)
-            median7 = int(current_price * (0.95 + price_variance))
-            
-            # Calculate percentage difference
-            if median7 > 0:
-                cheap_pct = (current_price - median7) / median7
-            else:
-                cheap_pct = 0
-            
-            # Mock volume (based on rating and price)
-            vol24 = max(10, (row["rating"] or 75) - 50 + (card_id_int % 30))
-            
-            # Determine risk level
+            candidates.append((row, current_price))
+
+        if not candidates:
+            return []
+
+        # Real market history (futbin-derived sales, bucketed by
+        # get_price_history) for each candidate. These are outbound network
+        # calls to futbin per card, so fetch them concurrently but bounded -
+        # same throttling pattern used for get_price_history() calls in
+        # app/routers/trade_finder.py (asyncio.Semaphore + gather).
+        sem = asyncio.Semaphore(8)
+
+        async def _throttled_hist(card_id: int) -> Dict[str, Any]:
+            async with sem:
+                try:
+                    return await get_price_history(card_id, platform, "week")
+                except Exception:
+                    return {"points": []}
+
+        histories = await asyncio.gather(
+            *(_throttled_hist(int(row["card_id"])) for row, _ in candidates)
+        )
+
+        results = []
+        for (row, current_price), hist in zip(candidates, histories):
+            points = (hist or {}).get("points") or []
+            prices = [
+                float(p["price"])
+                for p in points
+                if isinstance(p, dict) and p.get("price") is not None
+            ]
+
+            if not prices:
+                # No real market signal for this card at all - skip it
+                # rather than present a fabricated "good buy" score.
+                continue
+
+            # "median7" = real median sale price over the (up to 7-day)
+            # history window returned by get_price_history(tf="week"),
+            # not a guess derived from the current price.
+            median7 = statistics.median(prices)
+
+            # Same cheap/expensive-vs-median formula as before, just fed by
+            # the real median instead of a fabricated one.
+            cheap_pct = (current_price - median7) / median7 if median7 else 0.0
+
+            # No dedicated trade-count/volume field is exposed by
+            # get_price_history() (futbin has no public sales-volume API,
+            # only the bucketed price series), and fut_candles.volume is a
+            # tick-count from the older fut.gg-fed pipeline keyed off a
+            # different id space. So use the number of real bucketed price
+            # points returned for this card over the window as a genuine
+            # liquidity/activity proxy - more tracked data points means the
+            # card is more actively traded/tracked, not a hash of card_id.
+            vol24 = len(prices)
+
+            # Same risk thresholds as before, now driven by real cheap_pct.
             abs_cheap_pct = abs(cheap_pct)
             if abs_cheap_pct < 0.05:
                 risk_label = "Low"
@@ -95,7 +146,7 @@ async def top_buys(
                 risk_label = "Medium"
             else:
                 risk_label = "High"
-            
+
             results.append({
                 "player_card_id": str(row["card_id"]),  # Use card_id, not player_card_id
                 "player": {
@@ -106,12 +157,12 @@ async def top_buys(
                     "image_url": row["image_url"]
                 },
                 "current": current_price,
-                "median7": median7,
+                "median7": int(round(median7)),
                 "cheap_pct": cheap_pct,
                 "vol24": vol24,
                 "risk_label": risk_label
             })
-        
+
         return results
         
     except Exception as e:
@@ -184,7 +235,14 @@ async def ai_copilot(
         ent = await compute_entitlements(req)
         user_id = ent.get("user_id")
 
-        message = body.message.lower().strip()
+        # Frontend sends the full transcript as `messages`; pull the latest
+        # user turn's text and feed it into the existing keyword-matching
+        # logic below exactly where it used to use `body.message`.
+        user_messages = [m for m in body.messages if m.role == "user"]
+        if not user_messages:
+            raise HTTPException(status_code=422, detail="No user message provided in 'messages'")
+
+        message = user_messages[-1].content.lower().strip()
 
         # Get user's trading stats if authenticated
         stats = None
