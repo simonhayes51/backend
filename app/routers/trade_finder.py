@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from app.services.price_history import get_price_history
 from app.services.prices import get_player_price
 
-router = APIRouter()
+router = APIRouter(prefix="/api/trade-finder")
 
 # ---------- helpers ----------
 def _collapse_platform(p: str) -> str:
@@ -102,7 +102,7 @@ def _margin_pct(buy_like_current: int, target_sell: int) -> float:
     return 100.0 * ((target_sell - tax - buy_like_current) / buy_like_current)
 
 # -------------------------------- GET /api/trade-finder --------------------------------
-@router.get("/trade-finder")
+@router.get("")
 async def trade_finder(
     request: Request,
     platform: str = Query("console", pattern="^(console|pc)$"),
@@ -328,8 +328,8 @@ def _pct_change(vals: List[int]) -> float:
     except Exception:
         return 0.0
 
-# -------------------------------- POST /api/trade-insight --------------------------------
-@router.post("/trade-insight")
+# -------------------------------- POST /api/trade-finder/explain --------------------------------
+@router.post("/explain")
 async def trade_insight(payload: Dict[str, Any]):
     deal = payload.get("deal") or {}
     name = deal.get("name", f"Card {deal.get('player_id') or deal.get('card_id')}")
