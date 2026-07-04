@@ -265,3 +265,29 @@ async def fetch_card_layers(player_url: str) -> Dict[str, Optional[str]]:
     except Exception:
         return {"bgImageUrl": None, "cutoutImageUrl": None}
     return parse_card_layers(html)
+
+
+async def debug_fetch_player_page(player_url: str) -> Dict[str, Any]:
+    """Temporary diagnostic - reports what our own request actually gets
+    back from futbin, to tell apart 'parser is wrong' from 'we're getting a
+    different page than a browser gets' without needing terminal/curl
+    access on either end."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(player_url, headers=HEADERS, timeout=REQUEST_TIMEOUT) as r:
+                status = r.status
+                html = await r.text()
+    except Exception as e:
+        return {"player_url": player_url, "error": str(e)}
+
+    idx = html.find("playercard-26-bg")
+    return {
+        "player_url": player_url,
+        "http_status": status,
+        "content_length": len(html),
+        "has_playercard_26": "playercard-26" in html,
+        "playercard_26_bg_count": html.count("playercard-26-bg"),
+        "has_price_box": "price-box" in html or "platform-ps-only" in html,
+        "sample_around_first_match": html[max(0, idx - 150): idx + 150] if idx != -1 else None,
+        "layers_parsed": parse_card_layers(html),
+    }
