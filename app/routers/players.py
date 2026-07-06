@@ -581,6 +581,126 @@ async def get_player_sales_history_route(
         return {"card_id": card_id, "platform": "ps", "sales": []}
 
 
+@router.get("/{card_id}/market-metrics")
+async def get_player_market_metrics_route(
+    card_id: int,
+    conn = Depends(get_player_db),
+):
+    """
+    The real numbers a trader needs that plain BIN price doesn't give you,
+    computed from bin_history/sales_history: real sold price vs current
+    BIN, liquidity (sales/hour), volatility (sold-price stddev), a snipe
+    index (how often sales clear well below the trailing median), and a
+    tax-aware margin estimate. sales_history only covers the PS market, so
+    BIN comparisons here use the ps platform to match.
+    """
+    try:
+        bin_rows = await conn.fetch(
+            """
+            SELECT DISTINCT ON (platform) platform, lowest_bin, captured_at
+            FROM bin_history
+            WHERE player_id = $1 AND lowest_bin IS NOT NULL
+            ORDER BY platform, captured_at DESC
+            """,
+            card_id,
+        )
+        current_bin = {r["platform"]: r["lowest_bin"] for r in bin_rows}
+        ps_bin = current_bin.get("ps")
+
+        stats = await conn.fetchrow(
+            """
+            WITH stats AS (
+                SELECT
+                    COUNT(*) FILTER (WHERE sold_at >= NOW() - INTERVAL '1 hour') AS n_1h,
+                    COUNT(*) FILTER (WHERE sold_at >= NOW() - INTERVAL '24 hours') AS n_24h,
+                    COUNT(*) FILTER (WHERE sold_at >= NOW() - INTERVAL '7 days') AS n_7d,
+                    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY sold_price)
+                        FILTER (WHERE sold_at >= NOW() - INTERVAL '24 hours') AS median_24h,
+                    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY sold_price)
+                        FILTER (WHERE sold_at >= NOW() - INTERVAL '7 days') AS median_7d,
+                    STDDEV_POP(sold_price) FILTER (WHERE sold_at >= NOW() - INTERVAL '24 hours') AS stddev_24h,
+                    STDDEV_POP(sold_price) FILTER (WHERE sold_at >= NOW() - INTERVAL '7 days') AS stddev_7d
+                FROM sales_history
+                WHERE player_id = $1
+            )
+            SELECT
+                stats.*,
+                (
+                    SELECT COUNT(*) FROM sales_history
+                    WHERE player_id = $1
+                      AND sold_at >= NOW() - INTERVAL '24 hours'
+                      AND sold_price <= stats.median_24h * 0.85
+                ) AS snipe_count_24h
+            FROM stats
+            """,
+            card_id,
+        )
+
+        n_1h = stats["n_1h"] or 0
+        n_24h = stats["n_24h"] or 0
+        n_7d = stats["n_7d"] or 0
+        median_24h = float(stats["median_24h"]) if stats["median_24h"] is not None else None
+        median_7d = float(stats["median_7d"]) if stats["median_7d"] is not None else None
+        stddev_24h = float(stats["stddev_24h"]) if stats["stddev_24h"] is not None else None
+        stddev_7d = float(stats["stddev_7d"]) if stats["stddev_7d"] is not None else None
+        snipe_count_24h = stats["snipe_count_24h"] or 0
+
+        divergence_pct_24h = None
+        if ps_bin and median_24h is not None:
+            divergence_pct_24h = round((median_24h - ps_bin) / ps_bin * 100, 2)
+
+        cv_24h = round((stddev_24h or 0) / median_24h, 4) if median_24h else None
+
+        snipe_index_24h = round(snipe_count_24h / n_24h, 3) if n_24h > 0 else None
+
+        margin = None
+        if ps_bin and median_24h is not None:
+            net_after_tax = median_24h * 0.95
+            est_margin_coins = round(net_after_tax - ps_bin)
+            margin = {
+                "buyAt": ps_bin,
+                "sellAt": round(median_24h),
+                "netAfterTax": round(net_after_tax),
+                "estMarginCoins": est_margin_coins,
+                "estMarginPct": round(est_margin_coins / ps_bin * 100, 2),
+            }
+
+        return {
+            "card_id": card_id,
+            "currentBin": current_bin,
+            "realPrice": {
+                "medianSold24h": median_24h,
+                "medianSold7d": median_7d,
+                "sampleSize24h": n_24h,
+                "sampleSize7d": n_7d,
+            },
+            "divergencePct24h": divergence_pct_24h,
+            "liquidity": {
+                "salesLast1h": n_1h,
+                "salesLast24h": n_24h,
+                "salesPerHour24h": round(n_24h / 24.0, 2),
+            },
+            "volatility": {
+                "stddev24h": stddev_24h,
+                "stddev7d": stddev_7d,
+                "coefficientOfVariation24h": cv_24h,
+            },
+            "snipeIndex24h": snipe_index_24h,
+            "taxAwareMargin": margin,
+        }
+    except Exception:
+        return {
+            "card_id": card_id,
+            "currentBin": {},
+            "realPrice": {"medianSold24h": None, "medianSold7d": None, "sampleSize24h": 0, "sampleSize7d": 0},
+            "divergencePct24h": None,
+            "liquidity": {"salesLast1h": 0, "salesLast24h": 0, "salesPerHour24h": 0},
+            "volatility": {"stddev24h": None, "stddev7d": None, "coefficientOfVariation24h": None},
+            "snipeIndex24h": None,
+            "taxAwareMargin": None,
+        }
+
+
 @router.get("/batch/meta")
 async def batch_meta(
     ids: str = Query(..., description="CSV of card_ids"),
