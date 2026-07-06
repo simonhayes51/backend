@@ -774,7 +774,7 @@ async def get_player_sales_candles_route(
                         ORDER BY sold_at DESC
                     ) AS rn_close
                 FROM sales_history
-                WHERE player_id = $1 AND sold_at >= NOW() - ($3 || ' days')::interval
+                WHERE player_id = $1 AND sold_at >= NOW() - make_interval(days => $3)
             )
             SELECT
                 bucket_start,
@@ -810,7 +810,7 @@ async def get_player_sales_candles_route(
             """
             SELECT sold_price, sold_at
             FROM sales_history
-            WHERE player_id = $1 AND sold_at >= NOW() - ($2 || ' days')::interval
+            WHERE player_id = $1 AND sold_at >= NOW() - make_interval(days => $2)
             ORDER BY sold_at ASC
             LIMIT 300
             """,
@@ -848,7 +848,7 @@ async def get_player_backtest_route(
             WITH recent AS (
                 SELECT sold_price, sold_at
                 FROM sales_history
-                WHERE player_id = $1 AND sold_at >= NOW() - ($4 || ' days')::interval
+                WHERE player_id = $1 AND sold_at >= NOW() - make_interval(days => $4)
                 ORDER BY sold_at DESC
                 LIMIT 5000
             ),
