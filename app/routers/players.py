@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from app.services.price_history import get_price_history
 from app.db import get_player_db
 from app.futbin_client import fetch_price_by_url
+from app.auth.entitlements import require_feature
 
 router = APIRouter(prefix="/api/players", tags=["players"])
 
@@ -825,7 +826,7 @@ async def get_player_sales_candles_route(
         return {"card_id": card_id, "platform": "ps", "bucketHours": bucket_hours, "candles": [], "sales": []}
 
 
-@router.get("/{card_id}/backtest")
+@router.get("/{card_id}/backtest", dependencies=[Depends(require_feature("backtest"))])
 async def get_player_backtest_route(
     card_id: int,
     buy_below: float = Query(..., gt=0, description="simulate buying whenever a sale clears at or below this price"),

@@ -53,6 +53,8 @@ from app.routers.portfolio import router as portfolio_router
 from app.routers.leaderboard import router as leaderboard_router
 from app.routers.referrals import router as referrals_router
 from app.routers.trades import router as trades_router
+from app.routers.api_keys import router as api_keys_router
+from app.routers.public_api import router as public_api_router
 
 
 # ----------------- BOOTSTRAP -----------------
@@ -570,6 +572,24 @@ async def lifespan(app: FastAPI):
             assigned_at TIMESTAMP DEFAULT NOW(),
             expires_at TIMESTAMP
         ) """)
+
+        # Public/paid historical-data API keys (app/routers/api_keys.py,
+        # app/routers/public_api.py) - only the SHA-256 hash is stored, the
+        # plaintext key is shown to the user exactly once at creation time.
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS api_keys (
+            id BIGSERIAL PRIMARY KEY,
+            user_id VARCHAR(255) NOT NULL,
+            name TEXT,
+            key_hash TEXT NOT NULL UNIQUE,
+            key_prefix TEXT NOT NULL,
+            rate_limit_per_minute INT NOT NULL DEFAULT 60,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            last_used_at TIMESTAMPTZ,
+            revoked_at TIMESTAMPTZ
+        )""")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id)")
+        await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash)")
 
         # trading_goals
         await conn.execute("""
@@ -1192,6 +1212,10 @@ app.include_router(portfolio_router)        # /api/ai/optimize-portfolio
 app.include_router(leaderboard_router)      # /api/leaderboard/*
 app.include_router(referrals_router)        # /api/referrals/*
 app.include_router(trades_router)           # /api/trades/*
+
+# Public/paid historical-data API
+app.include_router(api_keys_router)         # /api/api-keys/* (session-authed key management)
+app.include_router(public_api_router)       # /api/public/v1/* (API-key-authed)
 
 # Premium-only — mount at /api/smart-buy
 app.include_router(
