@@ -825,6 +825,100 @@ async def get_player_sales_candles_route(
         return {"card_id": card_id, "platform": "ps", "bucketHours": bucket_hours, "candles": [], "sales": []}
 
 
+@router.get("/{card_id}/backtest")
+async def get_player_backtest_route(
+    card_id: int,
+    buy_below: float = Query(..., gt=0, description="simulate buying whenever a sale clears at or below this price"),
+    hold_sales: int = Query(1, ge=1, le=20, description="sell at the Nth sale after the buy (1 = the very next sale)"),
+    days: int = Query(30, ge=1, le=30, description="lookback window in days"),
+    conn = Depends(get_player_db),
+):
+    """
+    Backtests a simple flip rule against real completed sales - something
+    no BIN-only price site can offer, since it requires actual transaction
+    history: "whenever this card sold at or below X, what if I'd bought it
+    and sold at the Nth sale after that, net of EA's tax?" Bounded to the
+    last 5000 sales in the window so a high-liquidity card doesn't force an
+    unbounded LEAD() window scan.
+    """
+    try:
+        rows = await conn.fetch(
+            """
+            WITH recent AS (
+                SELECT sold_price, sold_at
+                FROM sales_history
+                WHERE player_id = $1 AND sold_at >= NOW() - ($4 || ' days')::interval
+                ORDER BY sold_at DESC
+                LIMIT 5000
+            ),
+            base AS (
+                SELECT
+                    sold_price AS buy_price,
+                    sold_at AS buy_time,
+                    LEAD(sold_price, $3) OVER (ORDER BY sold_at) AS sell_price,
+                    LEAD(sold_at, $3) OVER (ORDER BY sold_at) AS sell_time
+                FROM recent
+            )
+            SELECT
+                buy_price, buy_time, sell_price, sell_time,
+                (sell_price * 0.95) AS net_sell,
+                (sell_price * 0.95 - buy_price) AS profit
+            FROM base
+            WHERE buy_price <= $2 AND sell_price IS NOT NULL
+            ORDER BY buy_time ASC
+            """,
+            card_id, buy_below, hold_sales, days,
+        )
+
+        if not rows:
+            return {
+                "card_id": card_id,
+                "rule": {"buyBelow": buy_below, "holdSales": hold_sales, "days": days},
+                "trades": [],
+                "summary": None,
+            }
+
+        profits = [float(r["profit"]) for r in rows]
+        wins = [p for p in profits if p > 0]
+        total_profit = sum(profits)
+        n = len(profits)
+
+        trades = [
+            {
+                "buyAt": r["buy_price"],
+                "buyTime": r["buy_time"].isoformat(),
+                "sellAt": r["sell_price"],
+                "sellTime": r["sell_time"].isoformat(),
+                "netSell": round(float(r["net_sell"])),
+                "profitCoins": round(float(r["profit"])),
+                "profitPct": round(float(r["profit"]) / r["buy_price"] * 100, 2) if r["buy_price"] else None,
+            }
+            for r in rows[-100:]  # most recent 100 for display; summary covers all
+        ]
+
+        return {
+            "card_id": card_id,
+            "rule": {"buyBelow": buy_below, "holdSales": hold_sales, "days": days},
+            "trades": trades,
+            "summary": {
+                "tradeCount": n,
+                "winCount": len(wins),
+                "winRate": round(len(wins) / n * 100, 1),
+                "totalProfitCoins": round(total_profit),
+                "avgProfitCoins": round(total_profit / n),
+                "bestTradeCoins": round(max(profits)),
+                "worstTradeCoins": round(min(profits)),
+            },
+        }
+    except Exception:
+        return {
+            "card_id": card_id,
+            "rule": {"buyBelow": buy_below, "holdSales": hold_sales, "days": days},
+            "trades": [],
+            "summary": None,
+        }
+
+
 @router.get("/{card_id}/market-metrics")
 async def get_player_market_metrics_route(
     card_id: int,
