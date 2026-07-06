@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from app.services.price_history import get_price_history
 from app.db import get_player_db
 from app.futbin_client import fetch_price_by_url
+from app.auth.entitlements import require_feature
 
 router = APIRouter(prefix="/api/players", tags=["players"])
 
@@ -739,6 +740,184 @@ async def get_player_sales_history_route(
         return {"card_id": card_id, "platform": "ps", "sales": sales}
     except Exception:
         return {"card_id": card_id, "platform": "ps", "sales": []}
+
+
+@router.get("/{card_id}/sales-candles")
+async def get_player_sales_candles_route(
+    card_id: int,
+    bucket_hours: float = Query(1, gt=0, le=24, description="candle width in hours"),
+    days: int = Query(7, ge=1, le=30, description="lookback window in days"),
+    conn = Depends(get_player_db),
+):
+    """
+    Real OHLC candles built from actual completed sales (sales_history),
+    not the BIN-snapshot line the frontend used to show. Also returns the
+    raw sale points in the same window so the chart can overlay individual
+    sale markers on top of the candles. PS market only, per the collector's
+    scope.
+    """
+    try:
+        bucket_seconds = bucket_hours * 3600
+        rows = await conn.fetch(
+            """
+            WITH bucketed AS (
+                SELECT
+                    to_timestamp(floor(extract(epoch FROM sold_at) / $2::float) * $2::float) AS bucket_start,
+                    sold_price,
+                    sold_at,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY floor(extract(epoch FROM sold_at) / $2::float)
+                        ORDER BY sold_at ASC
+                    ) AS rn_open,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY floor(extract(epoch FROM sold_at) / $2::float)
+                        ORDER BY sold_at DESC
+                    ) AS rn_close
+                FROM sales_history
+                WHERE player_id = $1 AND sold_at >= NOW() - ($3 || ' days')::interval
+            )
+            SELECT
+                bucket_start,
+                MAX(CASE WHEN rn_open = 1 THEN sold_price END) AS open,
+                MAX(sold_price) AS high,
+                MIN(sold_price) AS low,
+                MAX(CASE WHEN rn_close = 1 THEN sold_price END) AS close,
+                COUNT(*) AS volume
+            FROM bucketed
+            GROUP BY bucket_start
+            ORDER BY bucket_start ASC
+            """,
+            card_id, bucket_seconds, days,
+        )
+        candles = [
+            {
+                "time": int(r["bucket_start"].timestamp()),
+                "open": r["open"],
+                "high": r["high"],
+                "low": r["low"],
+                "close": r["close"],
+                "volume": r["volume"],
+            }
+            for r in rows
+        ]
+
+        # Capped well below what a high-liquidity card can produce (seen up
+        # to ~12k sales/day in production) - beyond this, individual markers
+        # would just paint a solid line on top of the candles instead of
+        # conveying anything; the candle bodies/wicks already are the real
+        # sale data at that volume, just aggregated.
+        sale_rows = await conn.fetch(
+            """
+            SELECT sold_price, sold_at
+            FROM sales_history
+            WHERE player_id = $1 AND sold_at >= NOW() - ($2 || ' days')::interval
+            ORDER BY sold_at ASC
+            LIMIT 300
+            """,
+            card_id, days,
+        )
+        sales = [
+            {"time": int(r["sold_at"].timestamp()), "price": r["sold_price"]}
+            for r in sale_rows
+        ]
+
+        return {"card_id": card_id, "platform": "ps", "bucketHours": bucket_hours, "candles": candles, "sales": sales}
+    except Exception:
+        return {"card_id": card_id, "platform": "ps", "bucketHours": bucket_hours, "candles": [], "sales": []}
+
+
+@router.get("/{card_id}/backtest", dependencies=[Depends(require_feature("backtest"))])
+async def get_player_backtest_route(
+    card_id: int,
+    buy_below: float = Query(..., gt=0, description="simulate buying whenever a sale clears at or below this price"),
+    hold_sales: int = Query(1, ge=1, le=20, description="sell at the Nth sale after the buy (1 = the very next sale)"),
+    days: int = Query(30, ge=1, le=30, description="lookback window in days"),
+    conn = Depends(get_player_db),
+):
+    """
+    Backtests a simple flip rule against real completed sales - something
+    no BIN-only price site can offer, since it requires actual transaction
+    history: "whenever this card sold at or below X, what if I'd bought it
+    and sold at the Nth sale after that, net of EA's tax?" Bounded to the
+    last 5000 sales in the window so a high-liquidity card doesn't force an
+    unbounded LEAD() window scan.
+    """
+    try:
+        rows = await conn.fetch(
+            """
+            WITH recent AS (
+                SELECT sold_price, sold_at
+                FROM sales_history
+                WHERE player_id = $1 AND sold_at >= NOW() - ($4 || ' days')::interval
+                ORDER BY sold_at DESC
+                LIMIT 5000
+            ),
+            base AS (
+                SELECT
+                    sold_price AS buy_price,
+                    sold_at AS buy_time,
+                    LEAD(sold_price, $3) OVER (ORDER BY sold_at) AS sell_price,
+                    LEAD(sold_at, $3) OVER (ORDER BY sold_at) AS sell_time
+                FROM recent
+            )
+            SELECT
+                buy_price, buy_time, sell_price, sell_time,
+                (sell_price * 0.95) AS net_sell,
+                (sell_price * 0.95 - buy_price) AS profit
+            FROM base
+            WHERE buy_price <= $2 AND sell_price IS NOT NULL
+            ORDER BY buy_time ASC
+            """,
+            card_id, buy_below, hold_sales, days,
+        )
+
+        if not rows:
+            return {
+                "card_id": card_id,
+                "rule": {"buyBelow": buy_below, "holdSales": hold_sales, "days": days},
+                "trades": [],
+                "summary": None,
+            }
+
+        profits = [float(r["profit"]) for r in rows]
+        wins = [p for p in profits if p > 0]
+        total_profit = sum(profits)
+        n = len(profits)
+
+        trades = [
+            {
+                "buyAt": r["buy_price"],
+                "buyTime": r["buy_time"].isoformat(),
+                "sellAt": r["sell_price"],
+                "sellTime": r["sell_time"].isoformat(),
+                "netSell": round(float(r["net_sell"])),
+                "profitCoins": round(float(r["profit"])),
+                "profitPct": round(float(r["profit"]) / r["buy_price"] * 100, 2) if r["buy_price"] else None,
+            }
+            for r in rows[-100:]  # most recent 100 for display; summary covers all
+        ]
+
+        return {
+            "card_id": card_id,
+            "rule": {"buyBelow": buy_below, "holdSales": hold_sales, "days": days},
+            "trades": trades,
+            "summary": {
+                "tradeCount": n,
+                "winCount": len(wins),
+                "winRate": round(len(wins) / n * 100, 1),
+                "totalProfitCoins": round(total_profit),
+                "avgProfitCoins": round(total_profit / n),
+                "bestTradeCoins": round(max(profits)),
+                "worstTradeCoins": round(min(profits)),
+            },
+        }
+    except Exception:
+        return {
+            "card_id": card_id,
+            "rule": {"buyBelow": buy_below, "holdSales": hold_sales, "days": days},
+            "trades": [],
+            "summary": None,
+        }
 
 
 @router.get("/{card_id}/market-metrics")

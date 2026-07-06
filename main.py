@@ -53,6 +53,8 @@ from app.routers.portfolio import router as portfolio_router
 from app.routers.leaderboard import router as leaderboard_router
 from app.routers.referrals import router as referrals_router
 from app.routers.trades import router as trades_router
+from app.routers.api_keys import router as api_keys_router
+from app.routers.public_api import router as public_api_router
 
 
 # ----------------- BOOTSTRAP -----------------
@@ -388,8 +390,13 @@ class WatchlistCreate(BaseModel):
 class WatchlistAlertCreate(BaseModel):
     card_id: int
     platform: str  # ps|xbox|pc
+    metric: Optional[str] = "price"  # price | liquidity
     rise_pct: Optional[float] = 5
     fall_pct: Optional[float] = 5
+    # ref_mode only applies to metric="price" - last_close/started_price both
+    # need a price history that doesn't exist for liquidity. Liquidity alerts
+    # always use a fixed reference, auto-snapshotted at creation time if the
+    # caller doesn't supply ref_price explicitly.
     ref_mode: Optional[str] = "last_close"  # last_close | fixed | started_price
     ref_price: Optional[float] = None
     cooloff_minutes: Optional[int] = 30
@@ -566,6 +573,24 @@ async def lifespan(app: FastAPI):
             expires_at TIMESTAMP
         ) """)
 
+        # Public/paid historical-data API keys (app/routers/api_keys.py,
+        # app/routers/public_api.py) - only the SHA-256 hash is stored, the
+        # plaintext key is shown to the user exactly once at creation time.
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS api_keys (
+            id BIGSERIAL PRIMARY KEY,
+            user_id VARCHAR(255) NOT NULL,
+            name TEXT,
+            key_hash TEXT NOT NULL UNIQUE,
+            key_prefix TEXT NOT NULL,
+            rate_limit_per_minute INT NOT NULL DEFAULT 60,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            last_used_at TIMESTAMPTZ,
+            revoked_at TIMESTAMPTZ
+        )""")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id)")
+        await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash)")
+
         # trading_goals
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS trading_goals (
@@ -709,6 +734,7 @@ async def lifespan(app: FastAPI):
           user_discord_id TEXT,
           card_id BIGINT NOT NULL,
           platform TEXT NOT NULL CHECK (platform IN ('ps','xbox','pc')),
+          metric TEXT NOT NULL DEFAULT 'price' CHECK (metric IN ('price','liquidity')),
           ref_mode TEXT NOT NULL DEFAULT 'last_close',
           ref_price NUMERIC,
           rise_pct NUMERIC DEFAULT 5,
@@ -721,8 +747,17 @@ async def lifespan(app: FastAPI):
           last_alert_at TIMESTAMPTZ,
           created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )""")
+        # Additive - table may already exist from before liquidity alerts existed.
+        await wconn.execute("""
+            ALTER TABLE watchlist_alerts
+            ADD COLUMN IF NOT EXISTS metric TEXT NOT NULL DEFAULT 'price'
+        """)
         await wconn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_user ON watchlist_alerts(user_id)")
         await wconn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_pair ON watchlist_alerts(card_id, platform)")
+        # New name (not a rename of idx_alerts_pair above) so this is created
+        # fresh even on a DB where the table/old index already existed before
+        # the metric column was added.
+        await wconn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_pair_metric ON watchlist_alerts(card_id, platform, metric)")
 
         await wconn.execute("""
         CREATE TABLE IF NOT EXISTS alerts_log (
@@ -1062,7 +1097,41 @@ def require_extension_jwt(request: Request):
         raise HTTPException(status_code=403, detail="Insufficient scope")
     return SimpleNamespace(discord_id=payload.get("sub"))
 
-# (fetch_price defined earlier in the file — keep only one definition in main.py)
+# fetch_price() was called from three places (_poll_pair_once,
+# test_alert_endpoint, deal_confidence) but never actually defined anywhere
+# in the codebase - the alert poll loop crashed with NameError every time
+# it ran, so watchlist price alerts have never fired. Reads the daily-synced
+# fut_players.price_num rather than a live FUTBIN fetch, since this runs
+# across every distinct watched card/platform on a poll loop.
+async def fetch_price(card_id: int, platform: str = "ps") -> Dict[str, Any]:
+    try:
+        async with player_pool.acquire() as p:
+            val = await p.fetchval(
+                "SELECT price_num FROM fut_players WHERE card_id = $1", card_id
+            )
+        return {"price": int(val) if val else None, "isExtinct": val is None}
+    except Exception:
+        return {"price": None, "isExtinct": True}
+
+
+# Real liquidity (sales/hour, trailing 24h) for a card, from sales_history -
+# the second alert metric alongside price, computed the same way as
+# /api/players/{id}/market-metrics.
+async def fetch_liquidity(card_id: int) -> Dict[str, Any]:
+    try:
+        async with player_pool.acquire() as p:
+            n = await p.fetchval(
+                """
+                SELECT COUNT(*) FROM sales_history
+                WHERE player_id = $1 AND sold_at >= NOW() - INTERVAL '24 hours'
+                """,
+                card_id,
+            )
+        n = n or 0
+        return {"price": round(n / 24.0, 2), "isExtinct": n == 0}
+    except Exception:
+        return {"price": None, "isExtinct": True}
+
 
 ext_router = APIRouter()
 
@@ -1143,6 +1212,10 @@ app.include_router(portfolio_router)        # /api/ai/optimize-portfolio
 app.include_router(leaderboard_router)      # /api/leaderboard/*
 app.include_router(referrals_router)        # /api/referrals/*
 app.include_router(trades_router)           # /api/trades/*
+
+# Public/paid historical-data API
+app.include_router(api_keys_router)         # /api/api-keys/* (session-authed key management)
+app.include_router(public_api_router)       # /api/public/v1/* (API-key-authed)
 
 # Premium-only — mount at /api/smart-buy
 app.include_router(
@@ -1821,19 +1894,32 @@ def _fmt_alert(
     platform: str,
     direction: str,
     pct: float,
-    price: float,
+    value: float,
     ref_mode: str,
-    ref_price: Optional[float],
+    ref_value: Optional[float],
+    metric: str = "price",
 ) -> str:
     arrow = "📈" if direction == "rise" else "📉"
-    rp = f"{int(ref_price):,}c" if isinstance(ref_price, (int, float)) else "—"
+    if metric == "liquidity":
+        cur = f"{value:.2f} sales/hr"
+        rv = f"{ref_value:.2f} sales/hr" if isinstance(ref_value, (int, float)) else "—"
+        label = "Liquidity Alert"
+    else:
+        cur = f"{int(value):,}c"
+        rv = f"{int(ref_value):,}c" if isinstance(ref_value, (int, float)) else "—"
+        label = "Watchlist Alert"
     return (
-        f"{arrow} Watchlist Alert • {name} ({platform.upper()})\n"
-        f"Current: {int(price):,}c • Change: {pct:+.2f}%\n"
-        f"Ref: {rp} ({ref_mode})"
+        f"{arrow} {label} • {name} ({platform.upper()})\n"
+        f"Current: {cur} • Change: {pct:+.2f}%\n"
+        f"Ref: {rv} ({ref_mode})"
     )
 
 async def _ref_price_for_alert(row: asyncpg.Record) -> Optional[float]:
+    # Liquidity has no price-history/started_price concept - it's always a
+    # fixed snapshot taken at alert creation time (see create_watchlist_alert).
+    if row["metric"] == "liquidity":
+        return float(row["ref_price"]) if row["ref_price"] else None
+
     mode = row["ref_mode"]
     if mode == "fixed" and row["ref_price"]:
         return float(row["ref_price"])
@@ -1866,14 +1952,15 @@ async def _resolve_player_name(card_id: int) -> str:
     except Exception:
         return f"Card {card_id}"
 
-async def _eval_alerts_for_pair(card_id: int, platform: str, price_now: float) -> int:
+async def _eval_alerts_for_pair(card_id: int, platform: str, price_now: float, metric: str = "price") -> int:
     sent = 0
     now = now_utc()
     async with watchlist_pool.acquire() as w:
         rows = await w.fetch(
-            "SELECT * FROM watchlist_alerts WHERE card_id=$1 AND platform=$2",
+            "SELECT * FROM watchlist_alerts WHERE card_id=$1 AND platform=$2 AND metric=$3",
             card_id,
             platform,
+            metric,
         )
     if not rows:
         return 0
@@ -1903,7 +1990,7 @@ async def _eval_alerts_for_pair(card_id: int, platform: str, price_now: float) -
                 continue
 
             content = _fmt_alert(
-                name, platform, direction, pct, price_now, row["ref_mode"], refp
+                name, platform, direction, pct, price_now, row["ref_mode"], refp, metric
             )
             ok = False
             if row["prefer_dm"] and row["user_discord_id"]:
@@ -1945,10 +2032,10 @@ async def _alerts_poll_loop():
         try:
             async with watchlist_pool.acquire() as w:
                 pairs = await w.fetch(
-                    "SELECT DISTINCT card_id, platform FROM watchlist_alerts"
+                    "SELECT DISTINCT card_id, platform, metric FROM watchlist_alerts"
                 )
             tasks = [
-                _poll_pair_once(int(rec["card_id"]), rec["platform"])
+                _poll_pair_once(int(rec["card_id"]), rec["platform"], rec["metric"])
                 for rec in pairs
             ]
             if tasks:
@@ -1957,15 +2044,15 @@ async def _alerts_poll_loop():
             logging.warning("poll loop error: %s", e)
         await asyncio.sleep(WATCHLIST_POLL_INTERVAL)
 
-async def _poll_pair_once(card_id: int, platform: str):
+async def _poll_pair_once(card_id: int, platform: str, metric: str = "price"):
     try:
-        live = await fetch_price(card_id, platform)
-        price = live.get("price")
-        if not isinstance(price, (int, float)):
+        live = await (fetch_liquidity(card_id) if metric == "liquidity" else fetch_price(card_id, platform))
+        value = live.get("price")
+        if not isinstance(value, (int, float)):
             return
-        n = await _eval_alerts_for_pair(card_id, platform, float(price))
+        n = await _eval_alerts_for_pair(card_id, platform, float(value), metric)
         if n:
-            logging.info("sent %s alerts for %s/%s", n, card_id, platform)
+            logging.info("sent %s %s alerts for %s/%s", n, metric, card_id, platform)
     except Exception as e:
         logging.debug("poll pair error: %s", e)
 
@@ -1999,22 +2086,37 @@ async def create_watchlist_alert(
     if plat not in ("ps", "xbox", "pc"):
         plat = "ps"
 
+    metric = payload.metric if payload.metric in ("price", "liquidity") else "price"
+    ref_mode = payload.ref_mode or "last_close"
+    ref_price = payload.ref_price
+
+    if metric == "liquidity":
+        # No price-history concept applies to liquidity - always a fixed
+        # snapshot, auto-taken now if the caller didn't supply one.
+        ref_mode = "fixed"
+        if ref_price is None:
+            live = await fetch_liquidity(int(payload.card_id))
+            ref_price = live.get("price")
+        if ref_price is None:
+            raise HTTPException(400, "No sales data yet to set a liquidity baseline for this card")
+
     async with watchlist_pool.acquire() as w:
         await w.execute(
             """
             INSERT INTO watchlist_alerts (
-                user_id, user_discord_id, card_id, platform, ref_mode, ref_price,
+                user_id, user_discord_id, card_id, platform, metric, ref_mode, ref_price,
                 rise_pct, fall_pct, cooloff_minutes, quiet_start, quiet_end,
                 prefer_dm, fallback_channel_id
             )
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
             """,
             user_id,
             user_id,  # DM by default to the same Discord ID (if used)
             int(payload.card_id),
             plat,
-            payload.ref_mode or "last_close",
-            payload.ref_price,
+            metric,
+            ref_mode,
+            ref_price,
             payload.rise_pct or 5,
             payload.fall_pct or 5,
             payload.cooloff_minutes or 30,
@@ -2041,16 +2143,18 @@ async def delete_watchlist_alert(
 async def test_alert_endpoint(
     card_id: int,
     platform: str = "ps",
-    price: Optional[int] = None,
+    metric: str = "price",
+    price: Optional[float] = None,
     user_id: str = Depends(get_current_user),
 ):
     plat = (platform or "ps").lower()
+    metric = metric if metric in ("price", "liquidity") else "price"
     if price is None:
-        live = await fetch_price(card_id, plat)
+        live = await (fetch_liquidity(card_id) if metric == "liquidity" else fetch_price(card_id, plat))
         price = live.get("price")
     if not isinstance(price, (int, float)):
-        raise HTTPException(400, "No price available")
-    n = await _eval_alerts_for_pair(card_id, plat, float(price))
+        raise HTTPException(400, "No data available")
+    n = await _eval_alerts_for_pair(card_id, plat, float(price), metric)
     return {"sent": n}
 
 @app.get("/api/me")
