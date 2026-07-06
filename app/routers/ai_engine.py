@@ -1,14 +1,32 @@
 # app/routers/ai_engine.py
 import asyncio
+import re
 import statistics
 from fastapi import APIRouter, Depends, Request, HTTPException
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from pydantic import BaseModel
 from app.db import get_db
 from app.auth.entitlements import compute_entitlements
 from app.services.price_history import get_price_history
 
 router = APIRouter(prefix="/api/ai", tags=["AI Engine"])
+
+# Pulls a likely player name out of a price question like "how much is
+# mbappe worth" or "what's the price of ronaldo" so Copilot can look the
+# card up for real instead of refusing to answer price questions.
+_PRICE_TRIGGER_RE = re.compile(
+    r"(?:how much (?:is|are|will)|price of|current price of|cost of|worth(?: now)?|value of)\s+"
+    r"(?:the\s+)?(.+?)(?:\?|$| worth| card\b| cards\b| going\b| now\b)"
+)
+_FILLER_WORDS_RE = re.compile(r"\b(worth|cards?|now|going up|rise to|to rise|totw)\b")
+
+
+def _extract_player_name(message: str) -> Optional[str]:
+    m = _PRICE_TRIGGER_RE.search(message)
+    if not m:
+        return None
+    name = _FILLER_WORDS_RE.sub("", m.group(1)).strip()
+    return name or None
 
 class CopilotChatMessage(BaseModel):
     role: str
@@ -274,22 +292,65 @@ async def ai_copilot(
         # Pattern matching for common questions
         response = ""
 
-        # Live price/value questions - this bot only has static advice text, no
-        # live pricing lookup, so "how much are TOTW cards" or "what's X worth"
-        # must NOT fall through to the generic investment-budget branch below
-        # (it used to, since that branch's "how much" keyword matches almost
-        # any price question too, making unrelated questions return identical
-        # canned text). Answer honestly instead of guessing a number.
+        # Live price/value questions - "how much are TOTW cards" or "what's X
+        # worth" must NOT fall through to the generic investment-budget
+        # branch below (it used to, since that branch's "how much" keyword
+        # matches almost any price question too, making unrelated questions
+        # return identical canned text). Now grounded in real data: extract
+        # a player name and look up fut_players.price_num + the real median
+        # sold price from sales_history, instead of refusing to answer.
         if any(keyword in message for keyword in [
             "how much is", "how much are", "how much will", "price of", "current price",
             "cost of", "worth now", "value of", "totw price", "rise to", "going up", "going to rise",
         ]):
-            response = "I can't pull live prices in this chat - I only give trading strategy advice, not real-time card values.\n\n"
-            response += "For actual current prices and trends, use:\n"
-            response += "• **Player Search** to look up any card's live price\n"
-            response += "• **Trending** for what's rising/falling right now\n"
-            response += "• **Best Buys** or **Smart Buy** for suggested opportunities\n\n"
-            response += "Ask me about strategy, timing, risk, or your own performance instead!"
+            player_name = _extract_player_name(message)
+            row = await db.fetchrow(
+                """
+                SELECT card_id, name, rating, version, price_num
+                FROM fut_players
+                WHERE name ILIKE $1
+                ORDER BY rating DESC NULLS LAST
+                LIMIT 1
+                """,
+                f"%{player_name}%",
+            ) if player_name else None
+
+            if row and row["price_num"]:
+                card_id = int(row["card_id"])
+                sales_stats = await db.fetchrow(
+                    """
+                    SELECT
+                        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY sold_price) AS median_24h,
+                        COUNT(*) AS n_24h
+                    FROM sales_history
+                    WHERE player_id = $1 AND sold_at >= NOW() - INTERVAL '24 hours'
+                    """,
+                    card_id,
+                )
+                bin_price = int(row["price_num"])
+                response = (
+                    f"**{row['name']}** ({row['rating']} {row['version'] or 'Standard'}) is currently "
+                    f"listed around **{bin_price:,} coins** (lowest BIN)."
+                )
+                if sales_stats and (sales_stats["n_24h"] or 0) >= 3:
+                    median = round(float(sales_stats["median_24h"]))
+                    response += (
+                        f"\n\nReal sales say otherwise though - it's actually clearing at a median of "
+                        f"**{median:,} coins** over the last 24h ({sales_stats['n_24h']} completed sales)."
+                    )
+                    if median < bin_price * 0.95:
+                        response += " That's meaningfully below the BIN - don't pay full asking price on this one."
+                    elif median > bin_price * 1.05:
+                        response += " It's actually selling above the current BIN - demand is outrunning supply."
+                else:
+                    response += "\n\nNot enough completed sales tracked yet to show a real median sold price for it."
+                response += "\n\nCheck **Player Search** for the full history, or ask me about strategy/timing instead."
+            else:
+                response = (
+                    "I couldn't match that to a specific card in our database - try naming the player "
+                    "more directly (e.g. \"how much is Mbappe worth\"), or use **Player Search** to look "
+                    "it up directly.\n\nI can also tell you about strategy, timing, risk, or your own performance."
+                )
 
         # Investment questions
         elif any(keyword in message for keyword in ["how much should i invest", "how much per trade", "invest", "budget", "coins"]):
