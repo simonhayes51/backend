@@ -492,6 +492,95 @@ async def get_player_history_route(
     except Exception:
         return {"card_id": card_id, "platform": plat, "tf": tf, "history": [], "source": "none"}
 
+
+@router.get("/{card_id}/bin-history")
+async def get_player_bin_history_route(
+    card_id: int,
+    platform: Optional[str] = Query(None, description="ps|xbox|pc|console - omit for both markets"),
+    limit: int = Query(200, ge=1, le=2000),
+    conn = Depends(get_player_db),
+):
+    """
+    Timeline of lowest-BIN snapshots from bin_history (populated by the
+    separate auto_sync bin_sales_history_sync.py worker every 10 minutes -
+    this endpoint only reads it, it never writes). Each row is one point in
+    time; nothing is ever overwritten on the collector side, so this can
+    return the same price repeated across many captured_at timestamps if
+    the market hasn't moved.
+    """
+    plat = _plat(platform) if platform else None
+    try:
+        where: List[str] = ["player_id = $1"]
+        params: List[Any] = [card_id]
+        if plat:
+            params.append(plat)
+            where.append(f"platform = ${len(params)}")
+        params.append(limit)
+
+        sql = f"""
+            SELECT platform, lowest_bin, captured_at
+            FROM bin_history
+            WHERE {' AND '.join(where)}
+            ORDER BY captured_at DESC
+            LIMIT ${len(params)}
+        """
+        rows = await conn.fetch(sql, *params)
+        points = [
+            {
+                "platform": r["platform"],
+                "lowestBin": r["lowest_bin"],
+                "capturedAt": r["captured_at"].isoformat(),
+            }
+            for r in rows
+        ]
+        return {"card_id": card_id, "platform": plat, "points": points}
+    except Exception:
+        # bin_history/sales_history live in the same DB as fut_players but
+        # are populated by a separate service - if that service's tables
+        # somehow aren't there yet (fresh DB, not deployed), fail soft
+        # rather than 500 a page that's otherwise working fine.
+        return {"card_id": card_id, "platform": plat, "points": []}
+
+
+@router.get("/{card_id}/sales-history")
+async def get_player_sales_history_route(
+    card_id: int,
+    limit: int = Query(50, ge=1, le=500),
+    conn = Depends(get_player_db),
+):
+    """
+    Real completed sales from sales_history (populated by the same
+    bin_sales_history_sync.py worker, deduped on (player_id, sold_at,
+    sold_price) at write time - read-only here). PS/Xbox market only, per
+    the collector's own scope. Most recent first.
+    """
+    try:
+        rows = await conn.fetch(
+            """
+            SELECT listed_price, sold_price, ea_tax, net_price, sold_at, captured_at
+            FROM sales_history
+            WHERE player_id = $1
+            ORDER BY sold_at DESC
+            LIMIT $2
+            """,
+            card_id, limit,
+        )
+        sales = [
+            {
+                "listedPrice": r["listed_price"],
+                "soldPrice": r["sold_price"],
+                "eaTax": r["ea_tax"],
+                "netPrice": r["net_price"],
+                "soldAt": r["sold_at"].isoformat(),
+                "capturedAt": r["captured_at"].isoformat(),
+            }
+            for r in rows
+        ]
+        return {"card_id": card_id, "platform": "ps", "sales": sales}
+    except Exception:
+        return {"card_id": card_id, "platform": "ps", "sales": []}
+
+
 @router.get("/batch/meta")
 async def batch_meta(
     ids: str = Query(..., description="CSV of card_ids"),
