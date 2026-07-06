@@ -234,6 +234,166 @@ async def players_autocomplete(
 
     return {"items": items}
 
+
+# NOTE: /batch/... routes must be registered before /{card_id}/... routes.
+# card_id is typed str on some routes and int on others, and Starlette
+# matches path segments before FastAPI's parameter validation runs - so a
+# request to /batch/meta would otherwise be captured by /{card_id}/meta
+# (card_id="batch", str always validates) instead of ever reaching this
+# handler. Confirmed via isolated test: this silently broke /batch/meta
+# for as long as it was declared after /{card_id}/meta.
+@router.get("/batch/meta")
+async def batch_meta(
+    ids: str = Query(..., description="CSV of card_ids"),
+    conn = Depends(get_player_db),
+):
+    """
+    Batch metadata fetch for up to ~100 ids at once.
+    """
+    raw_ids = [x.strip() for x in ids.split(",") if x.strip()]
+    if not raw_ids:
+        return {"items": []}
+    rows = await conn.fetch(
+        """
+        SELECT card_id, name, rating, version, image_url, club, league, nation, position, altposition, price, price_num
+        FROM fut_players
+        WHERE card_id::text = ANY($1::text[])
+        """,
+        raw_ids,
+    )
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        d = dict(r)
+        d["card_id"] = int(d["card_id"])
+        out.append(d)
+    return {"items": out}
+
+
+@router.get("/batch/market-metrics")
+async def batch_market_metrics(
+    ids: str = Query(..., description="CSV of card_ids, up to ~150 at once"),
+    conn = Depends(get_player_db),
+):
+    """
+    Batch version of /{card_id}/market-metrics for list views (search
+    results, watchlist, trade finder) that need liquidity/real-price/snipe
+    signals for many cards without one request per card.
+    """
+    raw_ids = [x.strip() for x in ids.split(",") if x.strip()][:150]
+    if not raw_ids:
+        return {"items": {}}
+    try:
+        id_list = [int(x) for x in raw_ids]
+    except ValueError:
+        raise HTTPException(status_code=400, detail="ids must be integers")
+
+    try:
+        stats_rows = await conn.fetch(
+            """
+            WITH stats AS (
+                SELECT
+                    player_id,
+                    COUNT(*) FILTER (WHERE sold_at >= NOW() - INTERVAL '1 hour') AS n_1h,
+                    COUNT(*) FILTER (WHERE sold_at >= NOW() - INTERVAL '24 hours') AS n_24h,
+                    COUNT(*) FILTER (WHERE sold_at >= NOW() - INTERVAL '7 days') AS n_7d,
+                    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY sold_price)
+                        FILTER (WHERE sold_at >= NOW() - INTERVAL '24 hours') AS median_24h,
+                    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY sold_price)
+                        FILTER (WHERE sold_at >= NOW() - INTERVAL '7 days') AS median_7d,
+                    STDDEV_POP(sold_price) FILTER (WHERE sold_at >= NOW() - INTERVAL '24 hours') AS stddev_24h,
+                    STDDEV_POP(sold_price) FILTER (WHERE sold_at >= NOW() - INTERVAL '7 days') AS stddev_7d
+                FROM sales_history
+                WHERE player_id = ANY($1::bigint[])
+                GROUP BY player_id
+            ),
+            snipe AS (
+                SELECT sh.player_id, COUNT(*) AS snipe_count_24h
+                FROM sales_history sh
+                JOIN stats s ON s.player_id = sh.player_id
+                WHERE sh.sold_at >= NOW() - INTERVAL '24 hours'
+                  AND s.median_24h IS NOT NULL
+                  AND sh.sold_price <= s.median_24h * 0.85
+                GROUP BY sh.player_id
+            )
+            SELECT
+                stats.player_id, stats.n_1h, stats.n_24h, stats.n_7d,
+                stats.median_24h, stats.median_7d, stats.stddev_24h, stats.stddev_7d,
+                COALESCE(snipe.snipe_count_24h, 0) AS snipe_count_24h
+            FROM stats
+            LEFT JOIN snipe ON snipe.player_id = stats.player_id
+            """,
+            id_list,
+        )
+
+        bin_rows = await conn.fetch(
+            """
+            SELECT DISTINCT ON (player_id, platform) player_id, platform, lowest_bin
+            FROM bin_history
+            WHERE player_id = ANY($1::bigint[]) AND lowest_bin IS NOT NULL
+            ORDER BY player_id, platform, captured_at DESC
+            """,
+            id_list,
+        )
+
+        bins_by_card: Dict[int, Dict[str, int]] = {}
+        for r in bin_rows:
+            bins_by_card.setdefault(int(r["player_id"]), {})[r["platform"]] = r["lowest_bin"]
+
+        items: Dict[str, Any] = {}
+        for r in stats_rows:
+            cid = int(r["player_id"])
+            n_24h = r["n_24h"] or 0
+            median_24h = float(r["median_24h"]) if r["median_24h"] is not None else None
+            stddev_24h = float(r["stddev_24h"]) if r["stddev_24h"] is not None else None
+            ps_bin = bins_by_card.get(cid, {}).get("ps")
+
+            divergence_pct_24h = None
+            if ps_bin and median_24h is not None:
+                divergence_pct_24h = round((median_24h - ps_bin) / ps_bin * 100, 2)
+
+            cv_24h = round((stddev_24h or 0) / median_24h, 4) if median_24h else None
+            snipe_index_24h = round((r["snipe_count_24h"] or 0) / n_24h, 3) if n_24h > 0 else None
+
+            margin = None
+            if ps_bin and median_24h is not None:
+                net_after_tax = median_24h * 0.95
+                est_margin_coins = round(net_after_tax - ps_bin)
+                margin = {
+                    "buyAt": ps_bin,
+                    "sellAt": round(median_24h),
+                    "netAfterTax": round(net_after_tax),
+                    "estMarginCoins": est_margin_coins,
+                    "estMarginPct": round(est_margin_coins / ps_bin * 100, 2),
+                }
+
+            items[str(cid)] = {
+                "currentBin": bins_by_card.get(cid, {}),
+                "realPrice": {
+                    "medianSold24h": median_24h,
+                    "medianSold7d": float(r["median_7d"]) if r["median_7d"] is not None else None,
+                    "sampleSize24h": n_24h,
+                    "sampleSize7d": r["n_7d"] or 0,
+                },
+                "divergencePct24h": divergence_pct_24h,
+                "liquidity": {
+                    "salesLast1h": r["n_1h"] or 0,
+                    "salesLast24h": n_24h,
+                    "salesPerHour24h": round(n_24h / 24.0, 2),
+                },
+                "volatility": {
+                    "stddev24h": stddev_24h,
+                    "stddev7d": float(r["stddev_7d"]) if r["stddev_7d"] is not None else None,
+                    "coefficientOfVariation24h": cv_24h,
+                },
+                "snipeIndex24h": snipe_index_24h,
+                "taxAwareMargin": margin,
+            }
+
+        return {"items": items}
+    except Exception:
+        return {"items": {}}
+
+
 @router.get("/{card_id}")
 async def get_player(card_id: str, conn = Depends(get_player_db)):
     """
@@ -699,30 +859,3 @@ async def get_player_market_metrics_route(
             "snipeIndex24h": None,
             "taxAwareMargin": None,
         }
-
-
-@router.get("/batch/meta")
-async def batch_meta(
-    ids: str = Query(..., description="CSV of card_ids"),
-    conn = Depends(get_player_db),
-):
-    """
-    Batch metadata fetch for up to ~100 ids at once.
-    """
-    raw_ids = [x.strip() for x in ids.split(",") if x.strip()]
-    if not raw_ids:
-        return {"items": []}
-    rows = await conn.fetch(
-        """
-        SELECT card_id, name, rating, version, image_url, club, league, nation, position, altposition, price, price_num
-        FROM fut_players
-        WHERE card_id::text = ANY($1::text[])
-        """,
-        raw_ids,
-    )
-    out: List[Dict[str, Any]] = []
-    for r in rows:
-        d = dict(r)
-        d["card_id"] = int(d["card_id"])
-        out.append(d)
-    return {"items": out}
