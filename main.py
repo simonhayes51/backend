@@ -42,38 +42,17 @@ from app.routers.smart_buy import router as smart_buy_router
 from app.routers.trade_finder import router as trade_finder_router
 from app.routers.auth_me import router as auth_me_router
 from app.routers.auth_email import router as auth_email_router
-from app.routers.admin_traders import router as admin_traders_router
 from app.routers.trending import router as trending_router
 from discord_manager import discord_manager
 from app.routers.market import router as market_router
 from app.routers.ai_engine import router as ai_router
 from app.routers.players import router as players_router
-from app.routes_ea import router as ea_router
-from app.routes_ingest_sets import router as ingest_router
-from app.routes_sbc_read import router as sbc_read_router
 from app.services.futgg_history import _plat
 from app.futbin_client import fetch_price_by_url, fetch_recent_sales, fetch_card_layers
 from app.routers.portfolio import router as portfolio_router
 from app.routers.leaderboard import router as leaderboard_router
 from app.routers.referrals import router as referrals_router
 from app.routers.trades import router as trades_router
-from app.routers.social_feed import router as social_feed_router
-from app.routers.social_feed import social_router as social_feed_social_router
-from app.routers.subscriptions import router as subscriptions_router
-from app.routers.subscriptions import social_router as subscriptions_social_router
-from app.routers.interactions import router as interactions_router
-from app.routers.interactions import social_router as interactions_social_router
-from app.routers.interactions import social_posts_router as interactions_social_posts_router
-from app.routers.messaging import router as messaging_router
-from app.routers.messaging import social_router as messaging_social_router
-from app.routers.ratings import router as ratings_router
-from app.routers.ratings import social_router as ratings_social_router
-from app.routers.traders import router as traders_router
-from app.routers.notifications import router as notifications_router
-from app.routers.content_requests import router as content_requests_router
-from app.routers.content_purchases import router as content_purchases_router
-from app.routers.paypal_payments import router as paypal_payments_router
-from app.routers.payment_accounts import router as payment_accounts_router
 
 
 # ----------------- BOOTSTRAP -----------------
@@ -329,178 +308,6 @@ def parse_coin_amount(v) -> int:
     except:
         return 0
 
-# ========== SBC HELPERS ==========
-from typing import List, Dict, Any, Tuple, Optional  # (kept for local scope usage)
-from collections import Counter
-import datetime as dt
-
-def _band_filter_sql(exact_bronze: bool, exact_silver: bool, exact_gold: bool) -> str:
-    if exact_bronze:
-        return " AND p.rating <= 64 "
-    if exact_silver:
-        return " AND p.rating BETWEEN 65 AND 74 "
-    if exact_gold:
-        return " AND p.rating >= 75 "
-    return ""
-
-def _ensure_slots_array(raw_positions: Any) -> List[str]:
-    if raw_positions is None:
-        return []
-    if isinstance(raw_positions, list):
-        return [str(x).strip().upper() for x in raw_positions]
-    return [s.strip().upper() for s in str(raw_positions).split(",") if s.strip()]
-
-def _counts(assigns: List[Dict[str, Any]]) -> Tuple[Counter, Counter, Counter, int]:
-    nat = Counter(a.get("nation_id") or a.get("nation") for a in assigns)
-    lg  = Counter(a.get("league_id") or a.get("league") for a in assigns)
-    cl  = Counter(a.get("club_id")   or a.get("club")   for a in assigns)
-    rare = sum(1 for a in assigns if str(a.get("rarity","")).lower().find("rare") >= 0)
-    return nat, lg, cl, rare
-
-def _validate(assigns: List[Dict[str, Any]], ch: Dict[str, Any]) -> Tuple[bool, List[str]]:
-    msgs = []
-    if len(assigns) != 11:
-        msgs.append("squad not complete")
-        return False, msgs
-
-    avg_rating = sum(a["rating"] for a in assigns) / 11.0
-    if ch.get("min_squad_rating") and avg_rating < ch["min_squad_rating"]:
-        msgs.append(f"avg rating {avg_rating:.1f} < {ch['min_squad_rating']}")
-
-    nat, lg, cl, rare = _counts(assigns)
-
-    def _lt(val, req, label):
-        if req and val < req: msgs.append(f"{label} {val} < {req}")
-
-    def _maxlt(counter, req, label):
-        if req and (max(counter.values() or [0]) < req):
-            msgs.append(f"{label} max {max(counter.values() or [0])} < {req}")
-
-    _lt(len(nat), ch.get("min_nations"), "nations")
-    _lt(len(lg),  ch.get("min_leagues"), "leagues")
-    _lt(len(cl),  ch.get("min_clubs"), "clubs")
-    _maxlt(cl, ch.get("min_same_club"), "same club")
-    _maxlt(lg, ch.get("min_same_league"), "same league")
-    _maxlt(nat, ch.get("min_same_nation"), "same nation")
-    _lt(rare, ch.get("rare_players"), "rare")
-
-    return (len(msgs) == 0), msgs
-
-def _estimate_chem(assigns: List[Dict[str, Any]]) -> int:
-    _, lg, cl, _ = _counts(assigns)
-    league_cluster = max(lg.values() or [0])
-    club_cluster   = max(cl.values() or [0])
-    base = 15 + 2*league_cluster + 1*club_cluster
-    return max(0, min(33, base))
-
-async def _fetch_candidates_for_slot(
-    con,
-    req_pos: str,
-    ch: Dict[str, Any],
-    account_id: Optional[int],
-    use_club_only: bool,
-    prefer_untradeable: bool,
-    limit: int,
-) -> List[Dict[str, Any]]:
-    band = []
-    if ch.get("exact_bronze"):
-        band.append("p.rating <= 64")
-    if ch.get("exact_silver"):
-        band.append("p.rating BETWEEN 65 AND 74")
-    if ch.get("exact_gold"):
-        band.append("p.rating >= 75")
-    band_sql = (" AND " + " AND ".join(band)) if band else ""
-
-    sql = f"""
-      SELECT
-        p.card_id, p.name, p.rating, p.position,
-        p.price_num
-      FROM fut_players p
-      WHERE p.position = $1
-        {band_sql}
-        AND p.price_num IS NOT NULL
-      ORDER BY p.price_num ASC, p.rating ASC
-      LIMIT $2
-    """
-    rows = await con.fetch(sql, req_pos, limit)
-
-    out = []
-    for r in rows:
-        out.append({
-            "card_id": r["card_id"],
-            "name": r["name"],
-            "rating": r["rating"],
-            "primary_pos": r["position"],
-            "price": r["price_num"] or 999_999_999,
-            "raw_price": r["price_num"],
-            "source": "market",
-        })
-    return out
-
-async def _solve_challenge(
-    con,
-    ch_row: Any,
-    account_id: Optional[int],
-    use_club_only: bool,
-    prefer_untradeable: bool,
-    max_candidates_per_slot: int = 100,
-) -> Dict[str, Any]:
-    ch = dict(ch_row)
-    slots = _ensure_slots_array(ch.get("positions"))
-    if len(slots) != 11:
-        return {"ok": False, "error": "invalid_positions"}
-
-    picks: List[Dict[str, Any]] = []
-    used_ids = set()
-
-    for req_pos in slots:
-        cands = await _fetch_candidates_for_slot(
-            con, req_pos, ch, account_id, use_club_only, prefer_untradeable, max_candidates_per_slot
-        )
-        chosen = None
-        for c in cands:
-            if c["card_id"] in used_ids:
-                continue
-            if c["primary_pos"] == req_pos:
-                chosen = {**c, "used_pos": req_pos}
-                break
-        if not chosen:
-            return {"ok": False, "error": f"no_candidate_for_{req_pos}"}
-        used_ids.add(chosen["card_id"])
-        picks.append(chosen)
-
-    ok, reasons = _validate(picks, ch)
-
-    chem_est = _estimate_chem(picks)
-    total_cost = int(sum(p["price"] for p in picks))
-
-    summary = {
-        "avg_rating": round(sum(p["rating"] for p in picks) / 11.0, 2),
-        "nations": len(_counts(picks)[0]),
-        "leagues": len(_counts(picks)[1]),
-        "clubs":   len(_counts(picks)[2]),
-        "chem_estimate": chem_est,
-    }
-
-    return {
-        "ok": ok,
-        "error": (None if ok else "; ".join(reasons)),
-        "total_cost": total_cost,
-        "summary": summary,
-        "picks": [
-            {
-                "slot": i+1,
-                "req_pos": slots[i],
-                "card_id": p["card_id"],
-                "name": p["name"],
-                "rating": p["rating"],
-                "used_pos": p["used_pos"],
-                "price": p["price"],
-                "source": p["source"],
-            } for i, p in enumerate(picks)
-        ],
-        "price_snapshot": dt.datetime.utcnow(),
-    }
 
 # Time helpers
 LONDON = ZoneInfo("Europe/London")
@@ -722,109 +529,6 @@ async def lifespan(app: FastAPI):
         await conn.execute("""
         ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS twitch_url TEXT
         """)
-
-        # social trading: profiles/posts/etc
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS trader_profiles (
-            user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-            bio TEXT,
-            specialties TEXT[],
-            verified BOOLEAN DEFAULT FALSE,
-            subscription_price DECIMAL(10, 2) DEFAULT 0,
-            total_followers INTEGER DEFAULT 0,
-            total_posts INTEGER DEFAULT 0,
-            avg_rating DECIMAL(3, 2) DEFAULT 0,
-            total_ratings INTEGER DEFAULT 0,
-            achievements JSONB DEFAULT '[]'::JSONB,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )""")
-
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS social_posts (
-            id BIGSERIAL PRIMARY KEY,
-            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            post_type VARCHAR(50) NOT NULL,
-            content TEXT NOT NULL,
-            player_name VARCHAR(255),
-            player_card_id VARCHAR(100),
-            buy_range_min DECIMAL(12, 2),
-            buy_range_max DECIMAL(12, 2),
-            sell_target DECIMAL(12, 2),
-            confidence_level INTEGER,
-            tags TEXT[],
-            is_premium BOOLEAN DEFAULT FALSE,
-            likes_count INTEGER DEFAULT 0,
-            dislikes_count INTEGER DEFAULT 0,
-            comments_count INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            expires_at TIMESTAMP
-        )""")
-
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS post_comments (
-            id BIGSERIAL PRIMARY KEY,
-            post_id BIGINT NOT NULL REFERENCES social_posts(id) ON DELETE CASCADE,
-            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            parent_comment_id BIGINT REFERENCES post_comments(id) ON DELETE CASCADE,
-            content TEXT NOT NULL,
-            likes_count INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            deleted_at TIMESTAMP
-        )""")
-
-        # messaging: conversations/messages/notifications
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS conversations (
-            id BIGSERIAL PRIMARY KEY,
-            user1_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            user2_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            last_message_id BIGINT,
-            last_message_at TIMESTAMP,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            CHECK (user1_id < user2_id),
-            UNIQUE(user1_id, user2_id)
-        )""")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_conversations_user1 ON conversations(user1_id)")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_conversations_user2 ON conversations(user2_id)")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_conversations_last_message ON conversations(last_message_at DESC)")
-
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS messages (
-            id BIGSERIAL PRIMARY KEY,
-            conversation_id BIGINT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-            sender_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            recipient_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            content TEXT NOT NULL,
-            read_at TIMESTAMP,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            deleted_at TIMESTAMP
-        )""")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, created_at DESC)")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_id)")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient_id)")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_unread ON messages(recipient_id, read_at) WHERE read_at IS NULL")
-
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS notifications (
-            id BIGSERIAL PRIMARY KEY,
-            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            notification_type VARCHAR(50) NOT NULL CHECK (notification_type IN (
-                'new_follower', 'post_like', 'post_comment', 'new_message',
-                'new_rating', 'mention', 'subscription'
-            )),
-            title VARCHAR(255) NOT NULL,
-            message TEXT NOT NULL,
-            related_user_id TEXT REFERENCES users(id) ON DELETE CASCADE,
-            related_post_id BIGINT REFERENCES social_posts(id) ON DELETE CASCADE,
-            related_comment_id BIGINT REFERENCES post_comments(id) ON DELETE CASCADE,
-            related_message_id BIGINT REFERENCES messages(id) ON DELETE CASCADE,
-            read_at TIMESTAMP,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )""")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, created_at DESC)")
 
         # Billing tables
         await conn.execute("""
@@ -1069,13 +773,7 @@ async def lifespan(app: FastAPI):
                 ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
             """)
             logging.info("✅ Migration: users table social columns ensured")
-            
-            # Ensure social_posts table has image_url column
-            await conn.execute("""
-                ALTER TABLE social_posts ADD COLUMN IF NOT EXISTS image_url TEXT
-            """)
-            logging.info("✅ Migration: social_posts.image_url column ensured")
-            
+
             # Create indexes for better performance
             await conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)
@@ -1116,9 +814,6 @@ async def handle_undefined_table_error(request: Request, exc: Exception):
 
 from app.routers.watchlist import router as watchlist_router
 app.include_router(watchlist_router)
-app.include_router(ea_router)
-app.include_router(ingest_router)
-app.include_router(sbc_read_router)
 app.include_router(trending_router)
 
 # Local DB dependency (use the pools created in lifespan)
@@ -1127,31 +822,6 @@ async def get_db():
         raise HTTPException(500, "Database pool not initialized")
     async with app.state.pool.acquire() as conn:
         yield conn
-
-class SbcSolveReq(BaseModel):
-    challenge_code: str
-    account_id: Optional[int] = None
-    use_club_only: bool = False
-    prefer_untradeable: bool = True
-    max_candidates_per_slot: int = 100
-
-@app.get("/api/sbc/challenge/{code}")
-async def sbc_get_challenge(code: str, conn=Depends(get_db)):
-    ch = await conn.fetchrow("SELECT * FROM sbc_challenges WHERE challenge_code=$1", code)
-    if not ch:
-        return {"ok": False, "error": "challenge_not_found"}
-    return {"ok": True, "challenge": dict(ch)}
-
-@app.post("/api/sbc/solve")
-async def sbc_solve(req: SbcSolveReq, conn=Depends(get_db)):
-    ch = await conn.fetchrow("SELECT * FROM sbc_challenges WHERE challenge_code=$1", req.challenge_code)
-    if not ch:
-        return {"ok": False, "error": "challenge_not_found"}
-
-    sol = await _solve_challenge(
-        conn, ch, req.account_id, req.use_club_only, req.prefer_untradeable, req.max_candidates_per_slot
-    )
-    return sol
 
 @app.get("/api/entitlements")
 async def get_entitlements(request: Request):
@@ -1455,7 +1125,6 @@ async def ext_add_trade(
 # ---- Router wiring (single, final) ----
 app.include_router(auth_me_router)          # /api/auth/me
 app.include_router(auth_email_router)       # /api/auth/email/*
-app.include_router(admin_traders_router)    # /api/admin/*
 app.include_router(trade_finder_router)     # /api/trade-finder...
 app.include_router(ext_router)              # /ext/...
 
@@ -1474,25 +1143,6 @@ app.include_router(portfolio_router)        # /api/ai/optimize-portfolio
 app.include_router(leaderboard_router)      # /api/leaderboard/*
 app.include_router(referrals_router)        # /api/referrals/*
 app.include_router(trades_router)           # /api/trades/*
-
-# Social trading feed features
-app.include_router(social_feed_router)      # /api/feed/*
-app.include_router(social_feed_social_router)  # /api/social/feed, /api/social/posts
-app.include_router(subscriptions_router)    # /api/subscriptions/*
-app.include_router(subscriptions_social_router)  # /api/social/subscriptions/*
-app.include_router(interactions_router)     # /api/interactions/*
-app.include_router(interactions_social_router)  # /api/social/interactions/*
-app.include_router(interactions_social_posts_router)  # /api/social/posts/*
-app.include_router(messaging_router)        # /api/messages/*
-app.include_router(messaging_social_router)  # /api/social/messages/*
-app.include_router(ratings_router)          # /api/ratings/*
-app.include_router(ratings_social_router)    # /api/social/ratings/*
-app.include_router(traders_router)          # /api/traders/*
-app.include_router(notifications_router)    # /api/notifications/*
-app.include_router(content_requests_router)  # /api/content-requests/*
-app.include_router(content_purchases_router)  # /api/content-purchases/*
-app.include_router(paypal_payments_router)  # /api/paypal/*
-app.include_router(payment_accounts_router)  # /api/payment-accounts/*
 
 # Premium-only — mount at /api/smart-buy
 app.include_router(
@@ -2117,38 +1767,6 @@ async def get_player_price_proxy(card_id: str, platform: str = Query("ps", descr
         }
     }
 
-@app.get("/api/sbc/candidates")
-async def sbc_candidates(
-    req_pos: str,
-    exact_bronze: bool = False,
-    exact_silver: bool = False,
-    exact_gold: bool = False,
-    allow_alt_pos: bool = True,
-    limit: int = 10,
-    user_id: str = Depends(get_current_user),
-    conn=Depends(get_db),
-):
-    """
-    Return cheapest candidate players for a given SBC slot.
-    """
-    band_sql = _band_filter_sql(exact_bronze, exact_silver, exact_gold)
-    pos_check = "p.position=$1 OR $1 = ANY(p.alt_positions)" if allow_alt_pos else "p.position=$1"
-
-    sql = f"""
-      SELECT p.card_id, p.name, p.rating, p.position, p.alt_positions,
-             p.nation, p.club, p.league,
-             p.price_num AS price
-        FROM fut_players p
-       WHERE ({pos_check})
-         {band_sql}
-         AND p.price_num IS NOT NULL
-       ORDER BY p.price_num ASC, p.rating ASC
-       LIMIT $2
-    """
-
-    rows = await conn.fetch(sql, req_pos, limit)
-    return [dict(r) for r in rows]
-
 async def _send_discord_dm(user_discord_id: str, content: str) -> bool:
     if not DISCORD_BOT_TOKEN or not user_discord_id:
         return False
@@ -2524,19 +2142,6 @@ async def get_current_user_info(request: Request, conn=Depends(get_db)):
             "tier": None,
         }
     
-    # Check if user is a trader
-    is_trader = profile["account_type"] == "trader"
-    trader_profile = None
-    if is_trader:
-        trader_profile = await conn.fetchrow(
-            """
-            SELECT verified, total_followers, total_posts, avg_rating
-            FROM trader_profiles
-            WHERE user_id = $1
-            """,
-            user_id
-        )
-
     # REAL-TIME PREMIUM VALIDATION (UUID)
     is_premium = False
     premium_until = None
@@ -2597,21 +2202,10 @@ async def get_current_user_info(request: Request, conn=Depends(get_db)):
             "watchlist_max": 500 if is_premium else 3,
             "trending": {"timeframes": ["4h", "6h", "24h"] if is_premium else ["24h"]}
         },
-        # Trader information
         "account_type": profile["account_type"] or "user",
         "tier": profile["tier"],
-        "is_trader": is_trader
     }
-    
-    # Add trader-specific fields if user is a trader
-    if is_trader and trader_profile:
-        response_data.update({
-            "verified": trader_profile["verified"],
-            "total_followers": trader_profile["total_followers"],
-            "total_posts": trader_profile["total_posts"],
-            "avg_rating": float(trader_profile["avg_rating"]) if trader_profile["avg_rating"] else 0.0
-        })
-    
+
     return response_data
 
 @app.get("/api/validate-premium")
@@ -3831,189 +3425,6 @@ async def create_checkout_session(
     try:
         data = await request.json()
 
-        # Check for One-Off Content Purchase
-        if data.get("postId"):
-            post_id = data.get("postId")
-
-            # Get post details and author's payment account
-            post = await conn.fetchrow(
-                """
-                SELECT sp.*, tp.stripe_connect_account_id, tp.stripe_charges_enabled
-                FROM social_posts sp
-                LEFT JOIN trader_profiles tp ON sp.user_id = tp.user_id
-                WHERE sp.id = $1
-                """,
-                post_id
-            )
-            if not post:
-                raise HTTPException(status_code=404, detail="Post not found")
-
-            if not post["requires_purchase"] or not post["price"]:
-                raise HTTPException(status_code=400, detail="Post does not require purchase")
-
-            # Check if already purchased
-            existing = await conn.fetchval(
-                "SELECT id FROM content_purchases WHERE user_id = $1 AND post_id = $2 AND status = 'completed'",
-                user_id, post_id
-            )
-            if existing:
-                raise HTTPException(status_code=400, detail="Content already purchased")
-
-            # Check if author has payment account set up
-            author_id = str(post["user_id"])
-            stripe_account_id = post.get("stripe_connect_account_id")
-
-            if not stripe_account_id or not post.get("stripe_charges_enabled"):
-                raise HTTPException(
-                    status_code=400,
-                    detail="Content creator has not set up their payment account yet"
-                )
-
-            amount_cents = int(float(post["price"]) * 100)
-
-            # Calculate platform fee (10%)
-            platform_fee_cents = int(amount_cents * 0.10)
-
-            # Get user profile
-            profile = await conn.fetchrow("SELECT * FROM user_profiles WHERE user_id = $1", user_id)
-
-            # Create checkout session with Stripe Connect destination charge
-            session = stripe.checkout.Session.create(
-                customer_email=f"{profile['username']}@discord.local" if profile else None,
-                payment_method_types=['card'],
-                line_items=[{
-                    'price_data': {
-                        'currency': 'gbp',
-                        'product_data': {
-                            'name': post["title"] or f"Content: {post['post_type']}",
-                            'description': post["content"][:100] if post["content"] else None,
-                        },
-                        'unit_amount': amount_cents,
-                    },
-                    'quantity': 1,
-                }],
-                mode='payment',
-                payment_intent_data={
-                    'application_fee_amount': platform_fee_cents,
-                    'transfer_data': {
-                        'destination': stripe_account_id,
-                    },
-                },
-                success_url=data.get("successUrl", f"{os.getenv('FRONTEND_URL')}/post/{post_id}?purchase=success"),
-                cancel_url=data.get("cancelUrl", f"{os.getenv('FRONTEND_URL')}/post/{post_id}?purchase=cancelled"),
-                metadata={
-                    'user_id': user_id,
-                    'type': 'content_purchase',
-                    'post_id': str(post_id),
-                    'author_id': author_id,
-                    'platform_fee': str(platform_fee_cents / 100)
-                }
-            )
-
-            # Create pending purchase record
-            await conn.execute(
-                """
-                INSERT INTO content_purchases (
-                    user_id, post_id, amount, currency, payment_provider,
-                    stripe_payment_intent_id, status
-                )
-                VALUES ($1, $2, $3, 'GBP', 'stripe', $4, 'pending')
-                ON CONFLICT (user_id, post_id) DO NOTHING
-                """,
-                user_id, post_id, post["price"], session.payment_intent
-            )
-
-            return {"sessionId": session.id, "checkoutUrl": session.url}
-
-        # Check for Trader Subscription (Single-Tier)
-        if data.get("traderId"):
-            trader_id = data.get("traderId")
-            tier = data.get("tier", "paid")  # Default to 'paid' for single-tier
-            billing_cycle = data.get("billingCycle", "month")
-
-            # Fetch trader profile subscription price (single-tier) and payment account
-            trader = await conn.fetchrow("SELECT * FROM trader_profiles WHERE user_id = $1", trader_id)
-            if not trader:
-                raise HTTPException(status_code=404, detail="Trader not found")
-
-            # Check if trader has payment account set up
-            stripe_account_id = trader.get("stripe_connect_account_id")
-            if not stripe_account_id or not trader.get("stripe_charges_enabled"):
-                raise HTTPException(
-                    status_code=400,
-                    detail="This trader has not set up their payment account yet"
-                )
-
-            # Use single subscription_price (new system)
-            if trader.get("subscription_price") and float(trader["subscription_price"]) > 0:
-                price_amount = trader["subscription_price"]
-                tier_name = "Subscription"
-            else:
-                # Fallback to old tier system for backward compatibility
-                price_column = f"tier_{tier}_price"
-                if price_column not in trader:
-                    raise HTTPException(status_code=400, detail="Invalid tier")
-
-                price_amount = trader[price_column]
-                if price_amount is None:
-                    raise HTTPException(status_code=400, detail="Tier not available")
-                tier_name = f"{tier.capitalize()} Tier"
-
-            # Convert to cents/pence (GBP default for now)
-            amount_cents = int(float(price_amount) * 100)
-
-            # Calculate platform fee (10%)
-            platform_fee_percentage = 10  # 10% platform fee
-
-            # Get user profile for email/name
-            profile = await conn.fetchrow("SELECT * FROM user_profiles WHERE user_id = $1", user_id)
-
-            # Create checkout session with Stripe Connect
-            # For subscriptions, we use application_fee_percent on subscription_data
-            session = stripe.checkout.Session.create(
-                customer_email=f"{profile['username']}@discord.local" if profile else None,
-                payment_method_types=['card'],
-                line_items=[{
-                    'price_data': {
-                        'currency': 'gbp',
-                        'product_data': {
-                            'name': f"Subscription to {trader['user_id']}",
-                            'description': f"{tier_name} subscription",
-                        },
-                        'unit_amount': amount_cents,
-                        'recurring': {
-                            'interval': 'month', # could support 'year' if needed
-                        },
-                    },
-                    'quantity': 1,
-                }],
-                mode='subscription',
-                success_url=data.get("successUrl", os.getenv("BILLING_SUCCESS_URL")),
-                cancel_url=data.get("cancelUrl", os.getenv("BILLING_CANCEL_URL")),
-                subscription_data={
-                    'application_fee_percent': platform_fee_percentage,
-                    'transfer_data': {
-                        'destination': stripe_account_id,
-                    },
-                    'metadata': {
-                        'user_id': user_id,
-                        'type': 'trader_subscription',
-                        'trader_id': trader_id,
-                        'tier': 'paid',
-                        'amount': str(price_amount),
-                        'platform_fee_percentage': str(platform_fee_percentage)
-                    }
-                },
-                metadata={
-                    'user_id': user_id,
-                    'type': 'trader_subscription',
-                    'trader_id': trader_id,
-                    'tier': 'paid',  # Always use 'paid' for new single-tier system
-                    'amount': str(price_amount)
-                }
-            )
-            return {"sessionId": session.id, "checkoutUrl": session.url}
-
         # Existing Platform Subscription Logic
         price_id = data.get("priceId")
         billing_cycle = data.get("billingCycle")
@@ -4140,72 +3551,6 @@ async def stripe_webhook(request: Request, conn=Depends(get_db)):
 async def handle_checkout_completed(session, conn):
     """Handle successful checkout"""
     user_id = session.get('metadata', {}).get('user_id')
-    sub_type = session.get('metadata', {}).get('type')
-
-    # Handle Content Purchase
-    if sub_type == 'content_purchase':
-        post_id = session.get('metadata', {}).get('post_id')
-        author_id = session.get('metadata', {}).get('author_id')
-        payment_intent = session.get('payment_intent')
-
-        if user_id and post_id:
-            # Mark purchase as completed
-            await conn.execute("""
-                UPDATE content_purchases
-                SET status = 'completed',
-                    completed_at = NOW(),
-                    stripe_payment_intent_id = $3
-                WHERE user_id = $1 AND post_id = $2
-            """, user_id, int(post_id), payment_intent)
-
-            # Create notification for author
-            if author_id:
-                await conn.execute("""
-                    INSERT INTO notifications (
-                        user_id, notification_type, title, message,
-                        related_user_id, related_post_id
-                    )
-                    VALUES ($1, 'content_purchase', 'Content Sold!', $2, $3, $4)
-                """, author_id, "Someone purchased your content!", user_id, int(post_id))
-
-            # Create notification for buyer
-            await conn.execute("""
-                INSERT INTO notifications (
-                    user_id, notification_type, title, message, related_post_id
-                )
-                VALUES ($1, 'content_purchase', 'Purchase Complete', $2, $3)
-            """, user_id, "Your content purchase is complete!", int(post_id))
-        return
-
-    # Handle Trader Subscription
-    if sub_type == 'trader_subscription':
-        trader_id = session.get('metadata', {}).get('trader_id')
-        tier = session.get('metadata', {}).get('tier', 'paid')
-        amount = session.get('metadata', {}).get('amount')
-
-        if user_id and trader_id and tier:
-             await conn.execute("""
-                INSERT INTO trader_subscriptions (
-                    subscriber_id, trader_id, is_active, subscription_type,
-                    payment_provider, amount, currency, updated_at
-                )
-                VALUES ($1, $2, TRUE, $3, 'stripe', $4, 'GBP', NOW())
-                ON CONFLICT (subscriber_id, trader_id)
-                DO UPDATE SET
-                    is_active = TRUE,
-                    subscription_type = $3,
-                    payment_provider = 'stripe',
-                    amount = $4,
-                    unsubscribed_at = NULL,
-                    updated_at = NOW()
-            """, user_id, trader_id, tier, amount)
-
-             # Create notification
-             await conn.execute("""
-                INSERT INTO notifications (user_id, notification_type, title, message, related_user_id)
-                VALUES ($1, 'subscription', 'New Subscriber', $2, $3)
-             """, trader_id, f"You have a new {tier} subscriber!", user_id)
-        return
 
     if user_id:
         # Assign Discord role immediately (for platform subscriptions)
