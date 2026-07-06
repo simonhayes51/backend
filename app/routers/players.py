@@ -741,6 +741,90 @@ async def get_player_sales_history_route(
         return {"card_id": card_id, "platform": "ps", "sales": []}
 
 
+@router.get("/{card_id}/sales-candles")
+async def get_player_sales_candles_route(
+    card_id: int,
+    bucket_hours: float = Query(1, gt=0, le=24, description="candle width in hours"),
+    days: int = Query(7, ge=1, le=30, description="lookback window in days"),
+    conn = Depends(get_player_db),
+):
+    """
+    Real OHLC candles built from actual completed sales (sales_history),
+    not the BIN-snapshot line the frontend used to show. Also returns the
+    raw sale points in the same window so the chart can overlay individual
+    sale markers on top of the candles. PS market only, per the collector's
+    scope.
+    """
+    try:
+        bucket_seconds = bucket_hours * 3600
+        rows = await conn.fetch(
+            """
+            WITH bucketed AS (
+                SELECT
+                    to_timestamp(floor(extract(epoch FROM sold_at) / $2::float) * $2::float) AS bucket_start,
+                    sold_price,
+                    sold_at,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY floor(extract(epoch FROM sold_at) / $2::float)
+                        ORDER BY sold_at ASC
+                    ) AS rn_open,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY floor(extract(epoch FROM sold_at) / $2::float)
+                        ORDER BY sold_at DESC
+                    ) AS rn_close
+                FROM sales_history
+                WHERE player_id = $1 AND sold_at >= NOW() - ($3 || ' days')::interval
+            )
+            SELECT
+                bucket_start,
+                MAX(CASE WHEN rn_open = 1 THEN sold_price END) AS open,
+                MAX(sold_price) AS high,
+                MIN(sold_price) AS low,
+                MAX(CASE WHEN rn_close = 1 THEN sold_price END) AS close,
+                COUNT(*) AS volume
+            FROM bucketed
+            GROUP BY bucket_start
+            ORDER BY bucket_start ASC
+            """,
+            card_id, bucket_seconds, days,
+        )
+        candles = [
+            {
+                "time": int(r["bucket_start"].timestamp()),
+                "open": r["open"],
+                "high": r["high"],
+                "low": r["low"],
+                "close": r["close"],
+                "volume": r["volume"],
+            }
+            for r in rows
+        ]
+
+        # Capped well below what a high-liquidity card can produce (seen up
+        # to ~12k sales/day in production) - beyond this, individual markers
+        # would just paint a solid line on top of the candles instead of
+        # conveying anything; the candle bodies/wicks already are the real
+        # sale data at that volume, just aggregated.
+        sale_rows = await conn.fetch(
+            """
+            SELECT sold_price, sold_at
+            FROM sales_history
+            WHERE player_id = $1 AND sold_at >= NOW() - ($2 || ' days')::interval
+            ORDER BY sold_at ASC
+            LIMIT 300
+            """,
+            card_id, days,
+        )
+        sales = [
+            {"time": int(r["sold_at"].timestamp()), "price": r["sold_price"]}
+            for r in sale_rows
+        ]
+
+        return {"card_id": card_id, "platform": "ps", "bucketHours": bucket_hours, "candles": candles, "sales": sales}
+    except Exception:
+        return {"card_id": card_id, "platform": "ps", "bucketHours": bucket_hours, "candles": [], "sales": []}
+
+
 @router.get("/{card_id}/market-metrics")
 async def get_player_market_metrics_route(
     card_id: int,
