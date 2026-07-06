@@ -131,113 +131,135 @@ async def get_market_sentiment(
     db=Depends(get_player_db),
 ) -> Dict[str, Any]:
     """
-    Aggregate sentiment scores from social sources and trading activity.
-    Return trending topics, top players from recent trades, and AI market insights.
+    Market-wide sentiment computed from real completed sales across the
+    whole tracked Gold Rare population (bin_history/sales_history), not
+    this app's own users' logged trades - that was a tiny, self-selected,
+    gameable sample. Compares each card's median sold price in the recent
+    window to the equal-length window right before it (advance/decline
+    breadth, same idea stock market breadth indicators use) rather than a
+    simple win/loss ratio on personal trade logs.
     """
     try:
-        from datetime import datetime, timedelta
+        from datetime import datetime
 
-        # Map timeframe to hours
-        timeframe_hours = {
-            "1h": 1,
-            "6h": 6,
-            "24h": 24,
-            "7d": 168
-        }.get(timeframe, 24)
+        timeframe_hours = {"1h": 1, "6h": 6, "24h": 24, "7d": 168}.get(timeframe, 24)
 
-        cutoff = datetime.utcnow() - timedelta(hours=timeframe_hours)
-
-        # Get top trending players from recent trades (proxy for market activity)
-        trending_players = await db.fetch(
+        rows = await db.fetch(
             """
-            SELECT
-                player,
-                COUNT(*) as trade_count,
-                SUM(quantity) as total_volume,
-                AVG(profit) as avg_profit,
-                SUM(CASE WHEN profit > 0 THEN 1 ELSE 0 END)::FLOAT / COUNT(*)::FLOAT as win_rate
-            FROM trades
-            WHERE timestamp >= $1
-            GROUP BY player
-            ORDER BY trade_count DESC
-            LIMIT 10
+            WITH recent AS (
+                SELECT player_id,
+                       PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY sold_price) AS median_recent,
+                       COUNT(*) AS n_recent
+                FROM sales_history
+                WHERE sold_at >= NOW() - make_interval(hours => $1)
+                GROUP BY player_id
+            ),
+            prior AS (
+                SELECT player_id,
+                       PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY sold_price) AS median_prior,
+                       COUNT(*) AS n_prior
+                FROM sales_history
+                WHERE sold_at >= NOW() - make_interval(hours => $1 * 2)
+                  AND sold_at < NOW() - make_interval(hours => $1)
+                GROUP BY player_id
+            )
+            SELECT recent.player_id, median_recent, n_recent, median_prior, n_prior
+            FROM recent
+            JOIN prior ON prior.player_id = recent.player_id
+            WHERE recent.n_recent >= 3 AND prior.n_prior >= 3
             """,
-            cutoff
+            timeframe_hours,
         )
 
-        # Calculate overall market sentiment
-        total_trades = await db.fetchval(
-            "SELECT COUNT(*) FROM trades WHERE timestamp >= $1",
-            cutoff
+        total_recent_sales = await db.fetchval(
+            "SELECT COUNT(*) FROM sales_history WHERE sold_at >= NOW() - make_interval(hours => $1)",
+            timeframe_hours,
+        ) or 0
+        total_prior_sales = await db.fetchval(
+            """
+            SELECT COUNT(*) FROM sales_history
+            WHERE sold_at >= NOW() - make_interval(hours => $1 * 2)
+              AND sold_at < NOW() - make_interval(hours => $1)
+            """,
+            timeframe_hours,
         ) or 0
 
-        profitable_trades = await db.fetchval(
-            "SELECT COUNT(*) FROM trades WHERE timestamp >= $1 AND profit > 0",
-            cutoff
-        ) or 0
-
-        # Sentiment score (0-100)
-        if total_trades > 0:
-            profit_ratio = profitable_trades / total_trades
-            sentiment_score = int(profit_ratio * 100)
-        else:
-            sentiment_score = 50  # Neutral
-
-        # Determine sentiment label
-        if sentiment_score >= 70:
-            sentiment_label = "Bullish"
-            sentiment_icon = "🚀"
-        elif sentiment_score >= 55:
-            sentiment_label = "Positive"
-            sentiment_icon = "📈"
-        elif sentiment_score >= 45:
-            sentiment_label = "Neutral"
-            sentiment_icon = "➖"
-        elif sentiment_score >= 30:
-            sentiment_label = "Negative"
-            sentiment_icon = "📉"
-        else:
-            sentiment_label = "Bearish"
-            sentiment_icon = "🔻"
-
-        # Generate AI insights based on data
-        insights = []
-
-        if total_trades > 100:
-            insights.append(f"High trading activity detected ({total_trades} trades in {timeframe})")
-        elif total_trades < 20:
-            insights.append(f"Low market activity - consider waiting for better opportunities")
-
-        if sentiment_score >= 65:
-            insights.append("Strong buyer confidence. Good time to sell into demand.")
-        elif sentiment_score <= 35:
-            insights.append("Weak market conditions. Look for value buys or stay liquid.")
-
-        # Top 3 trending players
-        top_players = []
-        for idx, p in enumerate(trending_players[:3]):
-            win_rate = (p["win_rate"] or 0) * 100
-            top_players.append({
-                "rank": idx + 1,
-                "player": p["player"],
-                "trade_count": p["trade_count"],
-                "volume": p["total_volume"],
-                "avg_profit": int(p["avg_profit"] or 0),
-                "win_rate": round(win_rate, 1)
+        movers = []
+        risers = 0
+        fallers = 0
+        for r in rows:
+            median_recent = float(r["median_recent"])
+            median_prior = float(r["median_prior"])
+            if median_prior <= 0:
+                continue
+            pct_change = round((median_recent - median_prior) / median_prior * 100, 2)
+            if pct_change > 1:
+                risers += 1
+            elif pct_change < -1:
+                fallers += 1
+            movers.append({
+                "player_id": int(r["player_id"]),
+                "medianRecent": round(median_recent),
+                "medianPrior": round(median_prior),
+                "pctChange": pct_change,
+                "salesRecent": r["n_recent"],
             })
 
-            if idx == 0:  # Top player insight
-                if win_rate > 60:
-                    insights.append(f"{p['player']} showing strong profit potential ({win_rate:.0f}% win rate)")
-                elif win_rate < 40:
-                    insights.append(f"{p['player']} is risky - only {win_rate:.0f}% of traders profiting")
+        qualifying = risers + fallers
+        sentiment_score = round(risers / qualifying * 100) if qualifying > 0 else 50
 
-        # Market timing insight
-        hour = datetime.utcnow().hour
-        if 18 <= hour <= 22:
-            insights.append("Peak trading hours - high liquidity and faster sales")
-        elif 2 <= hour <= 8:
-            insights.append("Off-peak hours - fewer buyers, better deals available")
+        if sentiment_score >= 70:
+            sentiment_label, sentiment_icon = "Bullish", "🚀"
+        elif sentiment_score >= 55:
+            sentiment_label, sentiment_icon = "Positive", "📈"
+        elif sentiment_score >= 45:
+            sentiment_label, sentiment_icon = "Neutral", "➖"
+        elif sentiment_score >= 30:
+            sentiment_label, sentiment_icon = "Negative", "📉"
+        else:
+            sentiment_label, sentiment_icon = "Bearish", "🔻"
+
+        volume_change_pct = (
+            round((total_recent_sales - total_prior_sales) / total_prior_sales * 100, 1)
+            if total_prior_sales > 0 else None
+        )
+
+        insights = [
+            f"{risers} cards rising vs {fallers} falling across {qualifying} tracked Gold Rare cards "
+            f"with enough sales to compare over the last {timeframe}."
+        ]
+        if volume_change_pct is not None:
+            direction = "up" if volume_change_pct > 0 else "down" if volume_change_pct < 0 else "flat"
+            insights.append(
+                f"Completed sales volume is {direction} {abs(volume_change_pct)}% vs the previous "
+                f"{timeframe} window ({total_recent_sales} vs {total_prior_sales} sales)."
+            )
+        if sentiment_score >= 65:
+            insights.append("Broad-based buying - prices rising across more cards than they're falling.")
+        elif sentiment_score <= 35:
+            insights.append("Broad-based selling pressure - more cards falling than rising right now.")
+
+        movers.sort(key=lambda m: m["pctChange"], reverse=True)
+        top_risers = movers[:3]
+        top_fallers = sorted(movers, key=lambda m: m["pctChange"])[:3]
+
+        mover_ids = [m["player_id"] for m in top_risers + top_fallers]
+        names: Dict[int, Any] = {}
+        if mover_ids:
+            name_rows = await db.fetch(
+                "SELECT card_id, name, rating, image_url FROM fut_players WHERE card_id = ANY($1::bigint[])",
+                mover_ids,
+            )
+            names = {int(r["card_id"]): dict(r) for r in name_rows}
+
+        def _enrich(m: Dict[str, Any]) -> Dict[str, Any]:
+            meta = names.get(m["player_id"], {})
+            return {
+                **m,
+                "name": meta.get("name"),
+                "rating": meta.get("rating"),
+                "image_url": meta.get("image_url"),
+            }
 
         return {
             "ok": True,
@@ -245,16 +267,20 @@ async def get_market_sentiment(
             "sentiment": {
                 "score": sentiment_score,
                 "label": sentiment_label,
-                "icon": sentiment_icon
+                "icon": sentiment_icon,
             },
             "market_stats": {
-                "total_trades": total_trades,
-                "profitable_trades": profitable_trades,
-                "win_rate": round(profit_ratio * 100, 1) if total_trades > 0 else 0
+                "cards_rising": risers,
+                "cards_falling": fallers,
+                "cards_compared": qualifying,
+                "total_sales_recent": total_recent_sales,
+                "total_sales_prior": total_prior_sales,
+                "volume_change_pct": volume_change_pct,
             },
-            "trending_players": top_players,
+            "top_risers": [_enrich(m) for m in top_risers],
+            "top_fallers": [_enrich(m) for m in top_fallers],
             "insights": insights,
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": datetime.utcnow().isoformat(),
         }
 
     except Exception as e:
