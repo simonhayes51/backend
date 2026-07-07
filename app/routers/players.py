@@ -345,15 +345,30 @@ async def batch_market_metrics(
             cid = int(r["player_id"])
             n_24h = r["n_24h"] or 0
             median_24h = float(r["median_24h"]) if r["median_24h"] is not None else None
+            median_7d = float(r["median_7d"]) if r["median_7d"] is not None else None
             stddev_24h = float(r["stddev_24h"]) if r["stddev_24h"] is not None else None
             ps_bin = bins_by_card.get(cid, {}).get("ps")
+
+            # Same guard as the single-card endpoint and fair_value_mv's
+            # data_quality_suspect - this query also reads sales_history
+            # directly, bypassing that matview entirely.
+            data_quality_suspect = bool(
+                ps_bin and median_24h is not None
+                and (median_24h < ps_bin * 0.1 or median_24h > ps_bin * 10)
+            )
+            if data_quality_suspect:
+                median_24h = None
+                median_7d = None
 
             divergence_pct_24h = None
             if ps_bin and median_24h is not None:
                 divergence_pct_24h = round((median_24h - ps_bin) / ps_bin * 100, 2)
 
             cv_24h = round((stddev_24h or 0) / median_24h, 4) if median_24h else None
-            snipe_index_24h = round((r["snipe_count_24h"] or 0) / n_24h, 3) if n_24h > 0 else None
+            snipe_index_24h = (
+                round((r["snipe_count_24h"] or 0) / n_24h, 3)
+                if n_24h > 0 and not data_quality_suspect else None
+            )
 
             margin = None
             if ps_bin and median_24h is not None:
@@ -369,9 +384,10 @@ async def batch_market_metrics(
 
             items[str(cid)] = {
                 "currentBin": bins_by_card.get(cid, {}),
+                "dataQualitySuspect": data_quality_suspect,
                 "realPrice": {
                     "medianSold24h": median_24h,
-                    "medianSold7d": float(r["median_7d"]) if r["median_7d"] is not None else None,
+                    "medianSold7d": median_7d,
                     "sampleSize24h": n_24h,
                     "sampleSize7d": r["n_7d"] or 0,
                 },
@@ -984,13 +1000,31 @@ async def get_player_market_metrics_route(
         stddev_7d = float(stats["stddev_7d"]) if stats["stddev_7d"] is not None else None
         snipe_count_24h = stats["snipe_count_24h"] or 0
 
+        # Same sanity check as fair_value_mv's data_quality_suspect - this
+        # endpoint computes its own stats straight from sales_history and
+        # never goes through that matview, so it needs its own copy of the
+        # guard. Confirmed live: a scraper URL-resolution bug (now fixed)
+        # attributed a card's OWN gold/base card's real sales to its
+        # Star Performer card_id - internally consistent numbers, wildly
+        # wrong card. A median more than 10x off the live BIN in either
+        # direction isn't a real discount/premium, it's a sign this
+        # specific card's data can't be trusted yet.
+        data_quality_suspect = bool(
+            ps_bin and median_24h is not None
+            and (median_24h < ps_bin * 0.1 or median_24h > ps_bin * 10)
+        )
+
+        if data_quality_suspect:
+            median_24h = None
+            median_7d = None
+
         divergence_pct_24h = None
         if ps_bin and median_24h is not None:
             divergence_pct_24h = round((median_24h - ps_bin) / ps_bin * 100, 2)
 
         cv_24h = round((stddev_24h or 0) / median_24h, 4) if median_24h else None
 
-        snipe_index_24h = round(snipe_count_24h / n_24h, 3) if n_24h > 0 else None
+        snipe_index_24h = round(snipe_count_24h / n_24h, 3) if n_24h > 0 and not data_quality_suspect else None
 
         margin = None
         if ps_bin and median_24h is not None:
@@ -1007,6 +1041,7 @@ async def get_player_market_metrics_route(
         return {
             "card_id": card_id,
             "currentBin": current_bin,
+            "dataQualitySuspect": data_quality_suspect,
             "realPrice": {
                 "medianSold24h": median_24h,
                 "medianSold7d": median_7d,
