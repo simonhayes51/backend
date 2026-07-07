@@ -61,26 +61,36 @@ async def freshness(request: Request) -> Dict[str, Any]:
             "stale": stale,
         }
 
+    # Workers write heartbeats to THEIR DATABASE_URL, which is the DB that
+    # holds fut_players - i.e. the player DB. On split-DB deploys that is
+    # not the backend's core DB, so read both pools and keep the most
+    # recent row per worker.
+    by_worker: Dict[str, Dict[str, Any]] = {}
+    for p in {core_pool, player_pool}:
+        try:
+            async with p.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT worker, last_run_at, ok, detail FROM pipeline_heartbeats"
+                )
+            for r in rows:
+                prev = by_worker.get(r["worker"])
+                if prev is None or (r["last_run_at"] and prev["_ts"] and r["last_run_at"] > prev["_ts"]):
+                    by_worker[r["worker"]] = {
+                        "_ts": r["last_run_at"],
+                        "worker": r["worker"],
+                        "last_run_at": r["last_run_at"].isoformat() if r["last_run_at"] else None,
+                        "age_minutes": _age_minutes(r["last_run_at"]),
+                        "ok": r["ok"],
+                        "detail": r["detail"],
+                    }
+        except Exception:
+            continue  # table may not exist until migration 010 / first worker run
+
     heartbeats = []
-    try:
-        async with core_pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT worker, last_run_at, ok, detail FROM pipeline_heartbeats ORDER BY worker"
-            )
-        for r in rows:
-            hb_age = _age_minutes(r["last_run_at"])
-            heartbeats.append(
-                {
-                    "worker": r["worker"],
-                    "last_run_at": r["last_run_at"].isoformat() if r["last_run_at"] else None,
-                    "age_minutes": hb_age,
-                    "ok": r["ok"],
-                    "detail": r["detail"],
-                }
-            )
-            if not r["ok"]:
-                ok = False
-    except Exception:
-        heartbeats = []  # table may not exist until migration 010 runs
+    for hb in sorted(by_worker.values(), key=lambda h: h["worker"]):
+        hb.pop("_ts", None)
+        heartbeats.append(hb)
+        if not hb["ok"]:
+            ok = False
 
     return {"ok": ok, "signals": signals, "heartbeats": heartbeats}
