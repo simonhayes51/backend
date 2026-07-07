@@ -63,6 +63,23 @@ async def card_fair_value(card_id: int, request: Request):
     if not row:
         raise HTTPException(404, "No fair-value data for this card yet")
 
+    if row.get("data_quality_suspect"):
+        # Our own median is wildly inconsistent with the live BIN - a
+        # resolved incident showed this happens when a scraper bug
+        # attributes a different card's real sales to this one. Rather
+        # than show a confidently wrong number (or an equally-wrong
+        # "verdict" in the teaser), say plainly that we don't trust this
+        # card's data yet.
+        return {
+            "card_id": row["card_id"],
+            "name": row["name"],
+            "rating": row["rating"],
+            "version": row["version"],
+            "image_url": row["image_url"],
+            "data_quality_suspect": True,
+            "message": "We're not confident in this card's market data yet - check back shortly.",
+        }
+
     ent = await compute_entitlements(request)
     if "fair_value" in ent["features"]:
         row["locked"] = False
