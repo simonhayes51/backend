@@ -104,6 +104,15 @@ DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 DISCORD_SERVER_ID = os.getenv("DISCORD_SERVER_ID")
 DISCORD_PREMIUM_ROLE_ID = os.getenv("DISCORD_PREMIUM_ROLE_ID")
 
+# ---- Admins ------------------------------------------------------------------
+# Server-side admin was previously nonexistent - "admin" only lived in the
+# frontend's VITE_ADMIN_IDS cosmetic check. Admins are now: any id listed in
+# ADMIN_DISCORD_IDS (comma-separated discord ids / user ids), or a users row
+# with account_type='admin'. Admins get elite entitlements unconditionally.
+ADMIN_DISCORD_IDS = {
+    s.strip() for s in os.getenv("ADMIN_DISCORD_IDS", "").split(",") if s.strip()
+}
+
 _ROLE_CACHE: dict[str, dict] = {}
 ROLE_CACHE_TTL = 300  # seconds
 
@@ -158,6 +167,8 @@ async def _load_billing_state(pool: asyncpg.Pool, user_id: str) -> Dict[str, Any
     """Read every stored signal that could make this user paid."""
     out: Dict[str, Any] = {
         "plan": None,
+        "tier_column": None,
+        "account_type": None,
         "premium_until": None,
         "roles": set(),
         "profile_premium": False,
@@ -166,14 +177,27 @@ async def _load_billing_state(pool: asyncpg.Pool, user_id: str) -> Dict[str, Any
     }
     try:
         row = await pool.fetchrow(
-            "SELECT plan, premium_until, roles FROM users WHERE id=$1", user_id
+            "SELECT plan, tier, account_type, premium_until, roles FROM users WHERE id=$1",
+            user_id,
         )
         if row:
             out["plan"] = row["plan"]
+            out["tier_column"] = row["tier"]
+            out["account_type"] = row["account_type"]
             out["premium_until"] = _as_aware(row["premium_until"])
             out["roles"] = set(row["roles"] or [])
     except Exception:
-        pass
+        # users table may predate tier/account_type columns
+        try:
+            row = await pool.fetchrow(
+                "SELECT plan, premium_until, roles FROM users WHERE id=$1", user_id
+            )
+            if row:
+                out["plan"] = row["plan"]
+                out["premium_until"] = _as_aware(row["premium_until"])
+                out["roles"] = set(row["roles"] or [])
+        except Exception:
+            pass
 
     try:
         prow = await pool.fetchrow(
@@ -204,15 +228,30 @@ async def _load_billing_state(pool: asyncpg.Pool, user_id: str) -> Dict[str, Any
     return out
 
 
+def _is_admin(state: Dict[str, Any], user_id: str, discord_id: Optional[str]) -> bool:
+    if (state.get("account_type") or "").lower() == "admin":
+        return True
+    ids = {str(user_id)}
+    if discord_id:
+        ids.add(str(discord_id))
+    return bool(ids & ADMIN_DISCORD_IDS)
+
+
 def _resolve_tier(state: Dict[str, Any], has_discord_premium: bool) -> Tier:
     plan = (state.get("plan") or "").lower()
+    # users.tier is honored as a manual-grant channel: an admin running
+    # UPDATE users SET tier='elite' WHERE ... should just work, without
+    # having to fake a Stripe subscription. ('basic' means nothing here -
+    # it's the column's legacy default, not a grant.)
+    tier_col = (state.get("tier_column") or "").lower()
     now = _now()
 
-    if plan == "elite":
+    if plan == "elite" or tier_col == "elite":
         return "elite"
 
     paid = (
         plan in {"pro", "premium"}
+        or tier_col in {"pro", "premium"}
         or state.get("active_subscription")
         or (state.get("premium_until") and state["premium_until"] > now)
         or (
@@ -266,6 +305,7 @@ async def compute_entitlements(req: Request) -> Dict[str, Any]:
             "premium_until": None,
             "roles": [],
             "is_premium": False,
+            "is_admin": False,
             "features": sorted(features_for_tier(tier)),
             "limits": _limits_for(tier),
         }
@@ -277,18 +317,19 @@ async def compute_entitlements(req: Request) -> Dict[str, Any]:
     pool: asyncpg.Pool = req.app.state.pool
     state = await _load_billing_state(pool, str(user_id))
     roles: Set[str] = set(sess.get("roles") or []) | set(state.get("roles") or set())
+    discord_id = sess.get("discord_id") or user_id
 
     has_discord_premium = "Premium" in roles
     if not has_discord_premium:
         try:
-            discord_id = sess.get("discord_id") or user_id
             has_discord_premium = await user_has_premium_role(str(discord_id))
             if has_discord_premium:
                 roles.add("Premium")
         except Exception:
             has_discord_premium = False
 
-    tier = _resolve_tier(state, has_discord_premium)
+    is_admin = _is_admin(state, str(user_id), str(discord_id) if discord_id else None)
+    tier = "elite" if is_admin else _resolve_tier(state, has_discord_premium)
     is_premium = tier in ("pro", "elite")
 
     premium_until = state.get("premium_until") or state.get("profile_premium_until")
@@ -300,6 +341,7 @@ async def compute_entitlements(req: Request) -> Dict[str, Any]:
         "premium_until": premium_until.isoformat() if premium_until else None,
         "roles": sorted(roles),
         "is_premium": is_premium,
+        "is_admin": is_admin,
         "features": sorted(features_for_tier(tier)),
         "limits": _limits_for(tier),
     }
@@ -310,6 +352,60 @@ async def compute_entitlements(req: Request) -> Dict[str, Any]:
 def invalidate_entitlements_cache(user_id: str) -> None:
     """Call after any billing change (Stripe webhook, admin action)."""
     _ENT_CACHE.pop(str(user_id), None)
+
+
+async def explain_entitlements(req: Request) -> Dict[str, Any]:
+    """Self-serve diagnosis: every raw signal the tier decision reads, plus
+    whether the Discord env is even configured. Answers 'why am I not
+    premium?' without anyone having to read server logs. Exposed (for the
+    logged-in user only) at /api/entitlements/debug."""
+    sess = req.session or {}
+    user_id = sess.get("user_id") or (sess.get("user") or {}).get("id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    pool: asyncpg.Pool = req.app.state.pool
+    state = await _load_billing_state(pool, str(user_id))
+    discord_id = sess.get("discord_id") or user_id
+
+    discord_env_ready = bool(DISCORD_BOT_TOKEN and DISCORD_SERVER_ID and DISCORD_PREMIUM_ROLE_ID)
+    has_discord_premium = False
+    if discord_env_ready:
+        try:
+            has_discord_premium = await user_has_premium_role(str(discord_id))
+        except Exception:
+            has_discord_premium = False
+
+    # Bypass the cache so this always reflects the live DB.
+    invalidate_entitlements_cache(str(user_id))
+    ent = await compute_entitlements(req)
+
+    return {
+        "resolved": {"tier": ent["tier"], "is_premium": ent["is_premium"], "is_admin": ent["is_admin"]},
+        "signals": {
+            "users.plan": state.get("plan"),
+            "users.tier": state.get("tier_column"),
+            "users.account_type": state.get("account_type"),
+            "users.premium_until": state["premium_until"].isoformat() if state.get("premium_until") else None,
+            "users.roles": sorted(state.get("roles") or []),
+            "user_profiles.is_premium": state.get("profile_premium"),
+            "user_profiles.premium_until": state["profile_premium_until"].isoformat() if state.get("profile_premium_until") else None,
+            "subscriptions.active_or_trialing": state.get("active_subscription"),
+            "discord.premium_role": has_discord_premium,
+            "admin.matched": ent["is_admin"],
+        },
+        "config": {
+            "discord_role_check_configured": discord_env_ready,
+            "admin_ids_configured": bool(ADMIN_DISCORD_IDS),
+        },
+        "hint": (
+            "Premium comes from ANY of: users.plan in (pro/premium/elite), users.tier in "
+            "(pro/elite), an active/trialing subscriptions row, unexpired premium_until on "
+            "users or user_profiles, the Discord Premium role (needs "
+            "DISCORD_BOT_TOKEN/DISCORD_SERVER_ID/DISCORD_PREMIUM_ROLE_ID set), or admin "
+            "(ADMIN_DISCORD_IDS / account_type='admin')."
+        ),
+    }
 
 
 def require_feature(feature: Feature):
