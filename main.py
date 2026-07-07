@@ -35,7 +35,12 @@ from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 import inspect
 from pydantic import BaseModel, Field
 
-from app.auth.entitlements import compute_entitlements, require_feature, invalidate_entitlements_cache
+from app.auth.entitlements import (
+    compute_entitlements,
+    require_feature,
+    invalidate_entitlements_cache,
+    explain_entitlements,
+)
 from app.services.price_history import get_price_history
 from app.services.prices import get_player_price  # optional
 from app.routers.smart_buy import router as smart_buy_router
@@ -434,6 +439,15 @@ async def lifespan(app: FastAPI):
     app.state.pool = pool
     app.state.player_pool = player_pool
     app.state.watchlist_pool = watchlist_pool
+
+    # SQL migrations, self-applied at boot (no terminal access needed on
+    # Railway). Advisory-locked, ledgered in schema_migrations, and never
+    # crashes the boot - see scripts/run_migrations.py. Disable with
+    # RUN_MIGRATIONS_ON_BOOT=0 once a pre-deploy command runs them instead.
+    if os.getenv("RUN_MIGRATIONS_ON_BOOT", "1") != "0":
+        from scripts.run_migrations import run_on_boot
+        await run_on_boot(DATABASE_URL, PLAYER_DATABASE_URL)
+        logging.info("✅ Boot migrations pass complete")
 
     # ---------- Core tables (create-first so fresh DBs work) ----------
     async with pool.acquire() as conn:
@@ -887,6 +901,14 @@ async def get_entitlements(request: Request):
     ent = await compute_entitlements(request)
     ent["last_validated"] = datetime.now(timezone.utc).isoformat()
     return ent
+
+
+@app.get("/api/entitlements/debug")
+async def get_entitlements_debug(request: Request):
+    """Self-only: shows every raw billing signal behind the caller's own
+    tier decision ('why am I not premium?'). No other user's data is
+    reachable from here."""
+    return await explain_entitlements(request)
 
 ALLOWED_ORIGINS = [
     "https://app.futhub.co.uk",
