@@ -125,7 +125,8 @@ _ROW_COLS = """
     card_id, name, rating, version, position, image_url,
     fair_value_24h, fair_value_7d, sales_24h, sales_7d,
     sales_per_hour_24h, volatility_24h, last_sale_at,
-    current_bin, bin_captured_at, discount_pct, bin_zscore_24h, computed_at
+    current_bin, bin_captured_at, discount_pct, bin_zscore_24h,
+    data_quality_suspect, computed_at
 """
 
 
@@ -162,6 +163,7 @@ async def get_undervalued(
     where = [
         "current_bin IS NOT NULL",
         "fair_value_24h IS NOT NULL",
+        "NOT data_quality_suspect",
         "sales_24h >= $2",
         "discount_pct >= $3",
         "current_bin >= $4",
@@ -198,6 +200,7 @@ async def get_anomalies(
             f"""
             SELECT {_ROW_COLS} FROM fair_value_mv
             WHERE bin_zscore_24h IS NOT NULL
+              AND NOT data_quality_suspect
               AND bin_zscore_24h <= $2
               AND sales_24h >= $3
             ORDER BY bin_zscore_24h ASC

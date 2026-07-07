@@ -159,12 +159,16 @@ async def _sales_url(player_url: str, platform: str) -> Optional[str]:
     path = await _resolve_sales_path(player_url)
     if path:
         return f"https://www.futbin.com{path}?platform={fb_plat}"
-    # Fallback if the market page lookup fails for any reason - wrong slug
-    # text but the same numeric id, which futbin appears to route by
-    # regardless of slug.
-    if "/player/" in player_url:
-        sales_base = player_url.replace("/player/", "/sales/")
-        return f"{sales_base}?platform={fb_plat}"
+    # No naive "/player/ -> /sales/" fallback: confirmed live that this
+    # collides with unrelated cards for brand-new cards whose /market page
+    # has no "latest sale" link yet (futbin hasn't populated one there
+    # yet) - the numeric id does NOT reliably mean the same card across
+    # both URL namespaces, contrary to what this fallback used to assume.
+    # Real incident: a 97 Star Performer Mbappé and several new TOTW cards
+    # each recorded real, internally-consistent sales (correct EA tax
+    # math) for a DIFFERENT, unrelated card, because this fallback guessed
+    # a URL instead of confirming one. No sales data is a correct "we
+    # don't know yet" state; a wrong number confidently shown is not.
     return None
 
 
