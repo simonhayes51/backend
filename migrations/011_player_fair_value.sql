@@ -1,6 +1,15 @@
 -- Migration 011: Fair Value engine — run against the PLAYER database
 -- (PLAYER_DATABASE_URL; same as DATABASE_URL on default single-DB deploys).
 -- target: player
+-- requires-table: sales_history, bin_history
+--
+-- sales_history/bin_history are created by the auto_sync service's own
+-- ensure_tables() on its first run, not by any migration in this repo. If
+-- the backend boots and runs migrations before auto_sync has ever run
+-- against this database, this migration depends on tables that don't
+-- exist yet - the requires-table line above makes the runner skip it
+-- cleanly and retry next boot instead of surfacing a raw Postgres
+-- "relation does not exist" error.
 --
 -- Builds the precomputed fair-value layer over sales_history + bin_history:
 --   fair_value_mv: one row per card with real median sold prices,
