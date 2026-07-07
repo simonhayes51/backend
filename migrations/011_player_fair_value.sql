@@ -1,5 +1,6 @@
 -- Migration 011: Fair Value engine — run against the PLAYER database
 -- (PLAYER_DATABASE_URL; same as DATABASE_URL on default single-DB deploys).
+-- target: player
 --
 -- Builds the precomputed fair-value layer over sales_history + bin_history:
 --   fair_value_mv: one row per card with real median sold prices,

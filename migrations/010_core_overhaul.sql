@@ -1,4 +1,5 @@
 -- Migration 010: Overhaul — run against the CORE database (DATABASE_URL).
+-- target: core
 --
 -- 1. Stripe webhook idempotency
 -- 2. Public Data API v2: key tiers, monthly quotas, usage metering

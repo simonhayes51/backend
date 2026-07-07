@@ -440,6 +440,15 @@ async def lifespan(app: FastAPI):
     app.state.player_pool = player_pool
     app.state.watchlist_pool = watchlist_pool
 
+    # SQL migrations, self-applied at boot (no terminal access needed on
+    # Railway). Advisory-locked, ledgered in schema_migrations, and never
+    # crashes the boot - see scripts/run_migrations.py. Disable with
+    # RUN_MIGRATIONS_ON_BOOT=0 once a pre-deploy command runs them instead.
+    if os.getenv("RUN_MIGRATIONS_ON_BOOT", "1") != "0":
+        from scripts.run_migrations import run_on_boot
+        await run_on_boot(DATABASE_URL, PLAYER_DATABASE_URL)
+        logging.info("✅ Boot migrations pass complete")
+
     # ---------- Core tables (create-first so fresh DBs work) ----------
     async with pool.acquire() as conn:
         # trades
