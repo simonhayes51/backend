@@ -35,7 +35,7 @@ from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 import inspect
 from pydantic import BaseModel, Field
 
-from app.auth.entitlements import compute_entitlements, require_feature
+from app.auth.entitlements import compute_entitlements, require_feature, invalidate_entitlements_cache
 from app.services.price_history import get_price_history
 from app.services.prices import get_player_price  # optional
 from app.routers.smart_buy import router as smart_buy_router
@@ -55,6 +55,10 @@ from app.routers.referrals import router as referrals_router
 from app.routers.trades import router as trades_router
 from app.routers.api_keys import router as api_keys_router
 from app.routers.public_api import router as public_api_router
+from app.routers.public_api_v2 import router as public_api_v2_router
+from app.routers.fair_value import router as fair_value_router
+from app.routers.ops import router as ops_router
+from app.services.fair_value import refresher_loop as fair_value_refresher_loop
 
 
 # ----------------- BOOTSTRAP -----------------
@@ -85,6 +89,10 @@ COOKIE_DOMAIN = os.getenv("COOKIE_DOMAIN") or (".futhub.co.uk" if IS_PROD else N
 
 # JWT / Discord
 JWT_PRIVATE_KEY = os.getenv("JWT_PRIVATE_KEY", "dev-secret-change-me")
+if os.getenv("ENV", "production").lower() in ("prod", "production") and JWT_PRIVATE_KEY == "dev-secret-change-me":
+    # A known signing key in production means anyone can forge extension
+    # tokens (scope trade:ingest) for any user - hard-fail instead.
+    raise ValueError("JWT_PRIVATE_KEY must be set in production (extension tokens are HS256-signed with it)")
 JWT_ISSUER = os.getenv("JWT_ISSUER", "fut-dashboard")
 JWT_TTL_SECONDS = int(os.getenv("JWT_TTL_SECONDS", "2592000"))  # 30 days
 DISCORD_OAUTH_AUTHORIZE = "https://discord.com/api/oauth2/authorize"
@@ -779,6 +787,14 @@ async def lifespan(app: FastAPI):
     _watchlist_task = asyncio.create_task(_alerts_poll_loop())
     logging.info("✅ Watchlist alerts loop started (%ss)", WATCHLIST_POLL_INTERVAL)
 
+    # Fair Value engine: create-if-missing + periodic concurrent refresh of
+    # fair_value_mv on the player DB (advisory-locked, multi-instance safe).
+    fv_interval = int(os.getenv("FAIR_VALUE_REFRESH_SECONDS", "300"))
+    app.state.fair_value_task = asyncio.create_task(
+        fair_value_refresher_loop(player_pool, fv_interval)
+    )
+    logging.info("✅ Fair Value refresher started (%ss)", fv_interval)
+
     # Run migrations for social trading features
     async with pool.acquire() as conn:
         try:
@@ -828,6 +844,11 @@ async def lifespan(app: FastAPI):
             _watchlist_task.cancel()
             with suppress(asyncio.CancelledError):
                 await _watchlist_task
+        fv_task = getattr(app.state, "fair_value_task", None)
+        if fv_task:
+            fv_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await fv_task
         for p in {pool, player_pool, watchlist_pool}:
             if p is not None:
                 await p.close()
@@ -842,9 +863,12 @@ app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 
 @app.exception_handler(asyncpg_exceptions.UndefinedTableError)
 async def handle_undefined_table_error(request: Request, exc: Exception):
+    # Previously returned HTTP 200 for a missing table, which made schema
+    # failures invisible to clients and monitoring alike (review issue C9).
+    logging.error("Missing table serving %s %s: %s", request.method, request.url.path, exc)
     return JSONResponse(
-        status_code=200,
-        content={"detail": "Database tables not initialized"}
+        status_code=503,
+        content={"detail": "Service temporarily unavailable (schema not ready)"},
     )
 
 from app.routers.watchlist import router as watchlist_router
@@ -861,29 +885,8 @@ async def get_db():
 @app.get("/api/entitlements")
 async def get_entitlements(request: Request):
     ent = await compute_entitlements(request)
-    uid = ent["user_id"]
-    if not uid:
-        return {
-            "user_id": None,
-            "is_premium": False,
-            "features": [],
-            "limits": {
-                "watchlist_max": 3,
-                "trending": {"timeframes": ["24h"], "limit": 5, "smart": False}
-            },
-            "roles": [],
-            "last_validated": datetime.now(timezone.utc).isoformat(),
-        }
-
-    return {
-        "user_id": uid,
-        "is_premium": ent["is_premium"],
-        "premium_until": ent["premium_until"],
-        "features": ent["features"],
-        "limits": ent["limits"],
-        "roles": ent["roles"],
-        "last_validated": datetime.now(timezone.utc).isoformat(),
-    }
+    ent["last_validated"] = datetime.now(timezone.utc).isoformat()
+    return ent
 
 ALLOWED_ORIGINS = [
     "https://app.futhub.co.uk",
@@ -912,14 +915,23 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 @app.exception_handler(ResponseValidationError)
 async def response_validation_exception_handler(request: Request, exc: ResponseValidationError):
-    return JSONResponse(status_code=500, content={"detail": exc.errors()})
+    logging.error("Response validation failed on %s %s: %s", request.method, request.url.path, exc.errors())
+    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
-    import traceback
-    error_msg = f"{str(exc)}\n{traceback.format_exc()}"
-    logging.error(f"Unhandled exception: {error_msg}")
-    return JSONResponse(status_code=500, content={"detail": error_msg})
+    # Log the full traceback server-side only. Returning tracebacks to the
+    # client (previous behaviour) leaked file paths, SQL, and stack frames
+    # to any caller - review issue C2.
+    error_id = secrets.token_hex(8)
+    logging.error(
+        "Unhandled exception [%s] on %s %s", error_id, request.method, request.url.path,
+        exc_info=exc,
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error", "error_id": error_id},
+    )
 
 
 class CatchExceptionsMiddleware(BaseHTTPMiddleware):
@@ -927,10 +939,15 @@ class CatchExceptionsMiddleware(BaseHTTPMiddleware):
         try:
             return await call_next(request)
         except Exception as exc:
-            import traceback
-            error_msg = f"{str(exc)}\n{traceback.format_exc()}"
-            logging.error(f"Unhandled exception: {error_msg}", exc_info=True)
-            return JSONResponse(status_code=500, content={"detail": error_msg})
+            error_id = secrets.token_hex(8)
+            logging.error(
+                "Unhandled exception [%s] on %s %s", error_id, request.method, request.url.path,
+                exc_info=exc,
+            )
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "Internal server error", "error_id": error_id},
+            )
 
 def _session_middleware_kwargs() -> dict:
     kwargs = {
@@ -1215,7 +1232,12 @@ app.include_router(trades_router)           # /api/trades/*
 
 # Public/paid historical-data API
 app.include_router(api_keys_router)         # /api/api-keys/* (session-authed key management)
-app.include_router(public_api_router)       # /api/public/v1/* (API-key-authed)
+app.include_router(public_api_router)       # /api/public/v1/* (API-key-authed, frozen contract)
+app.include_router(public_api_v2_router)    # /api/public/v2/* (tiers/quotas + fair-value layer)
+
+# Fair Value engine + ops
+app.include_router(fair_value_router)       # /api/market/fair-value, /undervalued, /anomalies
+app.include_router(ops_router)              # /api/ops/freshness
 
 # Premium-only — mount at /api/smart-buy
 app.include_router(
@@ -1287,6 +1309,15 @@ async def callback(request: Request):
     if not code:
         raise HTTPException(status_code=400, detail="Missing code")
 
+    # CSRF: the state parameter MUST match one we issued, checked BEFORE we
+    # spend the authorization code. Previously the dashboard flow accepted
+    # callbacks with a missing/unknown state (fail-open), which allows OAuth
+    # login CSRF - review issue C4.
+    _prune_oauth_state()
+    state_meta = OAUTH_STATE.pop(state, None) if state else None
+    if state_meta is None:
+        raise HTTPException(400, detail="Invalid or expired OAuth state - please retry login")
+
     data = {
         "client_id": DISCORD_CLIENT_ID,
         "client_secret": DISCORD_CLIENT_SECRET,
@@ -1302,7 +1333,7 @@ async def callback(request: Request):
                 txt = await resp.text()
                 if resp.status != 200:
                     logging.error("Discord token exchange failed (%s): %s", resp.status, txt[:500])
-                    raise HTTPException(400, detail=f"OAuth token exchange failed: {txt}")
+                    raise HTTPException(400, detail="OAuth token exchange failed - please retry login")
                 token_data = json.loads(txt)
 
         access_token = token_data.get("access_token")
@@ -1316,21 +1347,24 @@ async def callback(request: Request):
             raise HTTPException(400, detail="Failed to fetch user data")
         user_id = user_data["id"]
 
-        # Handle extension flow (non-dashboard OAuth)
-        if state and state in OAUTH_STATE and OAUTH_STATE.get(state, {}).get("flow") != "dashboard":
-            meta = OAUTH_STATE.pop(state, None) or {}
+        # Handle extension flow (non-dashboard OAuth) - state already
+        # validated (fail-closed) before the token exchange above.
+        if state_meta.get("flow") != "dashboard":
             jwt_token = issue_extension_token(user_id)
-            ext_redirect = meta.get("ext_redirect")
+            ext_redirect = state_meta.get("ext_redirect")
             if not ext_redirect:
                 raise HTTPException(400, detail="Invalid extension state")
             return RedirectResponse(f"{ext_redirect}#token={jwt_token}&state={state}")
 
-        if state:
-            OAUTH_STATE.pop(state, None)
-
         discord_id = int(user_id)
 
-        print(f"✅ Discord OAuth successful for user {discord_id}, skipping guild membership check")
+        # Optional guild-membership gate. Fail-closed when enforcement is on:
+        # check_server_membership() returns True on transient Discord errors,
+        # so only a definite "not a member" blocks login.
+        if os.getenv("REQUIRE_GUILD_MEMBERSHIP", "0") == "1":
+            if not await check_server_membership(discord_id):
+                return RedirectResponse(f"{FRONTEND_URL}/#/access-denied")
+        logging.info("Discord OAuth successful for user %s", discord_id)
 
         username = user_data.get("global_name") or user_data.get("username") or "User"
         avatar_url = (
@@ -3544,10 +3578,23 @@ async def create_checkout_session(
         profile = await conn.fetchrow("SELECT * FROM user_profiles WHERE user_id = $1", user_id)
         if not profile:
             raise HTTPException(status_code=404, detail="User profile not found")
-        # Create Stripe checkout session
+
+        # Use the user's real email if we have one; the old
+        # "{username}@discord.local" placeholder broke Stripe receipts and
+        # dunning emails. Omitting customer_email lets Stripe Checkout
+        # collect a real address instead.
+        real_email = None
+        try:
+            real_email = await conn.fetchval("SELECT email FROM users WHERE id = $1", user_id)
+        except Exception:
+            pass
+
+        checkout_kwargs = {}
+        if real_email:
+            checkout_kwargs["customer_email"] = real_email
 
         session = stripe.checkout.Session.create(
-            customer_email=f"{profile['username']}@discord.local",  # Placeholder email
+            **checkout_kwargs,
             payment_method_types=['card'],
             line_items=[{
                 'price': stripe_price_id,
@@ -3633,6 +3680,26 @@ async def stripe_webhook(request: Request, conn=Depends(get_db)):
         raise HTTPException(status_code=400, detail="Invalid payload")
     except stripe.error.SignatureVerificationError:
         raise HTTPException(status_code=400, detail="Invalid signature")
+
+    # Idempotency: Stripe retries webhooks, and handle_subscription_created
+    # does a plain INSERT - process each event id exactly once.
+    try:
+        inserted = await conn.fetchval(
+            """
+            INSERT INTO stripe_events (event_id, event_type)
+            VALUES ($1, $2)
+            ON CONFLICT (event_id) DO NOTHING
+            RETURNING event_id
+            """,
+            event['id'], event['type'],
+        )
+        if inserted is None:
+            return {"received": True, "duplicate": True}
+    except asyncpg_exceptions.UndefinedTableError:
+        # Table missing (migration 010 not applied yet) - process anyway
+        # rather than dropping billing events on the floor.
+        logging.warning("stripe_events table missing - webhook idempotency disabled")
+
     try:
         if event['type'] == 'checkout.session.completed':
             await handle_checkout_completed(event['data']['object'], conn)
@@ -3659,6 +3726,7 @@ async def handle_checkout_completed(session, conn):
     if user_id:
         # Assign Discord role immediately (for platform subscriptions)
         await discord_manager.assign_premium_role(user_id)
+        invalidate_entitlements_cache(user_id)
 
 async def handle_subscription_created(subscription, conn):
     user_id = subscription['metadata'].get('user_id')
@@ -3707,6 +3775,7 @@ async def handle_subscription_created(subscription, conn):
     )
     # Assign Discord role and log
     await discord_manager.assign_premium_role(user_id)
+    invalidate_entitlements_cache(user_id)
     await conn.execute(
         """
         INSERT INTO discord_roles (user_id, discord_user_id, role_id, expires_at)
@@ -3745,6 +3814,7 @@ async def handle_subscription_updated(subscription, conn):
         is_active,
         datetime.fromtimestamp(subscription.get('current_period_end'), tz=timezone.utc) if is_active and subscription.get('current_period_end') else None
     )
+    invalidate_entitlements_cache(user_id)
 
 async def handle_subscription_deleted(subscription, conn):
     """Handle subscription cancellation"""
@@ -3764,6 +3834,7 @@ async def handle_subscription_deleted(subscription, conn):
         user_id
     )
     await discord_manager.remove_premium_role(user_id)
+    invalidate_entitlements_cache(user_id)
 
 async def handle_payment_succeeded(invoice, conn):
     """Handle successful payment"""
@@ -3848,46 +3919,15 @@ async def _bg_aggregator():
             await asyncio.sleep(60)
     asyncio.create_task(loop())
 
-# ---------- Global error handler (nicer 500s) ----------
-@app.exception_handler(Exception)
-async def _any_error(request: Request, exc: Exception):
-    import traceback; traceback.print_exc()
-    return JSONResponse(status_code=500, content={"path": str(request.url), "error": str(exc)})
-
-@app.get("/api/debug/session-state")
-async def debug_session_state(request: Request):
-    """Debug endpoint to see current session state"""
-    return {
-        "session_data": dict(request.session),
-        "has_user_id": "user_id" in request.session,
-        "user_id_value": request.session.get("user_id"),
-        "cookies": dict(request.cookies),
-    }
-
-# ---------- Tiny probes (remove later) ----------
-_probe = APIRouter()
-
-@_probe.get("/__whichdb")
-async def whichdb(db=Depends(get_db)):
-    return {
-        "current_database": await db.fetchval("SELECT current_database()"),
-        "current_schema": await db.fetchval("SELECT current_schema()"),
-        "search_path": await db.fetchval("SHOW search_path"),
-    }
-
-@_probe.get("/__has_candles")
-async def has_candles(player_card_id: str, platform: str = "ps", db=Depends(get_db)):
-    cnt = await db.fetchval(
-        "SELECT COUNT(*) FROM public.fut_candles WHERE player_card_id=$1 AND platform=$2",
-        player_card_id, platform
-    )
-    return {"player_card_id": player_card_id, "platform": platform, "rows": cnt}
+# The old /api/debug/session-state endpoint (dumped the caller's session +
+# cookies, unauthenticated) and the __whichdb/__has_candles probes were
+# removed - review issue C3. Operational visibility now lives at
+# /api/ops/freshness (app/routers/ops.py). A duplicate global Exception
+# handler that leaked str(exc) to clients was also removed here (C2).
 
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
-
-app.include_router(_probe)
 
 if __name__ == "__main__":
     import uvicorn
