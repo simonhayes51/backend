@@ -18,6 +18,7 @@ feature, which the frontend already understands (axios dispatches a
 `premium:blocked` event on 402).
 """
 
+import json
 import os
 import time
 from datetime import datetime, timezone
@@ -134,6 +135,23 @@ def _as_aware(dt: Optional[datetime]) -> Optional[datetime]:
     return dt
 
 
+def _parse_roles(raw: Any) -> Set[str]:
+    """users.roles is JSONB, which asyncpg returns as a JSON *string* unless
+    a codec is registered - so set('[\"Premium\"]') would iterate characters
+    and 'Premium' in roles would never match (found live via
+    /api/entitlements/debug showing roles: ['[', ']'])."""
+    if not raw:
+        return set()
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            return set()
+    if isinstance(raw, (list, tuple, set)):
+        return {str(r) for r in raw}
+    return set()
+
+
 async def user_has_premium_role(discord_user_id: str) -> bool:
     """Legacy grandfathering: True if the member holds the Premium role."""
     if not (DISCORD_BOT_TOKEN and DISCORD_SERVER_ID and DISCORD_PREMIUM_ROLE_ID):
@@ -185,7 +203,7 @@ async def _load_billing_state(pool: asyncpg.Pool, user_id: str) -> Dict[str, Any
             out["tier_column"] = row["tier"]
             out["account_type"] = row["account_type"]
             out["premium_until"] = _as_aware(row["premium_until"])
-            out["roles"] = set(row["roles"] or [])
+            out["roles"] = _parse_roles(row["roles"])
     except Exception:
         # users table may predate tier/account_type columns
         try:
@@ -195,7 +213,7 @@ async def _load_billing_state(pool: asyncpg.Pool, user_id: str) -> Dict[str, Any
             if row:
                 out["plan"] = row["plan"]
                 out["premium_until"] = _as_aware(row["premium_until"])
-                out["roles"] = set(row["roles"] or [])
+                out["roles"] = _parse_roles(row["roles"])
         except Exception:
             pass
 
