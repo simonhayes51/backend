@@ -1,13 +1,31 @@
 from __future__ import annotations
 
+"""
+Entitlements: the single place that decides what a user can do.
+
+This module previously granted every feature to any logged-in user and
+require_feature() was a no-op — the paywall did not exist (review issue C1).
+It now computes a real tier from, in priority order:
+
+  1. users.plan ('elite' | 'pro' | 'premium' | anything else -> free)
+  2. users.premium_until / user_profiles.is_premium + premium_until
+  3. An 'active' or 'trialing' row in subscriptions (Stripe-synced)
+  4. The Discord "Premium" role (legacy grandfathering, cached 5 min)
+
+and gates features through FEATURE_MATRIX. require_feature() raises
+HTTP 402 (payment required) when the caller's tier doesn't include the
+feature, which the frontend already understands (axios dispatches a
+`premium:blocked` event on 402).
+"""
+
 import os
 import time
 from datetime import datetime, timezone
-from typing import Optional, Set, Literal, Dict, Any
+from typing import Any, Dict, Optional, Set, Literal
 
 import aiohttp
 import asyncpg
-from fastapi import Request, HTTPException
+from fastapi import HTTPException, Request
 
 Feature = Literal[
     "smart_buy",
@@ -24,117 +42,91 @@ Feature = Literal[
     "leaderboard",
     "referrals",
     "bulk_trades",
+    "fair_value",
+    "undervalued_board",
+    "anomaly_alerts",
+    "realtime_alerts",
 ]
 
-# 3-tier subscription system
-Tier = Literal["basic", "pro", "elite"]
+Tier = Literal["free", "pro", "elite"]
 
-# ---- Config (overridable via env) -------------------------------------------
-# Watchlist limits by tier
-BASIC_WATCHLIST_MAX = int(os.getenv("WATCHLIST_BASIC_MAX", "3"))
+# ---- Limits (overridable via env) -------------------------------------------
+FREE_WATCHLIST_MAX = int(os.getenv("WATCHLIST_FREE_MAX", os.getenv("WATCHLIST_BASIC_MAX", "3")))
 PRO_WATCHLIST_MAX = int(os.getenv("WATCHLIST_PRO_MAX", "25"))
 ELITE_WATCHLIST_MAX = int(os.getenv("WATCHLIST_ELITE_MAX", "500"))
 
-# Legacy support
-FREE_WATCHLIST_MAX = BASIC_WATCHLIST_MAX
+# Legacy aliases still imported elsewhere
+BASIC_WATCHLIST_MAX = FREE_WATCHLIST_MAX
 PREMIUM_WATCHLIST_MAX = ELITE_WATCHLIST_MAX
 
-# Trending limits by tier
-BASIC_TRENDING = {
-    "timeframes": {"24h"},
-    "limit": 5,
-    "smart": False,
-}
-PRO_TRENDING = {
-    "timeframes": {"6h", "24h"},
-    "limit": 15,
-    "smart": True,
-}
-ELITE_TRENDING = {
-    "timeframes": {"4h", "6h", "24h"},
-    "limit": 50,
-    "smart": True,
-}
+FREE_TRENDING = {"timeframes": {"24h"}, "limit": 5, "smart": False}
+PRO_TRENDING = {"timeframes": {"6h", "24h"}, "limit": 15, "smart": True}
+ELITE_TRENDING = {"timeframes": {"4h", "6h", "24h"}, "limit": 50, "smart": True}
 
-# Legacy support
-FREE_TRENDING = BASIC_TRENDING
+# Legacy aliases
+BASIC_TRENDING = FREE_TRENDING
 PREMIUM_TRENDING = ELITE_TRENDING
 
-# Feature matrix: defines which tiers can access which features
-FEATURE_MATRIX: Dict[Feature, Dict[str, Any]] = {
-    # Legacy features (Pro and Elite)
-    "smart_buy":       {"roles": {"Premium"}, "plans": {"pro", "premium", "elite"}},
-    "trade_finder":    {"roles": {"Premium"}, "plans": {"pro", "premium", "elite"}},
-    "deal_confidence": {"roles": {"Premium"}, "plans": {"pro", "premium", "elite"}},
-    "backtest":        {"roles": {"Premium"}, "plans": {"pro", "premium", "elite"}},
-    "smart_trending":  {"roles": {"Premium"}, "plans": {"pro", "premium", "elite"}},
+# Feature -> minimum tier. Everything not listed here is free.
+_TIER_ORDER: Dict[str, int] = {"free": 0, "pro": 1, "elite": 2}
 
-    # New tier-specific features
-    "portfolio_optimizer": {"roles": {"Premium"}, "plans": {"pro", "premium", "elite"}},  # Pro+
-    "ai_copilot":          {"roles": set(), "plans": {"basic", "pro", "premium", "elite"}},  # All tiers
-    "market_sentiment":    {"roles": set(), "plans": {"basic", "pro", "premium", "elite"}},  # All tiers
-    "market_maker":        {"roles": {"Premium"}, "plans": {"elite"}},  # Elite only
-    "advanced_analytics":  {"roles": {"Premium"}, "plans": {"pro", "premium", "elite"}},  # Pro+
-    "leaderboard":         {"roles": set(), "plans": {"basic", "pro", "premium", "elite"}},  # All tiers
-    "referrals":           {"roles": set(), "plans": {"basic", "pro", "premium", "elite"}},  # All tiers
-    "bulk_trades":         {"roles": {"Premium"}, "plans": {"elite"}},  # Elite only
+FEATURE_MIN_TIER: Dict[Feature, Tier] = {
+    # Free — the hook
+    "ai_copilot": "free",
+    "market_sentiment": "free",
+    "leaderboard": "free",
+    "referrals": "free",
+    "watchlist": "free",          # size still limited by tier below
+    # Pro — the daily-driver tools
+    "smart_buy": "pro",
+    "trade_finder": "pro",
+    "deal_confidence": "pro",
+    "backtest": "pro",
+    "smart_trending": "pro",
+    "portfolio_optimizer": "pro",
+    "advanced_analytics": "pro",
+    "fair_value": "pro",
+    "undervalued_board": "pro",
+    "realtime_alerts": "pro",
+    # Elite — the edge
+    "market_maker": "elite",
+    "bulk_trades": "elite",
+    "anomaly_alerts": "elite",
 }
 
-# ---- Env needed to query Discord (optional; if missing we just skip) --------
+# Kept importable for older code paths that referenced the matrix by name.
+FEATURE_MATRIX: Dict[Feature, Dict[str, Any]] = {
+    f: {"min_tier": t} for f, t in FEATURE_MIN_TIER.items()
+}
+
+# ---- Discord legacy-role fallback (optional) --------------------------------
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 DISCORD_SERVER_ID = os.getenv("DISCORD_SERVER_ID")
-DISCORD_PREMIUM_ROLE_ID = os.getenv("DISCORD_PREMIUM_ROLE_ID")  # role ID you marked as Premium
+DISCORD_PREMIUM_ROLE_ID = os.getenv("DISCORD_PREMIUM_ROLE_ID")
 
-# small cache to avoid hammering Discord
 _ROLE_CACHE: dict[str, dict] = {}
 ROLE_CACHE_TTL = 300  # seconds
+
+# Short cache of computed entitlements so hot endpoints don't re-query the DB
+# on every request. Keyed by user_id.
+_ENT_CACHE: dict[str, dict] = {}
+ENT_CACHE_TTL = int(os.getenv("ENTITLEMENTS_CACHE_TTL", "60"))
 
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _is_premium(plan: Optional[str], premium_until: Optional[datetime], roles: Set[str]) -> bool:
-    if plan and plan.lower() in {"pro", "premium", "elite"}:
-        return True
-    if premium_until and premium_until > _now():
-        return True
-    if "Premium" in roles:
-        return True
-    return False
-
-def _get_tier(plan: Optional[str], premium_until: Optional[datetime], roles: Set[str]) -> Tier:
-    """Determine user's subscription tier"""
-    if not plan:
-        plan_lower = "basic"
-    else:
-        plan_lower = plan.lower()
-
-    # Map plans to tiers
-    if plan_lower in {"elite"}:
-        return "elite"
-    elif plan_lower in {"pro", "premium"}:
-        return "pro"
-    else:
-        return "basic"
-
-
-async def _load_user_row(pool: asyncpg.Pool, user_id: str) -> Optional[asyncpg.Record]:
-    """
-    Reads entitlements from the 'users' table if it exists.
-    If the table doesn't exist yet, we swallow the error and return None.
-    """
-    try:
-        return await pool.fetchrow("SELECT plan, premium_until, roles FROM users WHERE id=$1", user_id)
-    except Exception:
+def _as_aware(dt: Optional[datetime]) -> Optional[datetime]:
+    if dt is None:
         return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 async def user_has_premium_role(discord_user_id: str) -> bool:
-    """
-    True if the Discord member has the 'Premium' role ID in your guild.
-    Safe to call even if env is missing (just returns False).
-    """
+    """Legacy grandfathering: True if the member holds the Premium role."""
     if not (DISCORD_BOT_TOKEN and DISCORD_SERVER_ID and DISCORD_PREMIUM_ROLE_ID):
         return False
 
@@ -162,72 +154,205 @@ async def user_has_premium_role(discord_user_id: str) -> bool:
     return ok
 
 
+async def _load_billing_state(pool: asyncpg.Pool, user_id: str) -> Dict[str, Any]:
+    """Read every stored signal that could make this user paid."""
+    out: Dict[str, Any] = {
+        "plan": None,
+        "premium_until": None,
+        "roles": set(),
+        "profile_premium": False,
+        "profile_premium_until": None,
+        "active_subscription": False,
+    }
+    try:
+        row = await pool.fetchrow(
+            "SELECT plan, premium_until, roles FROM users WHERE id=$1", user_id
+        )
+        if row:
+            out["plan"] = row["plan"]
+            out["premium_until"] = _as_aware(row["premium_until"])
+            out["roles"] = set(row["roles"] or [])
+    except Exception:
+        pass
+
+    try:
+        prow = await pool.fetchrow(
+            "SELECT is_premium, premium_until FROM user_profiles WHERE user_id=$1",
+            user_id,
+        )
+        if prow:
+            out["profile_premium"] = bool(prow["is_premium"])
+            out["profile_premium_until"] = _as_aware(prow["premium_until"])
+    except Exception:
+        pass
+
+    try:
+        sub = await pool.fetchrow(
+            """
+            SELECT 1 FROM subscriptions
+            WHERE user_id = $1
+              AND status IN ('active', 'trialing')
+              AND (current_period_end IS NULL OR current_period_end > NOW())
+            LIMIT 1
+            """,
+            user_id,
+        )
+        out["active_subscription"] = sub is not None
+    except Exception:
+        pass
+
+    return out
+
+
+def _resolve_tier(state: Dict[str, Any], has_discord_premium: bool) -> Tier:
+    plan = (state.get("plan") or "").lower()
+    now = _now()
+
+    if plan == "elite":
+        return "elite"
+
+    paid = (
+        plan in {"pro", "premium"}
+        or state.get("active_subscription")
+        or (state.get("premium_until") and state["premium_until"] > now)
+        or (
+            state.get("profile_premium")
+            and (
+                state.get("profile_premium_until") is None
+                or state["profile_premium_until"] > now
+            )
+        )
+        or "Premium" in (state.get("roles") or set())
+        or has_discord_premium
+    )
+    return "pro" if paid else "free"
+
+
+def _limits_for(tier: Tier) -> Dict[str, Any]:
+    if tier == "elite":
+        return {
+            "watchlist_max": ELITE_WATCHLIST_MAX,
+            "trending": ELITE_TRENDING,
+            "bulk_trades_max": 100,
+        }
+    if tier == "pro":
+        return {
+            "watchlist_max": PRO_WATCHLIST_MAX,
+            "trending": PRO_TRENDING,
+            "bulk_trades_max": 25,
+        }
+    return {
+        "watchlist_max": FREE_WATCHLIST_MAX,
+        "trending": FREE_TRENDING,
+        "bulk_trades_max": 10,
+    }
+
+
+def features_for_tier(tier: Tier) -> Set[Feature]:
+    rank = _TIER_ORDER[tier]
+    return {f for f, t in FEATURE_MIN_TIER.items() if _TIER_ORDER[t] <= rank}
+
+
 async def compute_entitlements(req: Request) -> Dict[str, Any]:
-    """
-    Single place that decides what a user can do.
-    Sources:
-      - session (user_id, roles)
-      - users table (plan, premium_until, roles)
-      - Discord live role check (fallback)
-    """
     sess = req.session or {}
     user_id = sess.get("user_id") or (sess.get("user") or {}).get("id")
-    pool: asyncpg.Pool = req.app.state.pool  # provided in app.lifespan
 
-    plan = None
-    premium_until = None
-    roles: Set[str] = set(sess.get("roles") or [])
+    if not user_id:
+        tier: Tier = "free"
+        return {
+            "user_id": None,
+            "plan": None,
+            "tier": tier,
+            "premium_until": None,
+            "roles": [],
+            "is_premium": False,
+            "features": sorted(features_for_tier(tier)),
+            "limits": _limits_for(tier),
+        }
 
-    if user_id:
-        row = await _load_user_row(pool, user_id)
-        if row:
-            plan = row["plan"]
-            premium_until = row["premium_until"]
-            roles |= set(row["roles"] or [])
+    cached = _ENT_CACHE.get(str(user_id))
+    if cached and (time.time() - cached["at"] < ENT_CACHE_TTL):
+        return dict(cached["ent"])
 
-    # Fallback to live Discord check if we still don't have Premium in roles
-    if user_id and "Premium" not in roles:
+    pool: asyncpg.Pool = req.app.state.pool
+    state = await _load_billing_state(pool, str(user_id))
+    roles: Set[str] = set(sess.get("roles") or []) | set(state.get("roles") or set())
+
+    has_discord_premium = "Premium" in roles
+    if not has_discord_premium:
         try:
-            if await user_has_premium_role(user_id):
+            discord_id = sess.get("discord_id") or user_id
+            has_discord_premium = await user_has_premium_role(str(discord_id))
+            if has_discord_premium:
                 roles.add("Premium")
         except Exception:
-            pass
+            has_discord_premium = False
 
-    # Treat all authenticated users as having full premium access
-    premium = bool(user_id)
-    tier: Tier = "elite" if user_id else "basic"
+    tier = _resolve_tier(state, has_discord_premium)
+    is_premium = tier in ("pro", "elite")
 
-    # Set generous limits for authenticated users
-    if premium:
-        watchlist_max = ELITE_WATCHLIST_MAX
-        trending = ELITE_TRENDING
-    else:
-        watchlist_max = BASIC_WATCHLIST_MAX
-        trending = BASIC_TRENDING
+    premium_until = state.get("premium_until") or state.get("profile_premium_until")
 
-    limits = {
-        "watchlist_max": watchlist_max,
-        "trending": trending,
-        "bulk_trades_max": 100 if tier == "elite" else (25 if tier == "pro" else 10),
-    }
-
-    # Grant all features to authenticated users
-    features: Set[Feature] = set(FEATURE_MATRIX.keys()) if premium else set()
-
-    return {
-        "user_id": user_id,
-        "plan": plan,
+    ent = {
+        "user_id": str(user_id),
+        "plan": state.get("plan"),
         "tier": tier,
-        "premium_until": premium_until,
-        "roles": list(roles),
-        "is_premium": premium,
-        "features": list(features),
-        "limits": limits,
+        "premium_until": premium_until.isoformat() if premium_until else None,
+        "roles": sorted(roles),
+        "is_premium": is_premium,
+        "features": sorted(features_for_tier(tier)),
+        "limits": _limits_for(tier),
     }
+    _ENT_CACHE[str(user_id)] = {"at": time.time(), "ent": dict(ent)}
+    return ent
+
+
+def invalidate_entitlements_cache(user_id: str) -> None:
+    """Call after any billing change (Stripe webhook, admin action)."""
+    _ENT_CACHE.pop(str(user_id), None)
 
 
 def require_feature(feature: Feature):
-    async def _dep(req: Request):
-        return True
+    """FastAPI dependency: 401 if anonymous, 402 if tier doesn't cover it."""
+
+    async def _dep(req: Request) -> Dict[str, Any]:
+        ent = await compute_entitlements(req)
+        if not ent["user_id"]:
+            raise HTTPException(status_code=401, detail="Not authenticated")
+        if feature not in ent["features"]:
+            min_tier = FEATURE_MIN_TIER.get(feature, "pro")
+            raise HTTPException(
+                status_code=402,
+                detail={
+                    "error": "upgrade_required",
+                    "feature": feature,
+                    "required_tier": min_tier,
+                    "current_tier": ent["tier"],
+                    "message": f"'{feature}' needs the {min_tier.title()} plan.",
+                },
+            )
+        return ent
+
+    return _dep
+
+
+def require_tier(min_tier: Tier):
+    """FastAPI dependency for tier-gated (rather than feature-gated) routes."""
+
+    async def _dep(req: Request) -> Dict[str, Any]:
+        ent = await compute_entitlements(req)
+        if not ent["user_id"]:
+            raise HTTPException(status_code=401, detail="Not authenticated")
+        if _TIER_ORDER[ent["tier"]] < _TIER_ORDER[min_tier]:
+            raise HTTPException(
+                status_code=402,
+                detail={
+                    "error": "upgrade_required",
+                    "required_tier": min_tier,
+                    "current_tier": ent["tier"],
+                    "message": f"This needs the {min_tier.title()} plan.",
+                },
+            )
+        return ent
 
     return _dep

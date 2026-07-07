@@ -1,16 +1,26 @@
 # app/routers/api_keys.py
 from __future__ import annotations
 
+from datetime import date
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from app.auth.entitlements import compute_entitlements
-from app.auth.api_keys import generate_api_key, hash_api_key, DEFAULT_RATE_LIMIT_PER_MINUTE
+from app.auth.api_keys import (
+    TIER_LIMITS,
+    generate_api_key,
+    hash_api_key,
+)
 from app.db import get_db
 
 router = APIRouter(prefix="/api/api-keys", tags=["api-keys"])
+
+# Which key tiers a given subscription tier may self-serve. Higher API
+# tiers (trader/dev) are their own paid products - assigned after purchase
+# (Stripe payment link / manual for now), not self-served.
+SELF_SERVE_KEY_TIER = "starter"
 
 
 def _uid(request: Request) -> str:
@@ -29,30 +39,40 @@ async def list_api_keys(request: Request, conn = Depends(get_db)):
     uid = _uid(request)
     rows = await conn.fetch(
         """
-        SELECT id, name, key_prefix, rate_limit_per_minute, created_at, last_used_at, revoked_at
+        SELECT id, name, key_prefix, rate_limit_per_minute,
+               COALESCE(tier, 'starter') AS tier, monthly_quota,
+               created_at, last_used_at, revoked_at
         FROM api_keys
         WHERE user_id = $1
         ORDER BY created_at DESC
         """,
         uid,
     )
-    return {"items": [dict(r) for r in rows]}
+    items: List[Dict[str, Any]] = []
+    month_start = date.today().replace(day=1)
+    for r in rows:
+        d = dict(r)
+        try:
+            used = await conn.fetchval(
+                "SELECT COALESCE(SUM(requests),0) FROM api_key_usage WHERE api_key_id=$1 AND day >= $2",
+                r["id"], month_start,
+            )
+            d["used_this_month"] = int(used or 0)
+        except Exception:
+            d["used_this_month"] = None
+        items.append(d)
+    return {"items": items, "tiers": {t: {"rpm": rpm, "monthly_quota": q} for t, (rpm, q) in TIER_LIMITS.items()}}
 
 
 @router.post("")
 async def create_api_key(payload: ApiKeyCreate, request: Request, conn = Depends(get_db)):
     """
-    Issues a new API key for the paid historical-data tier
-    (/api/public/v1/*). The plaintext key is returned exactly once here -
-    only its hash is stored, so it can never be shown again after this
-    response.
+    Issues a new API key (v1 + v2 public data API). The plaintext key is
+    returned exactly once - only its hash is stored.
 
-    NOTE: gated on is_premium, which - per a real gap found while building
-    this - currently means "any logged-in user" (compute_entitlements()
-    grants premium to every authenticated session, not just paying ones).
-    Selling API access as its own product on top of that needs a real
-    decision about pricing/tier before this is a genuine paid tier rather
-    than a free perk of having an account.
+    Self-serve keys are 'starter' tier (free taster: 60 rpm, 5k req/month)
+    and require a Pro+ account. Trader/Dev tiers are sold separately and
+    upgraded via admin/billing flows.
     """
     uid = _uid(request)
     ent = await compute_entitlements(request)
@@ -61,7 +81,7 @@ async def create_api_key(payload: ApiKeyCreate, request: Request, conn = Depends
             402,
             detail={
                 "error": "premium_required",
-                "message": "API access requires a Premium account.",
+                "message": "API access needs a Pro plan.",
                 "upgrade_url": "/billing",
             },
         )
@@ -72,24 +92,32 @@ async def create_api_key(payload: ApiKeyCreate, request: Request, conn = Depends
     if int(existing or 0) >= 5:
         raise HTTPException(400, "Maximum of 5 active API keys per account - revoke one first.")
 
+    tier = SELF_SERVE_KEY_TIER
+    rpm, quota = TIER_LIMITS[tier]
+
     key = generate_api_key()
     row = await conn.fetchrow(
         """
-        INSERT INTO api_keys (user_id, name, key_hash, key_prefix, rate_limit_per_minute)
-        VALUES ($1, $2, $3, $4, $5)
+        INSERT INTO api_keys (user_id, name, key_hash, key_prefix, rate_limit_per_minute, tier, monthly_quota)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
         RETURNING id, created_at
         """,
         uid,
         payload.name or "Untitled key",
         hash_api_key(key),
         key[:14],
-        DEFAULT_RATE_LIMIT_PER_MINUTE,
+        rpm,
+        tier,
+        quota,
     )
     return {
         "ok": True,
         "id": row["id"],
         "key": key,  # shown once
         "keyPrefix": key[:14],
+        "tier": tier,
+        "rpm": rpm,
+        "monthlyQuota": quota,
         "createdAt": row["created_at"].isoformat(),
         "warning": "Save this key now - it will not be shown again.",
     }
