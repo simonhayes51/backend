@@ -1261,6 +1261,10 @@ app.include_router(public_api_v2_router)    # /api/public/v2/* (tiers/quotas + f
 app.include_router(fair_value_router)       # /api/market/fair-value, /undervalued, /anomalies
 app.include_router(ops_router)              # /api/ops/freshness
 
+# Admin (require_admin-gated): user search + premium grant/revoke
+from app.routers.admin import router as admin_router
+app.include_router(admin_router)            # /api/admin/*
+
 # Premium-only — mount at /api/smart-buy
 app.include_router(
     smart_buy_router,
