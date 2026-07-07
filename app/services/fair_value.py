@@ -95,7 +95,18 @@ async def refresh_fair_value(pool: asyncpg.Pool) -> bool:
 
 
 async def refresher_loop(pool: asyncpg.Pool, interval_seconds: int = 300) -> None:
-    """Background task started from the app lifespan."""
+    """Background task started from the app lifespan.
+
+    Waits a few seconds before its first attempt. During rapid iterative
+    redeploys a container can be superseded (SIGTERM) within seconds of
+    starting; without this delay the very first iteration - potentially a
+    multi-statement matview (re)create - can be cancelled mid-flight,
+    which Postgres logs as a real-looking ERROR even though it's a benign
+    side effect of the shutdown (an interrupted CREATE just rolls back,
+    nothing is left inconsistent). This doesn't eliminate the race, just
+    makes it far less likely to catch a short-lived container mid-DDL.
+    """
+    await asyncio.sleep(5)
     while True:
         try:
             ok = await ensure_fair_value_mv(pool)
