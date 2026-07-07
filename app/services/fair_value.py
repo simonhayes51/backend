@@ -22,6 +22,7 @@ import pathlib
 from typing import Any, Dict, List, Optional
 
 import asyncpg
+from asyncpg import exceptions as asyncpg_exceptions
 
 log = logging.getLogger("fair_value")
 
@@ -34,31 +35,57 @@ _MIGRATION_FILE = (
 
 
 async def ensure_fair_value_mv(pool: asyncpg.Pool) -> bool:
-    """Create the matview + indexes if missing. Returns True if usable."""
+    """Create the matview + indexes if missing. Returns True if usable.
+
+    Guarded by the same advisory lock as refresh_fair_value: on a rolling
+    deploy, two instances can boot within the same window, and without a
+    shared lock one instance's CREATE can be mid-flight (not yet committed)
+    when the other's REFRESH runs on a different connection - Postgres has
+    no visibility into an uncommitted DDL from another session, so that
+    REFRESH genuinely sees 'relation does not exist' (this is what fired
+    live: a REFRESH statement erroring 13 seconds before the next refresh
+    cycle succeeded once the create had landed). pg_try_advisory_lock makes
+    the two operations mutually exclusive instead of racing.
+    """
     try:
         async with pool.acquire() as conn:
-            exists = await conn.fetchval(
-                "SELECT 1 FROM pg_matviews WHERE matviewname = 'fair_value_mv'"
-            )
-            if exists:
+            got = await conn.fetchval("SELECT pg_try_advisory_lock($1)", REFRESH_LOCK_KEY)
+            if not got:
+                # Another instance is creating/refreshing right now -
+                # assume it has this covered rather than blocking here.
                 return True
-            log.info("fair_value_mv missing - creating from migration 011")
-            await conn.execute(_MIGRATION_FILE.read_text())
-            return True
+            try:
+                exists = await conn.fetchval(
+                    "SELECT 1 FROM pg_matviews WHERE matviewname = 'fair_value_mv'"
+                )
+                if exists:
+                    return True
+                log.info("fair_value_mv missing - creating from migration 011")
+                await conn.execute(_MIGRATION_FILE.read_text())
+                return True
+            finally:
+                await conn.execute("SELECT pg_advisory_unlock($1)", REFRESH_LOCK_KEY)
     except Exception as e:
         log.error("ensure_fair_value_mv failed: %s", e)
         return False
 
 
 async def refresh_fair_value(pool: asyncpg.Pool) -> bool:
-    """One guarded refresh. Concurrent-safe across instances."""
+    """One guarded refresh. Concurrent-safe across instances. Self-heals if
+    the matview turns out to be missing (recreates and retries once)
+    instead of failing every cycle forever."""
     try:
         async with pool.acquire() as conn:
             got = await conn.fetchval("SELECT pg_try_advisory_lock($1)", REFRESH_LOCK_KEY)
             if not got:
                 return False
             try:
-                await conn.execute("REFRESH MATERIALIZED VIEW CONCURRENTLY fair_value_mv")
+                try:
+                    await conn.execute("REFRESH MATERIALIZED VIEW CONCURRENTLY fair_value_mv")
+                except asyncpg_exceptions.UndefinedTableError:
+                    log.warning("fair_value_mv missing at refresh time - recreating")
+                    await conn.execute(_MIGRATION_FILE.read_text())
+                    await conn.execute("REFRESH MATERIALIZED VIEW CONCURRENTLY fair_value_mv")
                 return True
             finally:
                 await conn.execute("SELECT pg_advisory_unlock($1)", REFRESH_LOCK_KEY)
@@ -69,12 +96,13 @@ async def refresh_fair_value(pool: asyncpg.Pool) -> bool:
 
 async def refresher_loop(pool: asyncpg.Pool, interval_seconds: int = 300) -> None:
     """Background task started from the app lifespan."""
-    ok = await ensure_fair_value_mv(pool)
-    if not ok:
-        log.warning("fair_value_mv unavailable - refresher idling until it appears")
     while True:
         try:
-            await refresh_fair_value(pool)
+            ok = await ensure_fair_value_mv(pool)
+            if ok:
+                await refresh_fair_value(pool)
+            else:
+                log.warning("fair_value_mv unavailable this cycle - will retry")
         except Exception as e:  # never let the loop die
             log.error("fair_value refresher iteration failed: %s", e)
         await asyncio.sleep(interval_seconds)
