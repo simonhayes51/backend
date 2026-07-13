@@ -126,7 +126,7 @@ _ROW_COLS = """
     fair_value_24h, fair_value_7d, sales_24h, sales_7d,
     sales_per_hour_24h, volatility_24h, last_sale_at,
     current_bin, bin_captured_at, discount_pct, bin_zscore_24h,
-    data_quality_suspect, computed_at
+    data_quality_suspect, trend_falling, computed_at
 """
 
 
@@ -149,6 +149,22 @@ async def get_card_fair_value(pool: asyncpg.Pool, card_id: int) -> Optional[Dict
     return _row_to_dict(r) if r else None
 
 
+async def get_card_fair_values_batch(
+    pool: asyncpg.Pool, card_ids: List[int]
+) -> List[Dict[str, Any]]:
+    """Same shape as get_card_fair_value but for many cards in one query -
+    lets a caller showing N rows at once (e.g. a search results page) make
+    one request instead of N."""
+    if not card_ids:
+        return []
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"SELECT {_ROW_COLS} FROM fair_value_mv WHERE card_id = ANY($1::bigint[])",
+            list(card_ids),
+        )
+    return [_row_to_dict(r) for r in rows]
+
+
 async def get_undervalued(
     pool: asyncpg.Pool,
     *,
@@ -159,11 +175,17 @@ async def get_undervalued(
     min_discount_pct: float = 3.0,
 ) -> List[Dict[str, Any]]:
     """The 'Undervalued right now' board: cards whose live BIN sits below the
-    real 24h median sold price, with enough liquidity to actually exit."""
+    real 24h median sold price, with enough liquidity to actually exit.
+
+    Excludes trend_falling cards: a card mid-crash also shows a large
+    discount_pct (current_bin has already dropped; the 24h median hasn't
+    caught up yet), but that's a falling knife, not a steal - see
+    migrations/013_fair_value_trend_guard.sql."""
     where = [
         "current_bin IS NOT NULL",
         "fair_value_24h IS NOT NULL",
         "NOT data_quality_suspect",
+        "NOT trend_falling",
         "sales_24h >= $2",
         "discount_pct >= $3",
         "current_bin >= $4",
@@ -194,13 +216,19 @@ async def get_anomalies(
     min_sales_24h: int = 8,
 ) -> List[Dict[str, Any]]:
     """Statistical outliers: BIN more than |z| standard deviations below the
-    24h sold distribution on liquid cards - the 'snipe radar'."""
+    24h sold distribution on liquid cards - the 'snipe radar'.
+
+    Excludes trend_falling cards for the same reason as get_undervalued: a
+    crashing card's BIN sitting far below its own (still-elevated) 24h sold
+    distribution produces an extreme z-score that looks like a snipe but is
+    really just the market re-pricing downward."""
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             f"""
             SELECT {_ROW_COLS} FROM fair_value_mv
             WHERE bin_zscore_24h IS NOT NULL
               AND NOT data_quality_suspect
+              AND NOT trend_falling
               AND bin_zscore_24h <= $2
               AND sales_24h >= $3
             ORDER BY bin_zscore_24h ASC
