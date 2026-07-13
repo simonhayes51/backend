@@ -24,6 +24,7 @@ from datetime import date
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from pydantic import BaseModel, Field
 
 from app.auth.api_keys import require_api_key
 from app.db import get_player_db, get_db
@@ -202,6 +203,26 @@ async def v2_fair_value(card_id: int, request: Request, key=Depends(require_api_
     if not row:
         raise HTTPException(404, "No fair-value data for this card yet")
     return row
+
+
+class FairValueBatchRequest(BaseModel):
+    card_ids: List[int] = Field(..., min_length=1, max_length=100)
+
+
+@router.post("/fair-value/batch")
+async def v2_fair_value_batch(
+    payload: FairValueBatchRequest,
+    request: Request,
+    key=Depends(require_api_key),
+):
+    """Fair value for up to 100 cards in one call - counts as a single
+    request against the key's quota/rate limit rather than one per card,
+    which is what makes this usable from something like a browser
+    extension overlaying a whole search-results page at once."""
+    card_ids = list(dict.fromkeys(payload.card_ids))  # de-dupe, keep order
+    rows = await fv.get_card_fair_values_batch(_player_pool(request), card_ids)
+    by_id = {str(r["card_id"]): r for r in rows}
+    return {"items": by_id, "count": len(by_id)}
 
 
 @router.get("/undervalued")

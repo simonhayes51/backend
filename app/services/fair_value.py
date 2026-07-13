@@ -149,6 +149,22 @@ async def get_card_fair_value(pool: asyncpg.Pool, card_id: int) -> Optional[Dict
     return _row_to_dict(r) if r else None
 
 
+async def get_card_fair_values_batch(
+    pool: asyncpg.Pool, card_ids: List[int]
+) -> List[Dict[str, Any]]:
+    """Same shape as get_card_fair_value but for many cards in one query -
+    lets a caller showing N rows at once (e.g. a search results page) make
+    one request instead of N."""
+    if not card_ids:
+        return []
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"SELECT {_ROW_COLS} FROM fair_value_mv WHERE card_id = ANY($1::bigint[])",
+            list(card_ids),
+        )
+    return [_row_to_dict(r) for r in rows]
+
+
 async def get_undervalued(
     pool: asyncpg.Pool,
     *,
