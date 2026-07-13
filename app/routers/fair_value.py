@@ -32,7 +32,13 @@ def _player_pool(request: Request):
 def _teaser(row: Dict[str, Any]) -> Dict[str, Any]:
     """Free-tier view: direction + rough band, exact numbers withheld."""
     discount = row.get("discount_pct")
-    if discount is None:
+    if row.get("trend_falling"):
+        # A card mid-crash also shows a big discount_pct - current_bin has
+        # already dropped, the 24h median just hasn't caught up yet. That's
+        # a falling knife, not a discount, so this overrides the number
+        # regardless of how large it is (migrations/013_fair_value_trend_guard.sql).
+        verdict = "falling"
+    elif discount is None:
         verdict = "unknown"
     elif discount >= 8:
         verdict = "steal"
@@ -48,7 +54,7 @@ def _teaser(row: Dict[str, Any]) -> Dict[str, Any]:
         "rating": row["rating"],
         "version": row["version"],
         "image_url": row["image_url"],
-        "verdict": verdict,               # steal | under | fair | overpriced | unknown
+        "verdict": verdict,               # steal | under | fair | overpriced | falling | unknown
         "sales_24h": row["sales_24h"],    # liquidity is free - it builds trust
         "locked": True,
         "upgrade_feature": "fair_value",
