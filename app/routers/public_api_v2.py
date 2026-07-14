@@ -71,6 +71,49 @@ async def v2_search_players(
     return {"players": [dict(r) for r in rows]}
 
 
+@router.get("/sbc/cheap-fodder")
+async def v2_cheap_fodder(
+    min_rating: int = Query(..., ge=1, le=99, description="SBC's minimum rating requirement"),
+    max_rating: Optional[int] = Query(None, ge=1, le=99),
+    position: Optional[str] = Query(None, description="exact position code, e.g. ST, CB, GK"),
+    league: Optional[str] = Query(None, description="substring match"),
+    nation: Optional[str] = Query(None, description="substring match"),
+    limit: int = Query(20, ge=1, le=50),
+    key=Depends(require_api_key),
+    conn=Depends(get_player_db),
+):
+    """Cheapest currently-priced cards meeting an SBC's rating (and optional
+    position/league/nation) requirement - a manual shopping list, not a
+    solver. Consumers still pick, buy, and place cards themselves."""
+    where = ["rating >= $1", "price_num IS NOT NULL", "price_num > 0"]
+    params: List[Any] = [min_rating]
+    if max_rating is not None:
+        params.append(max_rating)
+        where.append(f"rating <= ${len(params)}")
+    if position:
+        params.append(position.strip().upper())
+        where.append(f"UPPER(position) = ${len(params)}")
+    if league:
+        params.append(f"%{league.strip()}%")
+        where.append(f"LOWER(league) LIKE LOWER(${len(params)})")
+    if nation:
+        params.append(f"%{nation.strip()}%")
+        where.append(f"LOWER(nation) LIKE LOWER(${len(params)})")
+    params.append(limit)
+
+    rows = await conn.fetch(
+        f"""
+        SELECT card_id, name, rating, version, position, club, league, nation, price_num
+        FROM fut_players
+        WHERE {' AND '.join(where)}
+        ORDER BY price_num ASC
+        LIMIT ${len(params)}
+        """,
+        *params,
+    )
+    return {"items": [dict(r) for r in rows], "count": len(rows)}
+
+
 @router.get("/players/{card_id}/bin-history")
 async def v2_bin_history(
     card_id: int,
