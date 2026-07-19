@@ -24,6 +24,8 @@ from typing import Any, Dict, List, Optional
 import asyncpg
 from asyncpg import exceptions as asyncpg_exceptions
 
+from scripts.run_migrations import _missing_tables
+
 log = logging.getLogger("fair_value")
 
 REFRESH_LOCK_KEY = 7741002  # distinct from the candle-aggregator lock
@@ -32,6 +34,13 @@ _MIGRATION_FILE = (
     / "migrations"
     / "011_player_fair_value.sql"
 )
+# sales_history/bin_history are owned by the auto_sync service (created by
+# its own ensure_tables(), not any migration here) - same prerequisite
+# migration 011 itself declares via "-- requires-table:". Without this
+# check here too, this module bypasses run_migrations.py's guard and
+# raises a raw "relation does not exist" on every refresh cycle until
+# auto_sync has run at least once against this database.
+_REQUIRED_TABLES = ["sales_history", "bin_history"]
 
 
 async def ensure_fair_value_mv(pool: asyncpg.Pool) -> bool:
@@ -60,6 +69,15 @@ async def ensure_fair_value_mv(pool: asyncpg.Pool) -> bool:
                 )
                 if exists:
                     return True
+
+                missing = await _missing_tables(conn, _REQUIRED_TABLES)
+                if missing:
+                    log.info(
+                        "fair_value_mv not created yet - waiting on table(s) %s "
+                        "(owned by auto_sync)", ", ".join(missing),
+                    )
+                    return False
+
                 log.info("fair_value_mv missing - creating from migration 011")
                 await conn.execute(_MIGRATION_FILE.read_text())
                 return True
@@ -83,6 +101,13 @@ async def refresh_fair_value(pool: asyncpg.Pool) -> bool:
                 try:
                     await conn.execute("REFRESH MATERIALIZED VIEW CONCURRENTLY fair_value_mv")
                 except asyncpg_exceptions.UndefinedTableError:
+                    missing = await _missing_tables(conn, _REQUIRED_TABLES)
+                    if missing:
+                        log.info(
+                            "fair_value_mv recreate deferred - waiting on table(s) %s "
+                            "(owned by auto_sync)", ", ".join(missing),
+                        )
+                        return False
                     log.warning("fair_value_mv missing at refresh time - recreating")
                     await conn.execute(_MIGRATION_FILE.read_text())
                     await conn.execute("REFRESH MATERIALIZED VIEW CONCURRENTLY fair_value_mv")
