@@ -63,6 +63,7 @@ from app.routers.public_api import router as public_api_router
 from app.routers.public_api_v2 import router as public_api_v2_router
 from app.routers.fair_value import router as fair_value_router
 from app.routers.ops import router as ops_router
+from app.routers.dashboard import router as dashboard_router
 from app.services.fair_value import refresher_loop as fair_value_refresher_loop
 
 
@@ -1260,6 +1261,7 @@ app.include_router(public_api_v2_router)    # /api/public/v2/* (tiers/quotas + f
 # Fair Value engine + ops
 app.include_router(fair_value_router)       # /api/market/fair-value, /undervalued, /anomalies
 app.include_router(ops_router)              # /api/ops/freshness
+app.include_router(dashboard_router)        # /api/dashboard/* (public, investor demo page)
 
 # Admin (require_admin-gated): user search + premium grant/revoke
 from app.routers.admin import router as admin_router
