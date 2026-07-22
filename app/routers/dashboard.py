@@ -34,6 +34,12 @@ _totals_cache_at: float = 0.0
 
 _DETAIL_NUM_RE = re.compile(r"([a-zA-Z_]+)=(\d+)")
 
+# pipeline_heartbeats.worker is a real join key auto_sync writes to - never
+# rename the key itself. This only controls what's DISPLAYED to a visitor
+# on the public /demo page, e.g. so it doesn't name a specific scraped
+# third-party site.
+_WORKER_DISPLAY_NAMES = {"futbin_full_sync": "Player Catalog Sync"}
+
 
 def _iso(ts: Optional[datetime]) -> Optional[str]:
     return ts.isoformat() if ts else None
@@ -184,7 +190,7 @@ async def dashboard_stats() -> Dict[str, Any]:
     futbin_counts = _parse_detail_counts(futbin_hb["detail"] if futbin_hb else None)
 
     pipeline_status = [
-        _status_card("FUTBIN Full Sync", futbin_hb, futbin_counts.get("written")),
+        _status_card(_WORKER_DISPLAY_NAMES["futbin_full_sync"], futbin_hb, futbin_counts.get("written")),
         _status_card("BIN History Sync", combined_hb, combined_counts.get("bin_found")),
         _status_card("Sales History Sync", combined_hb, combined_counts.get("sales_new")),
         {
@@ -318,9 +324,10 @@ async def dashboard_activity(limit: int = Query(20, ge=1, le=100)) -> Dict[str, 
     # single-DB deploy), since core_pool/player_pool are still two distinct
     # asyncpg.Pool objects even when their DSNs are equal.
     for hb in (await _heartbeats_by_worker(core_pool, player_pool)).values():
+        display_name = _WORKER_DISPLAY_NAMES.get(hb["worker"], hb["worker"])
         events.append({
             "type": "sync",
-            "message": f"Auto sync completed: {hb['worker']} ({'ok' if hb['ok'] else 'failed'})",
+            "message": f"Auto sync completed: {display_name} ({'ok' if hb['ok'] else 'failed'})",
             "at": hb["last_run_at"],
         })
 
