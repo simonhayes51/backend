@@ -944,6 +944,101 @@ async def get_player_backtest_route(
         }
 
 
+@router.get("/{card_id}/lazy-buyer-score")
+async def get_player_lazy_buyer_score_route(
+    card_id: int,
+    conn = Depends(get_player_db),
+):
+    """
+    "Lazy Buyer Odds" (LBO): how often this card's sales in the last 7
+    days cleared above the current PS BIN, benchmarked against the same
+    rate across the whole tracked (Gold Rare) pool - i.e. how "lazy buyer
+    friendly" this card is relative to the market average. Confidence
+    Score is this card's percentile rank on a blended, cross-pool
+    normalized score (70% LBO + 20% sales volume + 10% games played, or
+    70/30 when games-played coverage is missing for this card - see
+    bin_sales_history_sync.py's tiered scrape coverage). Built entirely
+    on top of fair_value_mv (current_bin, sales_7d, data_quality_suspect)
+    so it inherits that matview's existing 5-minute refresh cadence
+    rather than adding a second one.
+
+    Final Score itself is intentionally not returned - only used
+    internally to produce the Confidence Score ranking.
+    """
+    row = await conn.fetchrow(
+        """
+        WITH bin_ref AS (
+            SELECT card_id, current_bin
+            FROM fair_value_mv
+            WHERE current_bin IS NOT NULL
+              AND NOT data_quality_suspect
+              AND sales_7d >= 5
+        ),
+        sales_agg AS (
+            SELECT sh.player_id AS card_id,
+                   COUNT(*) AS n_sales,
+                   COUNT(*) FILTER (WHERE sh.sold_price > br.current_bin) AS n_above
+            FROM sales_history sh
+            JOIN bin_ref br ON br.card_id = sh.player_id
+            WHERE sh.sold_at >= NOW() - INTERVAL '7 days'
+            GROUP BY sh.player_id
+        ),
+        pool AS (
+            SELECT
+                sa.card_id,
+                sa.n_sales,
+                (sa.n_above::numeric / sa.n_sales) AS lbo,
+                fv.sales_7d,
+                COALESCE(fp.games_played_console, fp.games_played_pc) AS games_played
+            FROM sales_agg sa
+            JOIN fair_value_mv fv ON fv.card_id = sa.card_id
+            JOIN fut_players fp ON fp.card_id = sa.card_id
+            WHERE sa.n_sales >= 5
+        ),
+        ranked AS (
+            SELECT
+                *,
+                PERCENT_RANK() OVER (ORDER BY lbo) AS lbo_rank,
+                PERCENT_RANK() OVER (ORDER BY sales_7d) AS volume_rank,
+                PERCENT_RANK() OVER (ORDER BY games_played) AS games_rank,
+                AVG(lbo) OVER () AS pool_avg_lbo
+            FROM pool
+        ),
+        scored AS (
+            SELECT
+                *,
+                CASE WHEN games_played IS NOT NULL
+                    THEN 0.7 * lbo_rank + 0.2 * volume_rank + 0.1 * games_rank
+                    ELSE 0.7 * lbo_rank + 0.3 * volume_rank
+                END AS final_score
+            FROM ranked
+        ),
+        confidence AS (
+            SELECT *, PERCENT_RANK() OVER (ORDER BY final_score) AS confidence_score
+            FROM scored
+        )
+        SELECT card_id, n_sales, lbo, pool_avg_lbo, confidence_score
+        FROM confidence
+        WHERE card_id = $1
+        """,
+        card_id,
+    )
+    if not row:
+        return {
+            "card_id": card_id,
+            "available": False,
+            "reason": "insufficient_sales_history",
+        }
+    return {
+        "card_id": card_id,
+        "available": True,
+        "lboRate7d": round(float(row["lbo"]) * 100, 1),
+        "poolAvgLboRate7d": round(float(row["pool_avg_lbo"]) * 100, 1),
+        "sampleSize7d": row["n_sales"],
+        "confidenceScore": round(float(row["confidence_score"]) * 100, 1),
+    }
+
+
 @router.get("/{card_id}/market-metrics")
 async def get_player_market_metrics_route(
     card_id: int,
