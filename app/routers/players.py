@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -14,6 +15,20 @@ from app.futbin_client import fetch_price_by_url
 from app.auth.entitlements import require_feature
 
 router = APIRouter(prefix="/api/players", tags=["players"])
+
+# Lazy Buyer Score is a pool-wide ranking (every card gets percentile-ranked
+# against every other tracked card), so computing it fresh per request means
+# every single player-detail page load pays for re-scoring the ENTIRE Gold
+# Rare pool - including a per-sale LATERAL "as of" bin_history lookup across
+# every card's last 7 days of sales. That's expensive and was blocking the
+# whole detail panel (bundled in the same Promise.all as price). Same
+# in-process TTL cache pattern as dashboard.py's _cached_totals: compute the
+# whole pool once per window, serve every request in that window as a cheap
+# dict lookup. 300s matches fair_value_mv's own refresh cadence - no point
+# recomputing more often than the data underneath it changes.
+_LBO_CACHE_TTL_SECONDS = 300
+_lbo_pool_cache: Dict[int, Dict[str, Any]] = {}
+_lbo_pool_cache_at: float = 0.0
 
 # ------------------------------
 # Helpers
@@ -967,9 +982,38 @@ async def get_player_lazy_buyer_score_route(
     matview's single current_bin column.
 
     Final Score itself is intentionally not returned - only used
-    internally to produce the Confidence Score ranking.
+    internally to produce the Confidence Score ranking. The whole pool is
+    computed and cached together (see _lbo_pool_cache) rather than
+    per-request, since ranking one card requires ranking all of them.
     """
-    row = await conn.fetchrow(
+    pool = await _get_lazy_buyer_pool(conn)
+    row = pool.get(card_id)
+    if not row:
+        return {
+            "card_id": card_id,
+            "available": False,
+            "reason": "insufficient_sales_history",
+        }
+    return {
+        "card_id": card_id,
+        "available": True,
+        "lboRate7d": row["lboRate7d"],
+        "poolAvgLboRate7d": row["poolAvgLboRate7d"],
+        "sampleSize7d": row["sampleSize7d"],
+        "confidenceScore": row["confidenceScore"],
+    }
+
+
+async def _get_lazy_buyer_pool(conn) -> Dict[int, Dict[str, Any]]:
+    """Whole-pool Lazy Buyer Score computation, cached in-process for
+    _LBO_CACHE_TTL_SECONDS. Returns {card_id: {...}} for every card that
+    clears the sample-size/quality gate; cards not present didn't clear it."""
+    global _lbo_pool_cache, _lbo_pool_cache_at
+    now = time.monotonic()
+    if _lbo_pool_cache and (now - _lbo_pool_cache_at) < _LBO_CACHE_TTL_SECONDS:
+        return _lbo_pool_cache
+
+    rows = await conn.fetch(
         """
         WITH bin_snapshots AS (
             SELECT player_id AS card_id, captured_at, lowest_bin
@@ -1031,24 +1075,21 @@ async def get_player_lazy_buyer_score_route(
         )
         SELECT card_id, n_sales, lbo, pool_avg_lbo, confidence_score
         FROM confidence
-        WHERE card_id = $1
-        """,
-        card_id,
+        """
     )
-    if not row:
-        return {
-            "card_id": card_id,
-            "available": False,
-            "reason": "insufficient_sales_history",
+
+    pool_by_card = {
+        r["card_id"]: {
+            "lboRate7d": round(float(r["lbo"]) * 100, 1),
+            "poolAvgLboRate7d": round(float(r["pool_avg_lbo"]) * 100, 1),
+            "sampleSize7d": r["n_sales"],
+            "confidenceScore": round(float(r["confidence_score"]) * 100, 1),
         }
-    return {
-        "card_id": card_id,
-        "available": True,
-        "lboRate7d": round(float(row["lbo"]) * 100, 1),
-        "poolAvgLboRate7d": round(float(row["pool_avg_lbo"]) * 100, 1),
-        "sampleSize7d": row["n_sales"],
-        "confidenceScore": round(float(row["confidence_score"]) * 100, 1),
+        for r in rows
     }
+    _lbo_pool_cache = pool_by_card
+    _lbo_pool_cache_at = now
+    return _lbo_pool_cache
 
 
 @router.get("/{card_id}/market-metrics")
