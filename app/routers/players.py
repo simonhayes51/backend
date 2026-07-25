@@ -418,7 +418,9 @@ async def get_player(card_id: str, conn = Depends(get_player_db)):
     """
     row = await conn.fetchrow(
         """
-        SELECT card_id, name, rating, version, image_url, club, league, nation, position, altposition, price, price_num
+        SELECT card_id, name, rating, version, image_url, club, league, nation, position, altposition, price, price_num,
+               games_played_console, games_played_pc, avg_goals_console, avg_goals_pc,
+               top_chem_style_console, top_chem_style_pc
         FROM fut_players
         WHERE card_id::text = $1
         """,
@@ -428,6 +430,12 @@ async def get_player(card_id: str, conn = Depends(get_player_db)):
         raise HTTPException(status_code=404, detail="Player not found")
     d = dict(row)
     d["card_id"] = int(d["card_id"])
+    # NUMERIC columns come back as Decimal, which the JSON encoder can't
+    # serialize directly - same pattern as the market-metrics endpoint.
+    if d["avg_goals_console"] is not None:
+        d["avg_goals_console"] = float(d["avg_goals_console"])
+    if d["avg_goals_pc"] is not None:
+        d["avg_goals_pc"] = float(d["avg_goals_pc"])
     return d
 
 @router.get("/{card_id}/meta")
