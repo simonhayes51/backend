@@ -951,37 +951,49 @@ async def get_player_lazy_buyer_score_route(
 ):
     """
     "Lazy Buyer Odds" (LBO): how often this card's sales in the last 7
-    days cleared above the current PS BIN, benchmarked against the same
-    rate across the whole tracked (Gold Rare) pool - i.e. how "lazy buyer
-    friendly" this card is relative to the market average. Confidence
+    days sold for more than the PS BIN price that was actually live *at
+    the moment of that sale* - not just compared to today's BIN snapshot,
+    which would misjudge every card whose price has moved since (a sale
+    from Monday against Monday's BIN, not Friday's) - benchmarked against
+    the same rate across the whole tracked (Gold Rare) pool. Confidence
     Score is this card's percentile rank on a blended, cross-pool
     normalized score (70% LBO + 20% sales volume + 10% games played, or
     70/30 when games-played coverage is missing for this card - see
-    bin_sales_history_sync.py's tiered scrape coverage). Built entirely
-    on top of fair_value_mv (current_bin, sales_7d, data_quality_suspect)
-    so it inherits that matview's existing 5-minute refresh cadence
-    rather than adding a second one.
+    bin_sales_history_sync.py's tiered scrape coverage). Sales volume and
+    the data-quality gate come from fair_value_mv, so this inherits that
+    matview's existing 5-minute refresh cadence rather than adding a
+    second one; the LBO calculation itself reads bin_history directly
+    since it needs the full timestamped snapshot history, not just the
+    matview's single current_bin column.
 
     Final Score itself is intentionally not returned - only used
     internally to produce the Confidence Score ranking.
     """
     row = await conn.fetchrow(
         """
-        WITH bin_ref AS (
-            SELECT card_id, current_bin
-            FROM fair_value_mv
-            WHERE current_bin IS NOT NULL
-              AND NOT data_quality_suspect
-              AND sales_7d >= 5
+        WITH bin_snapshots AS (
+            SELECT player_id AS card_id, captured_at, lowest_bin
+            FROM bin_history
+            WHERE platform = 'ps' AND lowest_bin IS NOT NULL
+        ),
+        sales_with_bin AS (
+            SELECT sh.player_id AS card_id, sh.sold_price, bh.lowest_bin AS bin_at_sale
+            FROM sales_history sh
+            JOIN LATERAL (
+                SELECT bs.lowest_bin
+                FROM bin_snapshots bs
+                WHERE bs.card_id = sh.player_id AND bs.captured_at <= sh.sold_at
+                ORDER BY bs.captured_at DESC
+                LIMIT 1
+            ) bh ON true
+            WHERE sh.sold_at >= NOW() - INTERVAL '7 days'
         ),
         sales_agg AS (
-            SELECT sh.player_id AS card_id,
+            SELECT card_id,
                    COUNT(*) AS n_sales,
-                   COUNT(*) FILTER (WHERE sh.sold_price > br.current_bin) AS n_above
-            FROM sales_history sh
-            JOIN bin_ref br ON br.card_id = sh.player_id
-            WHERE sh.sold_at >= NOW() - INTERVAL '7 days'
-            GROUP BY sh.player_id
+                   COUNT(*) FILTER (WHERE sold_price > bin_at_sale) AS n_above
+            FROM sales_with_bin
+            GROUP BY card_id
         ),
         pool AS (
             SELECT
@@ -993,7 +1005,7 @@ async def get_player_lazy_buyer_score_route(
             FROM sales_agg sa
             JOIN fair_value_mv fv ON fv.card_id = sa.card_id
             JOIN fut_players fp ON fp.card_id = sa.card_id
-            WHERE sa.n_sales >= 5
+            WHERE sa.n_sales >= 5 AND NOT fv.data_quality_suspect
         ),
         ranked AS (
             SELECT
