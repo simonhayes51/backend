@@ -64,6 +64,7 @@ from app.routers.public_api_v2 import router as public_api_v2_router
 from app.routers.fair_value import router as fair_value_router
 from app.routers.ops import router as ops_router
 from app.routers.dashboard import router as dashboard_router
+from app.routers.v2 import router as v2_router
 from app.services.fair_value import refresher_loop as fair_value_refresher_loop
 
 
@@ -447,356 +448,15 @@ async def lifespan(app: FastAPI):
     # RUN_MIGRATIONS_ON_BOOT=0 once a pre-deploy command runs them instead.
     if os.getenv("RUN_MIGRATIONS_ON_BOOT", "1") != "0":
         from scripts.run_migrations import run_on_boot
-        await run_on_boot(DATABASE_URL, PLAYER_DATABASE_URL)
+        await run_on_boot(DATABASE_URL, PLAYER_DATABASE_URL, WATCHLIST_DATABASE_URL)
         logging.info("✅ Boot migrations pass complete")
 
-    # ---------- Core tables (create-first so fresh DBs work) ----------
-    async with pool.acquire() as conn:
-        # trades
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS trades (
-            user_id TEXT NOT NULL,
-            player TEXT NOT NULL,
-            version TEXT NOT NULL,
-            buy INTEGER NOT NULL,
-            sell INTEGER NOT NULL,
-            quantity INTEGER NOT NULL DEFAULT 1,
-            platform TEXT NOT NULL,
-            profit INTEGER NOT NULL DEFAULT 0,
-            ea_tax INTEGER NOT NULL DEFAULT 0,
-            tag TEXT,
-            notes TEXT,
-            timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            trade_id BIGINT
-        )""")
-        await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS trades_user_trade_uidx ON trades (user_id, trade_id)")
-        await conn.execute("DROP INDEX IF EXISTS idx_trades_date")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_user_ts ON trades(user_id, timestamp)")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_tag ON trades(user_id, tag)")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_platform ON trades(user_id, platform)")
-
-        # users (plan/premium/roles read by compute_entitlements)
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-          id TEXT PRIMARY KEY,
-          plan TEXT,
-          premium_until TIMESTAMPTZ,
-          roles JSONB DEFAULT '[]',
-          password_hash TEXT
-        )""")
-        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS account_type VARCHAR(20) DEFAULT 'user'")
-
-
-        # portfolio
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS portfolio (
-            user_id TEXT PRIMARY KEY,
-            starting_balance INTEGER NOT NULL DEFAULT 0
-        )""")
-
-        # usersettings
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS usersettings (
-            id SERIAL PRIMARY KEY,
-            user_id VARCHAR(255) UNIQUE NOT NULL,
-            default_platform VARCHAR(50) DEFAULT 'Console',
-            custom_tags JSONB DEFAULT '[]',
-            currency_format VARCHAR(20) DEFAULT 'coins',
-            theme VARCHAR(20) DEFAULT 'dark',
-            timezone VARCHAR(50) DEFAULT 'UTC',
-            date_format VARCHAR(10) DEFAULT 'US',
-            include_tax_in_profit BOOLEAN DEFAULT true,
-            default_chart_range VARCHAR(10) DEFAULT '30d',
-            visible_widgets JSONB DEFAULT '["profit", "tax", "balance", "trades"]',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )""")
-
-        # user_profiles
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS user_profiles (
-            id SERIAL PRIMARY KEY,
-            user_id VARCHAR(255) UNIQUE NOT NULL,
-            username VARCHAR(255),
-            avatar_url TEXT,
-            global_name VARCHAR(255),
-            bio TEXT,
-            header_image_url TEXT,
-            location VARCHAR(255),
-            website_url TEXT,
-            twitter_url TEXT,
-            youtube_url TEXT,
-            twitch_url TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )""")
-
-        # Add premium status to user_profiles
-        await conn.execute("""
-        ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS is_premium BOOLEAN DEFAULT FALSE
-        """)
-        await conn.execute("""
-        ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS premium_until TIMESTAMP WITH TIME ZONE
-        """)
-        await conn.execute("""
-        ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS bio TEXT
-        """)
-        await conn.execute("""
-        ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS header_image_url TEXT
-        """)
-        await conn.execute("""
-        ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS location VARCHAR(255)
-        """)
-        await conn.execute("""
-        ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS website_url TEXT
-        """)
-        await conn.execute("""
-        ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS twitter_url TEXT
-        """)
-        await conn.execute("""
-        ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS youtube_url TEXT
-        """)
-        await conn.execute("""
-        ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS twitch_url TEXT
-        """)
-
-        # Billing tables
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS subscriptions (
-            id SERIAL PRIMARY KEY,
-            user_id VARCHAR(255) NOT NULL REFERENCES user_profiles(user_id),
-            stripe_subscription_id VARCHAR(255) UNIQUE,
-            stripe_customer_id VARCHAR(255),
-            status VARCHAR(50) NOT NULL DEFAULT 'active',
-            plan_id VARCHAR(255) NOT NULL,
-            current_period_start TIMESTAMP WITH TIME ZONE,
-            current_period_end TIMESTAMP WITH TIME ZONE,
-            cancel_at_period_end BOOLEAN DEFAULT FALSE,
-            created_at TIMESTAMP DEFAULT NOW(),
-            updated_at TIMESTAMP DEFAULT NOW()
-        ) """)
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS payments (
-            id SERIAL PRIMARY KEY,
-            user_id VARCHAR(255) NOT NULL,
-            subscription_id INTEGER REFERENCES subscriptions(id),
-            stripe_payment_intent_id VARCHAR(255),
-            amount INTEGER NOT NULL,
-            currency VARCHAR(3) DEFAULT 'GBP',
-            status VARCHAR(50) NOT NULL,
-            created_at TIMESTAMP DEFAULT NOW()
-        ) """)
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS discord_roles (
-            id SERIAL PRIMARY KEY,
-            user_id VARCHAR(255) NOT NULL,
-            discord_user_id VARCHAR(255) NOT NULL,
-            role_id VARCHAR(255) NOT NULL,
-            assigned_at TIMESTAMP DEFAULT NOW(),
-            expires_at TIMESTAMP
-        ) """)
-
-        # Public/paid historical-data API keys (app/routers/api_keys.py,
-        # app/routers/public_api.py) - only the SHA-256 hash is stored, the
-        # plaintext key is shown to the user exactly once at creation time.
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS api_keys (
-            id BIGSERIAL PRIMARY KEY,
-            user_id VARCHAR(255) NOT NULL,
-            name TEXT,
-            key_hash TEXT NOT NULL UNIQUE,
-            key_prefix TEXT NOT NULL,
-            rate_limit_per_minute INT NOT NULL DEFAULT 60,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            last_used_at TIMESTAMPTZ,
-            revoked_at TIMESTAMPTZ
-        )""")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id)")
-        await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash)")
-
-        # trading_goals
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS trading_goals (
-            id SERIAL PRIMARY KEY,
-            user_id VARCHAR(255) NOT NULL,
-            title VARCHAR(255) NOT NULL,
-            target_amount INTEGER NOT NULL,
-            target_date DATE,
-            goal_type VARCHAR(50) DEFAULT 'profit',
-            is_completed BOOLEAN DEFAULT FALSE,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            completed_at TIMESTAMP
-        )""")
-
-        # backfill trade_id if NULL (compat)
-        await conn.execute("""
-        WITH to_fix AS (
-          SELECT ctid, user_id,
-                 ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY timestamp, player) AS rn
-          FROM trades
-          WHERE trade_id IS NULL
-        )
-        UPDATE trades t
-           SET trade_id = ((EXTRACT(EPOCH FROM NOW())*1000)::bigint) + tf.rn
-        FROM to_fix tf
-        WHERE t.ctid = tf.ctid AND t.trade_id IS NULL
-        """)
-
-        # fut_trades raw ingest
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS fut_trades (
-          id           BIGSERIAL PRIMARY KEY,
-          discord_id   TEXT NOT NULL,
-          trade_id     BIGINT NOT NULL,
-          player_name  TEXT NOT NULL,
-          card_version TEXT,
-          buy_price    INTEGER,
-          sell_price   INTEGER NOT NULL,
-          ts           TIMESTAMPTZ NOT NULL,
-          source       TEXT DEFAULT 'webapp'
-        )""")
-        await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS fut_trades_uidx ON fut_trades (discord_id, trade_id)")
-
-        # events (Next Promo)
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS events (
-          id BIGSERIAL PRIMARY KEY,
-          name TEXT NOT NULL,
-          kind TEXT NOT NULL,
-          start_at TIMESTAMPTZ NOT NULL,
-          end_at TIMESTAMPTZ,
-          confidence TEXT NOT NULL DEFAULT 'heuristic',
-          source TEXT NOT NULL DEFAULT 'rule:18:00',
-          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        )""")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_events_start ON events(start_at)")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind)")
-
-        # Smart Buy tables
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS smart_buy_suggestions (
-            id BIGSERIAL PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            card_id TEXT NOT NULL,
-            suggestion_type VARCHAR(50) NOT NULL,
-            current_price INTEGER NOT NULL,
-            target_price INTEGER NOT NULL,
-            expected_profit INTEGER NOT NULL,
-            risk_level VARCHAR(20) NOT NULL,
-            confidence_score INTEGER NOT NULL,
-            priority_score INTEGER NOT NULL,
-            reasoning TEXT NOT NULL,
-            time_to_profit VARCHAR(50),
-            platform VARCHAR(10) NOT NULL,
-            market_state VARCHAR(30) NOT NULL,
-            created_at TIMESTAMPTZ DEFAULT NOW(),
-            expires_at TIMESTAMPTZ
-        )""")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_smart_buy_suggestions_user_created ON smart_buy_suggestions(user_id, created_at DESC)")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_smart_buy_suggestions_card_platform ON smart_buy_suggestions(card_id, platform)")
-
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS smart_buy_feedback (
-            id BIGSERIAL PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            card_id TEXT NOT NULL,
-            action VARCHAR(20) NOT NULL,
-            notes TEXT,
-            actual_buy_price INTEGER,
-            actual_sell_price INTEGER,
-            actual_profit INTEGER,
-            timestamp TIMESTAMPTZ DEFAULT NOW()
-        )""")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_smart_buy_feedback_user_action ON smart_buy_feedback(user_id, action)")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_smart_buy_feedback_card ON smart_buy_feedback(card_id)")
-
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS market_states (
-            id BIGSERIAL PRIMARY KEY,
-            platform VARCHAR(10) NOT NULL,
-            state VARCHAR(30) NOT NULL,
-            confidence_score INTEGER NOT NULL,
-            detected_at TIMESTAMPTZ DEFAULT NOW(),
-            indicators JSONB
-        )""")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_market_states_platform_detected ON market_states(platform, detected_at DESC)")
-
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS smart_buy_market_cache (
-            id SMALLINT PRIMARY KEY DEFAULT 1,
-            payload JSONB NOT NULL,
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )""")
-
-    # watchlist DB objects (on watchlist_pool)
-    async with watchlist_pool.acquire() as wconn:
-        await wconn.execute("""
-        CREATE TABLE IF NOT EXISTS watchlist (
-          id SERIAL PRIMARY KEY,
-          user_id TEXT NOT NULL,
-          card_id BIGINT NOT NULL,
-          player_name TEXT NOT NULL,
-          version TEXT,
-          platform TEXT NOT NULL,
-          started_price INTEGER NOT NULL,
-          started_at TIMESTAMP NOT NULL DEFAULT NOW(),
-          last_price INTEGER,
-          last_checked TIMESTAMP,
-          notes TEXT
-        )""")
-        await wconn.execute("CREATE INDEX IF NOT EXISTS idx_watchlist_user ON watchlist(user_id)")
-        await wconn.execute("""
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_watchlist_unique
-        ON watchlist(user_id, card_id, platform)
-        """)
-
-        await wconn.execute("""
-        CREATE TABLE IF NOT EXISTS watchlist_alerts (
-          id BIGSERIAL PRIMARY KEY,
-          user_id TEXT NOT NULL,
-          user_discord_id TEXT,
-          card_id BIGINT NOT NULL,
-          platform TEXT NOT NULL CHECK (platform IN ('ps','xbox','pc')),
-          metric TEXT NOT NULL DEFAULT 'price' CHECK (metric IN ('price','liquidity')),
-          ref_mode TEXT NOT NULL DEFAULT 'last_close',
-          ref_price NUMERIC,
-          rise_pct NUMERIC DEFAULT 5,
-          fall_pct NUMERIC DEFAULT 5,
-          cooloff_minutes INT NOT NULL DEFAULT 30,
-          quiet_start TIME,
-          quiet_end TIME,
-          prefer_dm BOOLEAN NOT NULL DEFAULT TRUE,
-          fallback_channel_id TEXT,
-          last_alert_at TIMESTAMPTZ,
-          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        )""")
-        # Additive - table may already exist from before liquidity alerts existed.
-        await wconn.execute("""
-            ALTER TABLE watchlist_alerts
-            ADD COLUMN IF NOT EXISTS metric TEXT NOT NULL DEFAULT 'price'
-        """)
-        await wconn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_user ON watchlist_alerts(user_id)")
-        await wconn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_pair ON watchlist_alerts(card_id, platform)")
-        # New name (not a rename of idx_alerts_pair above) so this is created
-        # fresh even on a DB where the table/old index already existed before
-        # the metric column was added.
-        await wconn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_pair_metric ON watchlist_alerts(card_id, platform, metric)")
-
-        await wconn.execute("""
-        CREATE TABLE IF NOT EXISTS alerts_log (
-          id BIGSERIAL PRIMARY KEY,
-          user_id TEXT NOT NULL,
-          user_discord_id TEXT,
-          card_id BIGINT NOT NULL,
-          platform TEXT NOT NULL,
-          direction TEXT NOT NULL,
-          pct NUMERIC NOT NULL,
-          price NUMERIC NOT NULL,
-          ref_mode TEXT NOT NULL,
-          ref_price NUMERIC,
-          sent_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        )""")
-        await wconn.execute("CREATE INDEX IF NOT EXISTS idx_alerts_user_time ON alerts_log(user_id, sent_at)")
+    # Core-DB and watchlist-DB bootstrap tables used to be created inline
+    # right here on every boot - moved to migrations/015_consolidate_core_bootstrap.sql
+    # (target: core) and migrations/016_consolidate_watchlist_bootstrap.sql
+    # (target: watchlist), both applied by run_on_boot() above. See those
+    # files for the exact DDL; nothing here changed functionally, this only
+    # moved schema authority to the migration runner instead of duplicating it.
 
     # Start alerts loop (defined later)
     _watchlist_task = asyncio.create_task(_alerts_poll_loop())
@@ -810,47 +470,9 @@ async def lifespan(app: FastAPI):
     )
     logging.info("✅ Fair Value refresher started (%ss)", fv_interval)
 
-    # Run migrations for social trading features
-    async with pool.acquire() as conn:
-        try:
-            # Ensure users table has social columns
-            await conn.execute("""
-                ALTER TABLE users ADD COLUMN IF NOT EXISTS username VARCHAR(255)
-            """)
-            await conn.execute("""
-                ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT
-            """)
-            await conn.execute("""
-                ALTER TABLE users ADD COLUMN IF NOT EXISTS email VARCHAR(255)
-            """)
-            await conn.execute("""
-                ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT
-            """)
-            await conn.execute("""
-                ALTER TABLE users ADD COLUMN IF NOT EXISTS discord_id BIGINT
-            """)
-            await conn.execute("""
-                ALTER TABLE users ADD COLUMN IF NOT EXISTS account_type TEXT DEFAULT 'user'
-            """)
-            await conn.execute("""
-                ALTER TABLE users ADD COLUMN IF NOT EXISTS tier TEXT DEFAULT 'free'
-            """)
-            await conn.execute("""
-                ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-            """)
-            logging.info("✅ Migration: users table social columns ensured")
-
-            # Create indexes for better performance
-            await conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)
-            """)
-            await conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_users_discord_id ON users(discord_id)
-            """)
-            logging.info("✅ Migration: user indexes created")
-            
-        except Exception as e:
-            logging.warning(f"⚠️  Migration warning: {e}")
+    # The "social trading features" users-table ALTER/index block that used
+    # to run here is now part of migrations/015_consolidate_core_bootstrap.sql
+    # (same columns/indexes, applied once via run_on_boot() above).
 
     try:
         yield
@@ -916,7 +538,7 @@ ALLOWED_ORIGINS = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
 ]
-ALLOWED_ORIGIN_REGEX = r"^https://.*\\.futhub\\.co\\.uk$"
+ALLOWED_ORIGIN_REGEX = r"^https://.*\.futhub\.co\.uk$"
 
 
 def _is_allowed_origin(origin: str | None) -> bool:
@@ -994,6 +616,13 @@ app.add_middleware(CatchExceptionsMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
+    # Also allow any *.futhub.co.uk subdomain (e.g. a new v2 frontend on its
+    # own subdomain) without needing another deploy to extend the static
+    # list above. ALLOWED_ORIGIN_REGEX previously wasn't passed here at all,
+    # and its own pattern was broken (a raw string with "\\." - two literal
+    # backslashes - instead of the single-backslash "\." needed to escape a
+    # dot in regex), so this has never actually allowed a subdomain through.
+    allow_origin_regex=ALLOWED_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1262,6 +891,11 @@ app.include_router(public_api_v2_router)    # /api/public/v2/* (tiers/quotas + f
 app.include_router(fair_value_router)       # /api/market/fair-value, /undervalued, /anomalies
 app.include_router(ops_router)              # /api/ops/freshness
 app.include_router(dashboard_router)        # /api/dashboard/* (public, investor demo page)
+
+# FutHub v2 - AI market-intelligence platform, versioned routers on this
+# same app (see the v2 plan). Feature routers add themselves inside
+# app/routers/v2/__init__.py; this is the only line main.py ever needs.
+app.include_router(v2_router)               # /api/v2/*
 
 # Admin (require_admin-gated): user search + premium grant/revoke
 from app.routers.admin import router as admin_router

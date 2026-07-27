@@ -1,4 +1,10 @@
-
+# NOTE: process_price_tick()/watchlist_poll_loop() below are never called
+# from anywhere in this repo (confirmed via a full grep) - this alerting
+# engine and its `watchlist_items` table are currently dead code, not a
+# running background job. The live, user-facing watchlist is
+# app/routers/watchlist.py's plain CRUD against a differently-named
+# `watchlist` table on WATCHLIST_DATABASE_URL. Wire this up for real or
+# replace it before building anything new on top of `watchlist_items`.
 from __future__ import annotations
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timezone
