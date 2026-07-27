@@ -169,9 +169,15 @@ async def run(dsn: str, target: str = "core", execute_legacy: bool = False) -> i
         await conn.close()
 
 
-async def run_on_boot(core_dsn: str, player_dsn: str) -> None:
+async def run_on_boot(core_dsn: str, player_dsn: str, watchlist_dsn: str | None = None) -> None:
     """Called from main.py's lifespan. Never raises - the app must still
-    boot (and serve its degraded-but-working paths) if a migration fails."""
+    boot (and serve its degraded-but-working paths) if a migration fails.
+
+    watchlist_dsn is optional and defaults to core_dsn (matching main.py's
+    own "same pool if the DSNs match" pattern for WATCHLIST_DATABASE_URL) -
+    "watchlist" has always been a valid --target this runner recognizes
+    (see _TARGET_RE above), it just was never actually invoked here until
+    migration 016 needed it."""
     try:
         await run(core_dsn, target="core")
     except Exception as e:
@@ -180,6 +186,10 @@ async def run_on_boot(core_dsn: str, player_dsn: str) -> None:
         await run(player_dsn, target="player")
     except Exception as e:
         log.error("BOOT MIGRATIONS FAILED (player): %s - app continuing", e)
+    try:
+        await run(watchlist_dsn or core_dsn, target="watchlist")
+    except Exception as e:
+        log.error("BOOT MIGRATIONS FAILED (watchlist): %s - app continuing", e)
 
 
 def main() -> int:

@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from typing import Dict, Any, List, Optional, Literal
 from app.db import get_db
-from app.auth.entitlements import compute_entitlements
+from app.auth.entitlements import compute_entitlements, require_feature
 import asyncpg
 from datetime import datetime, timedelta
 
@@ -12,7 +12,12 @@ router = APIRouter(prefix="/api/ai", tags=["Portfolio"])
 class OptimizePortfolioRequest(BaseModel):
     goal: Literal["aggressive", "balanced", "conservative"] = "balanced"
 
-@router.post("/optimize-portfolio")
+# entitlements.py lists "portfolio_optimizer": "pro", but this route only
+# ever checked `user_id` (any logged-in free user could call it) -
+# confirmed via a repo-wide grep for require_feature(). The body below
+# still does its own compute_entitlements() call for user_id, which is
+# harmless (same cached lookup) and left as-is to keep this diff small.
+@router.post("/optimize-portfolio", dependencies=[Depends(require_feature("portfolio_optimizer"))])
 async def optimize_portfolio(
     req: Request,
     body: OptimizePortfolioRequest,

@@ -1,4 +1,18 @@
 # app/routers/watchlist.py
+#
+# This is the only live watchlist implementation - user-facing CRUD against
+# the `watchlist` table on the separate WATCHLIST_DATABASE_URL pool
+# (get_watchlist_db). A near-duplicate, unmounted router used to exist at
+# app/routes/watchlist.py against a same-named `watchlist` table on the core
+# pool instead - confirmed dead (never imported by main.py) and removed.
+#
+# app/services/watchlist_engine.py + its `watchlist_items` table are a
+# separate, ALSO CURRENTLY DEAD alerting engine: process_price_tick()/
+# watchlist_poll_loop() are defined but never called from anywhere in this
+# repo, so no threshold-alert polling actually runs today. Don't build v2
+# alerting on top of it without first deciding whether to wire it up for
+# real or replace it - and don't add a third "watchlist" concept alongside
+# these two.
 from __future__ import annotations
 
 import asyncio

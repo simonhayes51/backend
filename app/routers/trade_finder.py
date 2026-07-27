@@ -1,5 +1,5 @@
 # app/routers/trade_finder.py
-from fastapi import APIRouter, Query, Request, HTTPException
+from fastapi import APIRouter, Depends, Query, Request, HTTPException
 from typing import Optional, List, Dict, Any, Tuple
 import asyncio
 import logging
@@ -9,8 +9,13 @@ from datetime import datetime, timedelta
 
 # we’ll use your existing services
 from app.services.price_history import get_price_history
+from app.auth.entitlements import require_feature
 
-router = APIRouter(prefix="/api/trade-finder")
+# entitlements.py lists "trade_finder": "pro", but no route ever enforced
+# it - confirmed via a repo-wide grep for require_feature(). Gating here
+# closes that off at the API level (the frontend route wrapper already
+# gates the UI correctly).
+router = APIRouter(prefix="/api/trade-finder", dependencies=[Depends(require_feature("trade_finder"))])
 
 # ---------- helpers ----------
 def _collapse_platform(p: str) -> str:
