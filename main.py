@@ -43,6 +43,7 @@ from app.auth.entitlements import (
 )
 from app.services.price_history import get_price_history
 from app.services.prices import get_player_price  # optional
+from app.services.deal_confidence import compute_deal_confidence
 from app.routers.smart_buy import router as smart_buy_router
 from app.routers.trade_finder import router as trade_finder_router
 from app.routers.auth_me import router as auth_me_router
@@ -2232,7 +2233,7 @@ async def create_trading_goal(
     )
     return {"message": "Goal created successfully"}
 
-@app.get("/api/analytics/advanced")
+@app.get("/api/analytics/advanced", dependencies=[Depends(require_feature("advanced_analytics"))])
 async def get_advanced_analytics(
     user_id: str = Depends(get_current_user), conn=Depends(get_db)
 ):
@@ -3060,57 +3061,12 @@ async def create_event(request: Request, conn=Depends(get_db)):
 
 @app.get("/api/deal-confidence/{card_id}")
 async def deal_confidence(card_id: int, platform: str = "ps"):
-    try:
-        hist = await get_price_history(card_id, platform, "today")
-    except Exception as e:
-        raise HTTPException(502, f"history error: {e}")
-    prices = [p.get("price") or p.get("v") or p.get("y") for p in hist if (p.get("price") or p.get("v") or p.get("y"))]
-    if len(prices) < 6:
-        live = await fetch_price(card_id, platform)
-        if isinstance(live.get("price"), (int, float)):
-            prices = [int(live["price"])] * 6
-        else:
-            return {"score": 0, "components": {}, "note": "no data"}
-
-    n = len(prices)
-    def _slope(xs):
-        m = len(xs)
-        if m < 2: return 0.0
-        xb = (m-1)/2.0
-        yb = sum(xs)/m
-        num = sum((i-xb)*(y-yb) for i,y in enumerate(xs))
-        den = sum((i-xb)**2 for i in range(m))
-        return num/den if den else 0.0
-    last_q = prices[max(0, n - max(6, n//4)):]
-    sl = _slope(last_q)
-    momentum4h = 1.0 if sl > 0 else 0.0
-    first = prices[:n//2] or prices
-    second = prices[n//2:] or prices
-    regime = 1.0 if (sum(second)/len(second) >= sum(first)/len(first)) else 0.0
-    diffs = [abs(prices[i]-prices[i-1]) for i in range(1, n)]
-    vol_abs = sum(diffs)/len(diffs) if diffs else 0.0
-    avgp = sum(prices)/len(prices)
-    volRisk = min(1.0, (vol_abs/avgp) if avgp else 1.0)
-    liquidity = min(1.0, max(0.0, (n-6)/90))
-    wnd = prices[-min(12, n):]
-    if wnd:
-        lo, hi = min(wnd), max(wnd)
-        spread_proxy = (hi-lo)/hi if hi else 0.1
-    else:
-        spread_proxy = 0.1
-    recent_hi = max(wnd) if wnd else max(prices)
-    cur = prices[-1]
-    srRoom = (recent_hi - cur)/recent_hi if recent_hi else 0.0
-    secs = (next_daily_london_hour(18) - now_utc()).total_seconds()
-    catalyst = max(0.0, min(1.0, 1 - abs(secs)/(6*3600)))
-
-    score = 100 * (0.22*momentum4h + 0.14*regime + 0.16*(1-volRisk) + 0.18*liquidity + 0.12*(1-spread_proxy) + 0.10*srRoom + 0.08*catalyst)
-    score = max(0.0, min(100.0, score))
-    return {"score": round(score,1), "components": {
-        "momentum4h": round(momentum4h,3), "regimeAgreement": regime, "volRisk": round(volRisk,3),
-        "liquidity": round(liquidity,3), "spreadProxy": round(spread_proxy,3), "srRoom": round(srRoom,3),
-        "catalystBoost": round(catalyst,3)
-    }}
+    # Delegates to app/services/deal_confidence.py, which is now the one
+    # canonical implementation of this math (previously duplicated here
+    # inline while the service module sat dead and broken - see that
+    # file's docstring). Intentionally left ungated for Phase 1 - see
+    # the v2 plan's Phase 1 decisions section.
+    return await compute_deal_confidence(card_id, platform)
 
 @app.post("/api/backtest")
 async def backtest(payload: Dict[str, Any]):

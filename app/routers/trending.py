@@ -10,6 +10,8 @@ from bs4 import BeautifulSoup
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
+from app.auth.entitlements import require_feature
+
 router = APIRouter(prefix="/api", tags=["trending"])
 
 # ------------------ Config ------------------
@@ -261,6 +263,12 @@ async def trending(
     plat = _plat(platform)
 
     if type_ == "smart":
+        # entitlements.py's PRO_TRENDING/ELITE_TRENDING mark "smart" as a
+        # paid-tier capability (FREE_TRENDING has smart=False), but nothing
+        # enforced it here - confirmed via a repo-wide grep for
+        # require_feature(). Only the "smart" divergence type is gated;
+        # plain risers/fallers stay free, matching the free tier's design.
+        await require_feature("smart_trending")(req)
         items = await _build_smart(req, plat, limit)
         return {"type": "smart", "timeframe": f"{tf}h", "items": items, "limited": False}
 

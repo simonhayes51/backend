@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, Request, HTTPException, Query
 from typing import Dict, Any, List
 from pydantic import BaseModel, Field, validator
 from app.db import get_db
-from app.auth.entitlements import compute_entitlements
+from app.auth.entitlements import compute_entitlements, require_feature
 from datetime import datetime
 
 router = APIRouter(prefix="/api/trades", tags=["Trades"])
@@ -171,7 +171,12 @@ async def delete_trade(
 class BulkTradesRequest(BaseModel):
     trades: List[TradeItem] = Field(..., min_items=1, max_items=100)
 
-@router.post("/bulk")
+# entitlements.py lists "bulk_trades": "elite", but this route only ever
+# checked `user_id` (any logged-in free user could call it) - confirmed
+# via a repo-wide grep for require_feature(). The body below still does
+# its own compute_entitlements() call for user_id, harmless (same cached
+# lookup), left as-is to keep this diff small.
+@router.post("/bulk", dependencies=[Depends(require_feature("bulk_trades"))])
 async def bulk_insert_trades(
     req: Request,
     body: BulkTradesRequest,
