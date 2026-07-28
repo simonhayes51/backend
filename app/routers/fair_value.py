@@ -54,6 +54,10 @@ def _teaser(row: Dict[str, Any]) -> Dict[str, Any]:
         "rating": row["rating"],
         "version": row["version"],
         "image_url": row["image_url"],
+        "card_bg_image": row.get("card_bg_image"),
+        "card_cutout_image": row.get("card_cutout_image"),
+        "card_cutout_type": row.get("card_cutout_type"),
+        "card_name": row.get("card_name"),
         "verdict": verdict,               # steal | under | fair | overpriced | falling | unknown
         "sales_24h": row["sales_24h"],    # liquidity is free - it builds trust
         "locked": True,
@@ -82,6 +86,10 @@ async def card_fair_value(card_id: int, request: Request):
             "rating": row["rating"],
             "version": row["version"],
             "image_url": row["image_url"],
+            "card_bg_image": row.get("card_bg_image"),
+            "card_cutout_image": row.get("card_cutout_image"),
+            "card_cutout_type": row.get("card_cutout_type"),
+            "card_name": row.get("card_name"),
             "data_quality_suspect": True,
             "message": "We're not confident in this card's market data yet - check back shortly.",
         }

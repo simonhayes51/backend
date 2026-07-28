@@ -148,6 +148,7 @@ async def refresher_loop(pool: asyncpg.Pool, interval_seconds: int = 300) -> Non
 
 _ROW_COLS = """
     card_id, name, rating, version, position, image_url,
+    card_bg_image, card_cutout_image, card_cutout_type, card_name,
     fair_value_24h, fair_value_7d, sales_24h, sales_7d,
     sales_per_hour_24h, volatility_24h, last_sale_at,
     current_bin, bin_captured_at, discount_pct, bin_zscore_24h,

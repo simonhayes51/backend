@@ -29,9 +29,16 @@ async def get_events(
             f"""
             SELECT e.id, e.kind, e.source, e.external_id, e.title, e.description,
                    e.starts_at, e.ends_at, e.fingerprint, e.first_seen_at, e.updated_at,
-                   d.category, d.total_cost_coins, d.repeatable
+                   d.category, d.total_cost_coins, d.repeatable,
+                   rc.name AS reward_card_name, rc.rating AS reward_card_rating,
+                   rc.version AS reward_card_version, rc.image_url AS reward_card_image_url,
+                   rc.card_bg_image AS reward_card_bg_image,
+                   rc.card_cutout_image AS reward_card_cutout_image,
+                   rc.card_cutout_type AS reward_card_cutout_type,
+                   rc.card_name AS reward_card_card_name
             FROM market_events e
             LEFT JOIN sbc_details d ON d.event_id = e.id
+            LEFT JOIN fut_players rc ON rc.card_id = d.reward_card_id
             {where}
             ORDER BY e.starts_at DESC NULLS LAST, e.first_seen_at DESC
             LIMIT $1 OFFSET $2
@@ -65,9 +72,17 @@ async def get_event(pool: asyncpg.Pool, event_id: int) -> Optional[Dict[str, Any
         if event["kind"] == "sbc":
             details = await conn.fetchrow(
                 """
-                SELECT set_name, category, total_cost_coins, repeatable,
-                       reward_card_id, reward_description, expires_at
-                FROM sbc_details WHERE event_id = $1
+                SELECT d.set_name, d.category, d.total_cost_coins, d.repeatable,
+                       d.reward_card_id, d.reward_description, d.expires_at,
+                       rc.name AS reward_card_name, rc.rating AS reward_card_rating,
+                       rc.version AS reward_card_version, rc.image_url AS reward_card_image_url,
+                       rc.card_bg_image AS reward_card_bg_image,
+                       rc.card_cutout_image AS reward_card_cutout_image,
+                       rc.card_cutout_type AS reward_card_cutout_type,
+                       rc.card_name AS reward_card_card_name
+                FROM sbc_details d
+                LEFT JOIN fut_players rc ON rc.card_id = d.reward_card_id
+                WHERE d.event_id = $1
                 """,
                 event_id,
             )
@@ -96,7 +111,8 @@ async def get_event_impact(pool: asyncpg.Pool, event_id: int) -> List[Dict[str, 
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT i.card_id, p.name, p.rating, p.version, i.relation,
+            SELECT i.card_id, p.name, p.rating, p.version, p.image_url, i.relation,
+                   p.card_bg_image, p.card_cutout_image, p.card_cutout_type, p.card_name,
                    i.price_before, i.price_after, i.price_change_pct,
                    i.volume_before_24h, i.volume_after_24h,
                    i.measured_before_at, i.measured_after_at, i.computed_at

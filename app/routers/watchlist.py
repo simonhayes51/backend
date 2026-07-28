@@ -105,7 +105,8 @@ async def list_watch_items(
     card_ids = [int(it["card_id"]) for it in items if it.get("card_id") is not None]
     meta_rows = await pdb.fetch(
         """
-        SELECT card_id, name, rating, club, nation
+        SELECT card_id, name, rating, club, nation, version, image_url,
+               card_bg_image, card_cutout_image, card_cutout_type, card_name
         FROM fut_players
         WHERE card_id = ANY($1::bigint[])
         """,
@@ -117,6 +118,12 @@ async def list_watch_items(
             "rating": m["rating"],
             "club": m["club"],
             "nation": m["nation"],
+            "version": m["version"],
+            "image_url": m["image_url"],
+            "card_bg_image": m["card_bg_image"],
+            "card_cutout_image": m["card_cutout_image"],
+            "card_cutout_type": m["card_cutout_type"],
+            "card_name": m["card_name"],
         }
         for m in meta_rows
     }
@@ -158,6 +165,12 @@ async def list_watch_items(
             "rating": m.get("rating"),
             "club": m.get("club"),
             "nation": m.get("nation"),
+            "version": m.get("version"),
+            "image_url": m.get("image_url"),
+            "card_bg_image": m.get("card_bg_image"),
+            "card_cutout_image": m.get("card_cutout_image"),
+            "card_cutout_type": m.get("card_cutout_type"),
+            "card_name": m.get("card_name"),
         })
 
     return {"ok": True, "items": enriched}
