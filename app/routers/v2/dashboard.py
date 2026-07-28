@@ -28,7 +28,10 @@ from app.db import get_core_pool, get_player_pool, get_watchlist_db
 
 router = APIRouter(tags=["v2-dashboard"])
 
-_STATE_LABEL = {"bullish": "Bullish", "bearish": "Bearish", "illiquid": "Illiquid", "normal": "Normal"}
+# Plain, FUT-trader-facing labels rather than stock-market jargon
+# (bullish/bearish/illiquid) - this product's audience trades FUT cards,
+# not stocks, and isn't assumed to know those terms.
+_STATE_LABEL = {"bullish": "Good Time to Buy", "bearish": "Prices Dropping", "illiquid": "Slow Trading", "normal": "Steady Market"}
 
 # recommendation_engine.py's RuleV1Strategy only ever assigns
 # recommendation in {"buy", "hold", "avoid"} - "hold" really does mean
@@ -65,12 +68,12 @@ def _regime_summary(state: str, indicators: Dict[str, Any]) -> str:
     avg_discount = indicators.get("avg_discount_pct") or 0
     avg_liquidity = indicators.get("avg_liquidity") or 0
     if state == "bullish":
-        return f"Tracked cards are trading an average {avg_discount:.1f}% below real value with only {falling_pct:.0f}% in a falling trend - buyers have the edge."
+        return f"Tracked cards are selling for {avg_discount:.1f}% less than usual, and only {falling_pct:.0f}% are still dropping in price - good time to pick some up."
     if state == "bearish":
-        return f"{falling_pct:.0f}% of tracked cards are in a confirmed downward trend right now - treat discounts as falling knives, not steals."
+        return f"{falling_pct:.0f}% of tracked cards are still dropping in price right now - a cheap price might drop even more before it's worth buying."
     if state == "illiquid":
-        return f"Average liquidity is only {avg_liquidity:.2f} sales/hour across tracked cards - moves take longer to confirm."
-    return "Prices and liquidity are broadly in line with recent norms across tracked cards."
+        return f"Cards are only selling about {avg_liquidity:.2f} times an hour on average - it'll take longer than usual to buy or sell."
+    return "Prices and sales are behaving normally across tracked cards right now."
 
 
 def _to_recommendation(d: Dict[str, Any], scores: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
