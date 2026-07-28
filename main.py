@@ -67,6 +67,9 @@ from app.routers.ops import router as ops_router
 from app.routers.dashboard import router as dashboard_router
 from app.routers.v2 import router as v2_router
 from app.services.fair_value import refresher_loop as fair_value_refresher_loop
+from app.services.event_impact import refresher_loop as event_impact_refresher_loop
+from app.services.analytics_engine import refresher_loop as analytics_engine_refresher_loop
+from app.services.recommendation_engine import refresher_loop as recommendation_engine_refresher_loop
 
 
 # ----------------- BOOTSTRAP -----------------
@@ -471,6 +474,33 @@ async def lifespan(app: FastAPI):
     )
     logging.info("✅ Fair Value refresher started (%ss)", fv_interval)
 
+    # Event Market Impact: before/after price+volume per (event, card) -
+    # see app/services/event_impact.py.
+    event_impact_interval = int(os.getenv("EVENT_IMPACT_REFRESH_SECONDS", "1800"))
+    app.state.event_impact_task = asyncio.create_task(
+        event_impact_refresher_loop(player_pool, event_impact_interval)
+    )
+    logging.info("✅ Event Impact refresher started (%ss)", event_impact_interval)
+
+    # Analytics Engine: 10 per-card scores into card_scores, self-
+    # synchronized on fair_value_mv's own watermark rather than chained
+    # directly off fair_value_refresher_loop - zero coupling to that
+    # already-shipped file. Also the one place market_states (core DB)
+    # actually gets written now.
+    analytics_poll = int(os.getenv("ANALYTICS_ENGINE_POLL_SECONDS", "60"))
+    app.state.analytics_engine_task = asyncio.create_task(
+        analytics_engine_refresher_loop(pool, player_pool, analytics_poll)
+    )
+    logging.info("✅ Analytics Engine refresher started (poll every %ss)", analytics_poll)
+
+    # AI Recommendation Engine: rule_v1, self-synchronized on
+    # card_scores_latest's watermark (needs scores to exist first).
+    recommendation_poll = int(os.getenv("RECOMMENDATION_ENGINE_POLL_SECONDS", "60"))
+    app.state.recommendation_engine_task = asyncio.create_task(
+        recommendation_engine_refresher_loop(pool, player_pool, recommendation_poll)
+    )
+    logging.info("✅ Recommendation Engine refresher started (poll every %ss)", recommendation_poll)
+
     # The "social trading features" users-table ALTER/index block that used
     # to run here is now part of migrations/015_consolidate_core_bootstrap.sql
     # (same columns/indexes, applied once via run_on_boot() above).
@@ -487,6 +517,12 @@ async def lifespan(app: FastAPI):
             fv_task.cancel()
             with suppress(asyncio.CancelledError):
                 await fv_task
+        for task_attr in ("event_impact_task", "analytics_engine_task", "recommendation_engine_task"):
+            task = getattr(app.state, task_attr, None)
+            if task:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
         for p in {pool, player_pool, watchlist_pool}:
             if p is not None:
                 await p.close()
