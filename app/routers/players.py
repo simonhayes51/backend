@@ -436,7 +436,7 @@ async def get_player(card_id: str, conn = Depends(get_player_db)):
         SELECT card_id, name, rating, version, image_url, club, league, nation, position, altposition, price, price_num,
                games_played_console, games_played_pc, avg_goals_console, avg_goals_pc,
                top_chem_style_console, top_chem_style_pc,
-               card_bg_image, card_cutout_image, card_cutout_type, card_name,
+               card_bg_image, card_cutout_image, card_cutout_type, card_name, player_url,
                pace, shooting, passing, dribbling, defending, physicality,
                nation_image, league_image, club_image
         FROM fut_players
