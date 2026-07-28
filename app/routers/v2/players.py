@@ -28,8 +28,16 @@ from app.services.deal_confidence import compute_deal_confidence
 
 router = APIRouter(tags=["v2-players"])
 
+# Bounded, not fetch_card_layers's own 15s REQUEST_TIMEOUT: that constant
+# is shared with fetch_price_by_url/fetch_recent_sales and is fine for
+# those (nothing else is waiting on them), but this call sits directly in
+# the critical path of every Player Page load - a slow or blocked
+# futbin.com response must not hang the whole endpoint. 3s is enough for
+# a normal page fetch and still fails fast if futbin.com is unreachable.
+_LIVE_CARD_LAYERS_TIMEOUT = 3.0
 
-async def _with_live_card_layers(meta: Dict[str, Any]) -> Dict[str, Any]:
+
+async def _live_card_layers(meta: Dict[str, Any]) -> Any:
     """card_bg_image/card_cutout_image are only ever populated by
     auto_sync's futbin_card_art_backfill.py, which - unlike the collectors
     that came before it - has never actually been scheduled as a Railway
@@ -40,17 +48,23 @@ async def _with_live_card_layers(meta: Dict[str, Any]) -> Dict[str, Any]:
     v1's Player Search page by fetching the same layers live, per request,
     off meta's player_url - viable here because this is a single card, not
     a list surface (fetching per-row for N list items is what the batch
-    backfill worker exists to avoid)."""
+    backfill worker exists to avoid).
+
+    Two real bugs in the first version of this: it awaited before the
+    summary endpoint's asyncio.gather() rather than as part of it (so its
+    full latency - up to fetch_card_layers's own 15s timeout - serially
+    added to every page load instead of overlapping with the other,
+    much-faster panels), and it had no exception handling at all, so a
+    parse_card_layers() failure on any real, unexpected futbin.com HTML
+    (parse_card_layers is called *outside* fetch_card_layers's own
+    try/except) 500'd the entire summary endpoint rather than just
+    skipping the card art enhancement."""
     if meta.get("card_bg_image") or not meta.get("player_url"):
-        return meta
-    layers = await fetch_card_layers(meta["player_url"])
-    if layers.get("bgImageUrl"):
-        meta = dict(meta)
-        meta["card_bg_image"] = layers["bgImageUrl"]
-        meta["card_cutout_image"] = layers.get("cutoutImageUrl")
-        meta["card_cutout_type"] = layers.get("cutoutType")
-        meta["card_name"] = layers.get("cardName") or meta.get("card_name")
-    return meta
+        return None
+    try:
+        return await asyncio.wait_for(fetch_card_layers(meta["player_url"]), timeout=_LIVE_CARD_LAYERS_TIMEOUT)
+    except Exception:
+        return None
 
 
 async def _safe(coro) -> Any:
@@ -91,11 +105,10 @@ async def player_summary(card_id: int, request: Request) -> Dict[str, Any]:
     pool = await get_player_pool()
     async with pool.acquire() as conn:
         meta = await get_player(str(card_id), conn)  # 404s naturally, propagates below
-    meta = await _with_live_card_layers(meta)
 
     (
         market_metrics, fair_value, lazy_buyer_score, deal_confidence,
-        card_scores, recommendation, ent,
+        card_scores, recommendation, ent, live_layers,
     ) = await asyncio.gather(
         _safe(_market_metrics(card_id)),
         _safe(card_fair_value(card_id, request)),
@@ -104,7 +117,14 @@ async def player_summary(card_id: int, request: Request) -> Dict[str, Any]:
         _safe(get_card_scores(card_id, request)),
         _safe(get_player_recommendation(card_id, request)),
         compute_entitlements(request),
+        _live_card_layers(meta),
     )
+    if live_layers and live_layers.get("bgImageUrl"):
+        meta = dict(meta)
+        meta["card_bg_image"] = live_layers["bgImageUrl"]
+        meta["card_cutout_image"] = live_layers.get("cutoutImageUrl")
+        meta["card_cutout_type"] = live_layers.get("cutoutType")
+        meta["card_name"] = live_layers.get("cardName") or meta.get("card_name")
 
     return {
         "card_id": card_id,
