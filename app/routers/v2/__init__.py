@@ -22,6 +22,7 @@ from app.routers.v2.market import router as market_router
 from app.routers.v2.sbc import router as sbc_router
 from app.routers.v2.analytics import router as analytics_router
 from app.routers.v2.recommendations import router as recommendations_router
+from app.routers.v2.dashboard import router as dashboard_router
 
 router = APIRouter(prefix="/api/v2")
 router.include_router(health_router)
@@ -30,3 +31,4 @@ router.include_router(market_router)
 router.include_router(sbc_router)
 router.include_router(analytics_router)
 router.include_router(recommendations_router)
+router.include_router(dashboard_router)
