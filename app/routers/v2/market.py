@@ -8,11 +8,13 @@
 # request instead of N.
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, List
 
 from fastapi import APIRouter, HTTPException, Request
 
 from app.auth.entitlements import compute_entitlements
+from app.db import get_core_pool
 from app.routers.fair_value import _teaser
 from app.services import fair_value as fv
 
@@ -49,6 +51,10 @@ async def fair_value_batch(ids: str, request: Request) -> Dict[str, Any]:
                 "rating": row["rating"],
                 "version": row["version"],
                 "image_url": row["image_url"],
+                "card_bg_image": row.get("card_bg_image"),
+                "card_cutout_image": row.get("card_cutout_image"),
+                "card_cutout_type": row.get("card_cutout_type"),
+                "card_name": row.get("card_name"),
                 "data_quality_suspect": True,
                 "message": "We're not confident in this card's market data yet - check back shortly.",
             })
@@ -60,3 +66,30 @@ async def fair_value_batch(ids: str, request: Request) -> Dict[str, Any]:
             items.append(_teaser(row))
 
     return {"items": items, "count": len(items)}
+
+
+_STATE_LABEL = {"bullish": "Bullish", "bearish": "Bearish", "illiquid": "Illiquid", "normal": "Normal"}
+
+
+@router.get("/market/regime")
+async def market_regime() -> Dict[str, Any]:
+    """Ungated - mirrors the same "free teaser numbers" precedent as
+    GET /api/v2/cards/{id}/scores. Reads the latest core-DB market_states
+    row (app/services/analytics_engine.py::compute_market_regime), not
+    v1's smart_buy_router's /market-intelligence, which is wrong-gated
+    behind the smart_buy feature flag for what should be a v2-native,
+    ungated dashboard panel."""
+    core_pool = await get_core_pool()
+    async with core_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT platform, state, confidence_score, detected_at, indicators "
+            "FROM market_states WHERE platform = 'ps' ORDER BY detected_at DESC LIMIT 1"
+        )
+    if not row:
+        raise HTTPException(404, "No market regime computed yet")
+    d = dict(row)
+    d["detected_at"] = d["detected_at"].isoformat()
+    d["label"] = _STATE_LABEL.get(d["state"], d["state"])
+    if isinstance(d.get("indicators"), str):
+        d["indicators"] = json.loads(d["indicators"])
+    return d

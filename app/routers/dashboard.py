@@ -38,7 +38,10 @@ _DETAIL_NUM_RE = re.compile(r"([a-zA-Z_]+)=(\d+)")
 # rename the key itself. This only controls what's DISPLAYED to a visitor
 # on the public /demo page, e.g. so it doesn't name a specific scraped
 # third-party site.
-_WORKER_DISPLAY_NAMES = {"futbin_full_sync": "Player Catalog Sync"}
+_WORKER_DISPLAY_NAMES = {
+    "futbin_full_sync": "Player Catalog Sync",
+    "futbin_card_art_backfill": "Card Art Backfill",
+}
 
 
 def _iso(ts: Optional[datetime]) -> Optional[str]:
@@ -160,17 +163,20 @@ async def dashboard_stats() -> Dict[str, Any]:
                 """
                 SELECT
                     (SELECT row_to_json(m) FROM (
-                        SELECT card_id, name, rating, version, volatility_24h
+                        SELECT card_id, name, rating, version, volatility_24h,
+                               image_url, card_bg_image, card_cutout_image, card_cutout_type, card_name
                         FROM fair_value_mv WHERE volatility_24h IS NOT NULL
                         ORDER BY volatility_24h DESC LIMIT 1
                     ) m) AS largest_mover,
                     (SELECT row_to_json(m) FROM (
-                        SELECT card_id, name, rating, version, sales_24h
+                        SELECT card_id, name, rating, version, sales_24h,
+                               image_url, card_bg_image, card_cutout_image, card_cutout_type, card_name
                         FROM fair_value_mv WHERE sales_24h IS NOT NULL
                         ORDER BY sales_24h DESC LIMIT 1
                     ) m) AS most_traded_today,
                     (SELECT row_to_json(m) FROM (
-                        SELECT card_id, name, rating, version, sales_per_hour_24h
+                        SELECT card_id, name, rating, version, sales_per_hour_24h,
+                               image_url, card_bg_image, card_cutout_image, card_cutout_type, card_name
                         FROM fair_value_mv WHERE sales_per_hour_24h IS NOT NULL
                         ORDER BY sales_per_hour_24h DESC LIMIT 1
                     ) m) AS highest_liquidity
@@ -254,11 +260,19 @@ async def dashboard_activity(limit: int = Query(20, ge=1, le=100)) -> Dict[str, 
 
     events: List[Dict[str, Any]] = []
 
+    # card_id/rating/version + the 4 card-art columns are carried through
+    # on the 3 card-related event types (sale/bin/player_update) so v2's
+    # ActivityFeedSection can link to the Player Page and render real card
+    # art instead of plain text - sync events have no single card to
+    # reference and correctly keep card_id: None.
+    _ART_COLS = "p.card_bg_image, p.card_cutout_image, p.card_cutout_type, p.card_name"
+
     try:
         async with player_pool.acquire() as conn:
             sales = await conn.fetch(
-                """
-                SELECT s.sold_price, s.sold_at, p.name
+                f"""
+                SELECT s.sold_price, s.sold_at, p.card_id, p.name, p.rating, p.version,
+                       p.image_url, {_ART_COLS}
                 FROM sales_history s
                 LEFT JOIN fut_players p ON p.card_id = s.player_id
                 ORDER BY s.sold_at DESC
@@ -271,6 +285,10 @@ async def dashboard_activity(limit: int = Query(20, ge=1, le=100)) -> Dict[str, 
                 "type": "sale",
                 "message": f"New sale recorded: {r['name'] or 'Unknown player'} sold for {r['sold_price']:,} coins",
                 "at": r["sold_at"],
+                "card_id": r["card_id"], "rating": r["rating"], "version": r["version"],
+                "image_url": r["image_url"], "card_bg_image": r["card_bg_image"],
+                "card_cutout_image": r["card_cutout_image"], "card_cutout_type": r["card_cutout_type"],
+                "card_name": r["card_name"],
             })
     except Exception:
         pass
@@ -278,8 +296,9 @@ async def dashboard_activity(limit: int = Query(20, ge=1, le=100)) -> Dict[str, 
     try:
         async with player_pool.acquire() as conn:
             bins = await conn.fetch(
-                """
-                SELECT b.lowest_bin, b.platform, b.captured_at, p.name
+                f"""
+                SELECT b.lowest_bin, b.platform, b.captured_at, p.card_id, p.name, p.rating, p.version,
+                       p.image_url, {_ART_COLS}
                 FROM bin_history b
                 LEFT JOIN fut_players p ON p.card_id = b.player_id
                 ORDER BY b.captured_at DESC
@@ -292,6 +311,10 @@ async def dashboard_activity(limit: int = Query(20, ge=1, le=100)) -> Dict[str, 
                 "type": "bin",
                 "message": f"BIN changed: {r['name'] or 'Unknown player'} now {r['lowest_bin']:,} ({r['platform']})",
                 "at": r["captured_at"],
+                "card_id": r["card_id"], "rating": r["rating"], "version": r["version"],
+                "image_url": r["image_url"], "card_bg_image": r["card_bg_image"],
+                "card_cutout_image": r["card_cutout_image"], "card_cutout_type": r["card_cutout_type"],
+                "card_name": r["card_name"],
             })
     except Exception:
         pass
@@ -299,9 +322,9 @@ async def dashboard_activity(limit: int = Query(20, ge=1, le=100)) -> Dict[str, 
     try:
         async with player_pool.acquire() as conn:
             updated = await conn.fetch(
-                """
-                SELECT card_id, name, price_updated_at
-                FROM fut_players
+                f"""
+                SELECT card_id, name, rating, version, image_url, {_ART_COLS}, price_updated_at
+                FROM fut_players AS p
                 WHERE price_updated_at IS NOT NULL
                 ORDER BY price_updated_at DESC
                 LIMIT $1
@@ -313,6 +336,10 @@ async def dashboard_activity(limit: int = Query(20, ge=1, le=100)) -> Dict[str, 
                 "type": "player_update",
                 "message": f"Player updated: {r['name'] or r['card_id']}",
                 "at": r["price_updated_at"],
+                "card_id": r["card_id"], "rating": r["rating"], "version": r["version"],
+                "image_url": r["image_url"], "card_bg_image": r["card_bg_image"],
+                "card_cutout_image": r["card_cutout_image"], "card_cutout_type": r["card_cutout_type"],
+                "card_name": r["card_name"],
             })
     except Exception:
         pass
@@ -329,6 +356,7 @@ async def dashboard_activity(limit: int = Query(20, ge=1, le=100)) -> Dict[str, 
             "type": "sync",
             "message": f"Auto sync completed: {display_name} ({'ok' if hb['ok'] else 'failed'})",
             "at": hb["last_run_at"],
+            "card_id": None,
         })
 
     epoch = datetime.min.replace(tzinfo=timezone.utc)
@@ -337,7 +365,13 @@ async def dashboard_activity(limit: int = Query(20, ge=1, le=100)) -> Dict[str, 
 
     return {
         "events": [
-            {"type": e["type"], "message": e["message"], "at": _iso(e["at"])}
+            {
+                "type": e["type"], "message": e["message"], "at": _iso(e["at"]),
+                "card_id": e.get("card_id"), "rating": e.get("rating"), "version": e.get("version"),
+                "image_url": e.get("image_url"), "card_bg_image": e.get("card_bg_image"),
+                "card_cutout_image": e.get("card_cutout_image"), "card_cutout_type": e.get("card_cutout_type"),
+                "card_name": e.get("card_name"),
+            }
             for e in top
         ]
     }

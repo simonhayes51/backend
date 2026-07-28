@@ -55,7 +55,8 @@ async def _feed(pool, where: str, order: str, limit: int) -> Dict[str, Any]:
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             f"""
-            SELECT r.*, p.name, p.rating, p.version, p.image_url
+            SELECT r.*, p.name, p.rating, p.version, p.image_url,
+                   p.card_bg_image, p.card_cutout_image, p.card_cutout_type, p.card_name
             FROM recommendations_latest r
             LEFT JOIN fut_players p ON p.card_id = r.card_id
             WHERE {where}
@@ -81,7 +82,8 @@ async def high_confidence(request: Request, limit: int = Query(20, ge=1, le=100)
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT r.*, p.name, p.rating, p.version, p.image_url
+            SELECT r.*, p.name, p.rating, p.version, p.image_url,
+                   p.card_bg_image, p.card_cutout_image, p.card_cutout_type, p.card_name
             FROM recommendations_latest r
             LEFT JOIN fut_players p ON p.card_id = r.card_id
             WHERE r.recommendation = 'buy' AND r.confidence >= $1
