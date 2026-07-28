@@ -88,11 +88,27 @@ def _to_recommendation(d: Dict[str, Any], scores: Optional[Dict[str, float]] = N
             "name": d.get("name") or f"Card {d.get('card_id')}",
             "rating": d.get("rating"),
             "version": d.get("version"),
+            "position": d.get("position"),
             "imageUrl": d.get("image_url"),
             "cardBgImage": d.get("card_bg_image"),
             "cardCutoutImage": d.get("card_cutout_image"),
             "cardCutoutType": d.get("card_cutout_type"),
             "cardName": d.get("card_name"),
+            # Same bg+cutout+overlay rendering PlayerCardArt already uses
+            # on the Player Search/Compare pages - stats/nation-league-club
+            # images are only present here so that component's full (non-
+            # compact) overlay has real numbers instead of "-" placeholders.
+            "stats": {
+                "pace": d.get("pace"),
+                "shooting": d.get("shooting"),
+                "passing": d.get("passing"),
+                "dribbling": d.get("dribbling"),
+                "defending": d.get("defending"),
+                "physicality": d.get("physicality"),
+            },
+            "nationImage": d.get("nation_image"),
+            "leagueImage": d.get("league_image"),
+            "clubImage": d.get("club_image"),
         },
         "recommendation": _ACTION_LABEL.get(d.get("recommendation"), "WAIT"),
         "confidence": float(d.get("confidence") or 0),
@@ -181,8 +197,10 @@ async def get_dashboard(request: Request) -> Dict[str, Any]:
         async with player_pool.acquire() as conn:
             buy_rows = await conn.fetch(
                 """
-                SELECT r.*, p.name, p.rating, p.version, p.image_url,
+                SELECT r.*, p.name, p.rating, p.version, p.position, p.image_url,
                        p.card_bg_image, p.card_cutout_image, p.card_cutout_type, p.card_name,
+                       p.pace, p.shooting, p.passing, p.dribbling, p.defending, p.physicality,
+                       p.nation_image, p.league_image, p.club_image,
                        fv.current_bin, fv.fair_value_24h, fv.sales_24h, fv.sales_7d, fv.data_quality_suspect
                 FROM recommendations_latest r
                 LEFT JOIN fut_players p ON p.card_id = r.card_id
@@ -193,8 +211,10 @@ async def get_dashboard(request: Request) -> Dict[str, Any]:
             )
             avoid_rows = await conn.fetch(
                 """
-                SELECT r.*, p.name, p.rating, p.version, p.image_url,
+                SELECT r.*, p.name, p.rating, p.version, p.position, p.image_url,
                        p.card_bg_image, p.card_cutout_image, p.card_cutout_type, p.card_name,
+                       p.pace, p.shooting, p.passing, p.dribbling, p.defending, p.physicality,
+                       p.nation_image, p.league_image, p.club_image,
                        fv.current_bin, fv.fair_value_24h, fv.sales_24h, fv.sales_7d, fv.data_quality_suspect
                 FROM recommendations_latest r
                 LEFT JOIN fut_players p ON p.card_id = r.card_id
@@ -205,8 +225,10 @@ async def get_dashboard(request: Request) -> Dict[str, Any]:
             )
             recent_rows = await conn.fetch(
                 """
-                SELECT r.*, p.name, p.rating, p.version, p.image_url,
+                SELECT r.*, p.name, p.rating, p.version, p.position, p.image_url,
                        p.card_bg_image, p.card_cutout_image, p.card_cutout_type, p.card_name,
+                       p.pace, p.shooting, p.passing, p.dribbling, p.defending, p.physicality,
+                       p.nation_image, p.league_image, p.club_image,
                        fv.current_bin, fv.fair_value_24h, fv.sales_24h, fv.sales_7d, fv.data_quality_suspect
                 FROM recommendations r
                 LEFT JOIN fut_players p ON p.card_id = r.card_id
@@ -231,17 +253,17 @@ async def get_dashboard(request: Request) -> Dict[str, Any]:
             """
             SELECT
                 (SELECT row_to_json(m) FROM (
-                    SELECT card_id, name, rating, version, volatility_24h AS metric,
+                    SELECT card_id, name, rating, version, position, volatility_24h AS metric,
                            image_url, card_bg_image, card_cutout_image, card_cutout_type, card_name
                     FROM fair_value_mv WHERE volatility_24h IS NOT NULL ORDER BY volatility_24h DESC LIMIT 1
                 ) m) AS largest_mover,
                 (SELECT row_to_json(m) FROM (
-                    SELECT card_id, name, rating, version, sales_24h AS metric,
+                    SELECT card_id, name, rating, version, position, sales_24h AS metric,
                            image_url, card_bg_image, card_cutout_image, card_cutout_type, card_name
                     FROM fair_value_mv WHERE sales_24h IS NOT NULL ORDER BY sales_24h DESC LIMIT 1
                 ) m) AS most_traded,
                 (SELECT row_to_json(m) FROM (
-                    SELECT card_id, name, rating, version, sales_per_hour_24h AS metric,
+                    SELECT card_id, name, rating, version, position, sales_per_hour_24h AS metric,
                            image_url, card_bg_image, card_cutout_image, card_cutout_type, card_name
                     FROM fair_value_mv WHERE sales_per_hour_24h IS NOT NULL ORDER BY sales_per_hour_24h DESC LIMIT 1
                 ) m) AS highest_liquidity
@@ -255,6 +277,7 @@ async def get_dashboard(request: Request) -> Dict[str, Any]:
         m = json.loads(raw) if isinstance(raw, str) else raw
         mover_cards.append(_to_recommendation({
             "card_id": m["card_id"], "name": m["name"], "rating": m["rating"], "version": m["version"],
+            "position": m.get("position"),
             "image_url": m["image_url"], "card_bg_image": m.get("card_bg_image"),
             "card_cutout_image": m.get("card_cutout_image"), "card_cutout_type": m.get("card_cutout_type"),
             "card_name": m.get("card_name"),
