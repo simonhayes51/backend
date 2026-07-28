@@ -15,6 +15,7 @@ from fastapi import APIRouter, HTTPException, Request
 
 from app.auth.entitlements import compute_entitlements, require_feature
 from app.db import get_player_pool
+from app.futbin_client import fetch_card_layers
 from app.routers.fair_value import card_fair_value
 from app.routers.players import (
     get_player,
@@ -26,6 +27,30 @@ from app.routers.v2.recommendations import get_player_recommendation
 from app.services.deal_confidence import compute_deal_confidence
 
 router = APIRouter(tags=["v2-players"])
+
+
+async def _with_live_card_layers(meta: Dict[str, Any]) -> Dict[str, Any]:
+    """card_bg_image/card_cutout_image are only ever populated by
+    auto_sync's futbin_card_art_backfill.py, which - unlike the collectors
+    that came before it - has never actually been scheduled as a Railway
+    Cron Job (see that file's own README section: it was deliberately left
+    unscheduled pending a live-network verification pass). So in practice
+    that column is null for nearly every card today. GET
+    /api/fut-player-definition/{card_id} already solves exactly this for
+    v1's Player Search page by fetching the same layers live, per request,
+    off meta's player_url - viable here because this is a single card, not
+    a list surface (fetching per-row for N list items is what the batch
+    backfill worker exists to avoid)."""
+    if meta.get("card_bg_image") or not meta.get("player_url"):
+        return meta
+    layers = await fetch_card_layers(meta["player_url"])
+    if layers.get("bgImageUrl"):
+        meta = dict(meta)
+        meta["card_bg_image"] = layers["bgImageUrl"]
+        meta["card_cutout_image"] = layers.get("cutoutImageUrl")
+        meta["card_cutout_type"] = layers.get("cutoutType")
+        meta["card_name"] = layers.get("cardName") or meta.get("card_name")
+    return meta
 
 
 async def _safe(coro) -> Any:
@@ -66,6 +91,7 @@ async def player_summary(card_id: int, request: Request) -> Dict[str, Any]:
     pool = await get_player_pool()
     async with pool.acquire() as conn:
         meta = await get_player(str(card_id), conn)  # 404s naturally, propagates below
+    meta = await _with_live_card_layers(meta)
 
     (
         market_metrics, fair_value, lazy_buyer_score, deal_confidence,
