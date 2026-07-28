@@ -47,6 +47,20 @@ Feature = Literal[
     "undervalued_board",
     "anomaly_alerts",
     "realtime_alerts",
+    # v2 - only 4 of these have a real route as of Phase 4 (ai_recommendations,
+    # sbc_impact_predictions, investment_score_history, opportunity_feed) -
+    # the other 6 are reserved names for features outside the v2 Phase 0-4
+    # scope (backtesting/portfolio/journal/API-v2/briefing/early-refresh).
+    "ai_recommendations",
+    "sbc_impact_predictions",
+    "investment_score_history",
+    "advanced_backtesting",
+    "portfolio_performance",
+    "daily_ai_briefing",
+    "early_data_refresh",
+    "advanced_api_v2",
+    "trade_journal",
+    "opportunity_feed",
 ]
 
 Tier = Literal["free", "pro", "elite"]
@@ -93,6 +107,18 @@ FEATURE_MIN_TIER: Dict[Feature, Tier] = {
     "market_maker": "elite",
     "bulk_trades": "elite",
     "anomaly_alerts": "elite",
+    # v2 - Pro (daily-driver AI tools)
+    "ai_recommendations": "pro",
+    "sbc_impact_predictions": "pro",
+    "investment_score_history": "pro",
+    "portfolio_performance": "pro",
+    "daily_ai_briefing": "pro",
+    "trade_journal": "pro",
+    # v2 - Elite (the edge)
+    "opportunity_feed": "elite",
+    "advanced_backtesting": "elite",
+    "early_data_refresh": "elite",
+    "advanced_api_v2": "elite",
 }
 
 # Kept importable for older code paths that referenced the matrix by name.

@@ -1,14 +1,21 @@
 # app/routers/v2/sbc.py
 #
 # Read-only endpoints over market_events/sbc_details/sbc_challenges/
-# event_market_impact (migrations 018/019). Ungated for now - Phase 4
-# wires require_feature("sbc_impact_predictions") onto the impact route.
+# event_market_impact (migrations 018/019). The impact route is gated
+# via an INLINE require_feature(...) call, not a route-decorator
+# Depends() - these functions aren't called directly elsewhere today,
+# but the inline form is used consistently across v2 so that never
+# becomes a silent bypass risk later (a Depends() gate is only enforced
+# by FastAPI's own request pipeline; a direct Python call to the
+# function - like app/routers/v2/players.py's player_summary() already
+# does for several of these - skips it entirely).
 from __future__ import annotations
 
 from typing import Any, Dict, List
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
+from app.auth.entitlements import require_feature
 from app.services import market_events as me
 
 router = APIRouter(tags=["v2-sbc"])
@@ -44,6 +51,7 @@ async def get_sbc_event(event_id: int, request: Request) -> Dict[str, Any]:
 
 @router.get("/sbc/events/{event_id}/impact")
 async def get_sbc_event_impact(event_id: int, request: Request) -> Dict[str, Any]:
+    await require_feature("sbc_impact_predictions")(request)
     pool = _player_pool(request)
     event = await me.get_event(pool, event_id)
     if not event:
