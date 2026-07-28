@@ -3095,13 +3095,17 @@ async def create_event(request: Request, conn=Depends(get_db)):
         logging.error(f"Create event error: {e}")
         raise HTTPException(status_code=500, detail="Failed to create event")
 
-@app.get("/api/deal-confidence/{card_id}")
+@app.get("/api/deal-confidence/{card_id}", dependencies=[Depends(require_feature("deal_confidence"))])
 async def deal_confidence(card_id: int, platform: str = "ps"):
     # Delegates to app/services/deal_confidence.py, which is now the one
     # canonical implementation of this math (previously duplicated here
     # inline while the service module sat dead and broken - see that
-    # file's docstring). Intentionally left ungated for Phase 1 - see
-    # the v2 plan's Phase 1 decisions section.
+    # file's docstring). Left deliberately ungated through Phase 1-3 (see
+    # the v2 plan's Phase 1 decisions section) - gated here in Phase 4's
+    # premium-gating pass, matching entitlements.py's existing
+    # "deal_confidence": "pro" entry. app/routers/v2/players.py's
+    # player_summary() calls the service function directly (not this
+    # route), so it gets its own matching inline check - see that file.
     return await compute_deal_confidence(card_id, platform)
 
 @app.post("/api/backtest")

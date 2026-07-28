@@ -13,7 +13,7 @@ from typing import Any, Dict
 
 from fastapi import APIRouter, HTTPException, Request
 
-from app.auth.entitlements import compute_entitlements
+from app.auth.entitlements import compute_entitlements, require_feature
 from app.db import get_player_pool
 from app.routers.fair_value import card_fair_value
 from app.routers.players import (
@@ -52,6 +52,15 @@ async def _lazy_buyer_score(card_id: int) -> Any:
         return await get_player_lazy_buyer_score_route(card_id, conn)
 
 
+async def _deal_confidence(card_id: int, request: Request) -> Any:
+    # compute_deal_confidence() is a bare service function with no gate
+    # of its own - main.py's /api/deal-confidence/{card_id} route gates
+    # itself, but that route isn't what's called here, so the same
+    # check is applied inline to keep the two consistent.
+    await require_feature("deal_confidence")(request)
+    return await compute_deal_confidence(card_id)
+
+
 @router.get("/players/{card_id}/summary")
 async def player_summary(card_id: int, request: Request) -> Dict[str, Any]:
     pool = await get_player_pool()
@@ -65,7 +74,7 @@ async def player_summary(card_id: int, request: Request) -> Dict[str, Any]:
         _safe(_market_metrics(card_id)),
         _safe(card_fair_value(card_id, request)),
         _safe(_lazy_buyer_score(card_id)),
-        _safe(compute_deal_confidence(card_id)),
+        _safe(_deal_confidence(card_id, request)),
         _safe(get_card_scores(card_id, request)),
         _safe(get_player_recommendation(card_id, request)),
         compute_entitlements(request),

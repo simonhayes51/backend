@@ -1,15 +1,21 @@
 # app/routers/v2/recommendations.py
 #
 # Read-only endpoints over recommendations/recommendations_latest
-# (migration 021). Ungated for now (Phase 2/3) - Phase 4 wires
-# require_feature("ai_recommendations") on the single-card route and
-# require_feature("opportunity_feed") on the three feed routes.
+# (migration 021). require_feature("ai_recommendations") gates the
+# single-card route; require_feature("opportunity_feed") gates the
+# three feed routes. Gated INLINE (not via a route Depends()) - the
+# single-card route is called directly by
+# app/routers/v2/players.py's player_summary(), which bypasses a
+# route-decorator Depends() entirely (that's only enforced by FastAPI's
+# own request pipeline, not a plain in-process function call).
 from __future__ import annotations
 
 import json
 from typing import Any, Dict, List
 
 from fastapi import APIRouter, HTTPException, Query, Request
+
+from app.auth.entitlements import require_feature
 
 router = APIRouter(tags=["v2-recommendations"])
 
@@ -33,6 +39,7 @@ def _row_to_dict(row) -> Dict[str, Any]:
 
 @router.get("/players/{card_id}/recommendation")
 async def get_player_recommendation(card_id: int, request: Request) -> Dict[str, Any]:
+    await require_feature("ai_recommendations")(request)
     pool = _player_pool(request)
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -63,11 +70,13 @@ async def _feed(pool, where: str, order: str, limit: int) -> Dict[str, Any]:
 
 @router.get("/recommendations/opportunities")
 async def opportunities(request: Request, limit: int = Query(20, ge=1, le=100)) -> Dict[str, Any]:
+    await require_feature("opportunity_feed")(request)
     return await _feed(_player_pool(request), "r.recommendation = 'buy'", "r.confidence DESC", limit)
 
 
 @router.get("/recommendations/high-confidence")
 async def high_confidence(request: Request, limit: int = Query(20, ge=1, le=100), min_confidence: float = Query(70, ge=0, le=100)) -> Dict[str, Any]:
+    await require_feature("opportunity_feed")(request)
     pool = _player_pool(request)
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -87,4 +96,5 @@ async def high_confidence(request: Request, limit: int = Query(20, ge=1, le=100)
 
 @router.get("/recommendations/avoid")
 async def avoid(request: Request, limit: int = Query(20, ge=1, le=100)) -> Dict[str, Any]:
+    await require_feature("opportunity_feed")(request)
     return await _feed(_player_pool(request), "r.recommendation = 'avoid'", "r.computed_at DESC", limit)

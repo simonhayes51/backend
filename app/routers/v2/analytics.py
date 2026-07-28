@@ -3,12 +3,16 @@
 # Read-only endpoints over card_scores/card_scores_latest (migration
 # 020). GET /scores stays free (mirrors fair_value's teaser/full split -
 # free users see the current number, not the trend); GET /scores/history
-# is the literal investment_score_history feature, gated in Phase 4.
+# is the literal investment_score_history feature, gated inline (not via
+# a route Depends()) so the same check applies whether the route is hit
+# directly or this function is called in-process elsewhere later.
 from __future__ import annotations
 
 from typing import Any, Dict, List
 
 from fastapi import APIRouter, HTTPException, Query, Request
+
+from app.auth.entitlements import require_feature
 
 router = APIRouter(tags=["v2-analytics"])
 
@@ -62,7 +66,7 @@ async def get_card_score_history(
     score_type: str = Query(..., description="e.g. investment, risk, opportunity"),
     days: int = Query(30, ge=1, le=365),
 ) -> Dict[str, Any]:
-    # Ungated in Phase 2/3 - Phase 4 wires require_feature("investment_score_history") here.
+    await require_feature("investment_score_history")(request)
     pool = _player_pool(request)
     async with pool.acquire() as conn:
         rows = await conn.fetch(
