@@ -17,7 +17,8 @@ from pydantic import BaseModel, Field
 
 from app.auth.entitlements import compute_entitlements, invalidate_entitlements_cache
 from app.auth.api_keys import TIER_LIMITS
-from app.db import get_db
+from app.db import get_db, get_core_pool, get_player_pool
+from app.routers.dashboard import _heartbeats_by_worker, _parse_detail_counts, _status_card, _iso
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
@@ -248,3 +249,36 @@ async def set_api_key_tier(
         pass
 
     return {"ok": True, "key_id": row["id"], "key_prefix": row["key_prefix"], "tier": row["tier"], "rpm": rpm, "monthly_quota": quota}
+
+
+@router.get("/sbc/imports")
+async def sbc_imports(admin=Depends(require_admin)) -> Dict[str, Any]:
+    """SBC collector status + a daily import count - reuses dashboard.py's
+    existing cross-pool heartbeat merge and detail-count parser rather
+    than reimplementing them for this one worker."""
+    core_pool = await get_core_pool()
+    player_pool = await get_player_pool()
+
+    heartbeats = await _heartbeats_by_worker(core_pool, player_pool)
+    hb = heartbeats.get("futbin_sbc_sync")
+    counts = _parse_detail_counts(hb["detail"] if hb else None)
+    status = _status_card("SBC Collector", hb, counts.get("sets_written"))
+
+    async with player_pool.acquire() as conn:
+        daily = await conn.fetch(
+            """
+            SELECT date_trunc('day', first_seen_at) AS day, count(*) AS new_sets
+            FROM market_events
+            WHERE kind = 'sbc' AND first_seen_at >= now() - interval '7 days'
+            GROUP BY 1 ORDER BY 1 DESC
+            """
+        )
+        total = await conn.fetchval("SELECT count(*) FROM market_events WHERE kind = 'sbc'")
+
+    return {
+        "status": status,
+        "total_sbc_events": int(total or 0),
+        "daily_imports": [
+            {"day": _iso(r["day"]), "new_sets": r["new_sets"]} for r in daily
+        ],
+    }

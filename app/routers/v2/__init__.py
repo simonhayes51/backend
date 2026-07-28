@@ -19,8 +19,10 @@ from fastapi import APIRouter
 from app.routers.v2.health import router as health_router
 from app.routers.v2.players import router as players_router
 from app.routers.v2.market import router as market_router
+from app.routers.v2.sbc import router as sbc_router
 
 router = APIRouter(prefix="/api/v2")
 router.include_router(health_router)
 router.include_router(players_router)
 router.include_router(market_router)
+router.include_router(sbc_router)
