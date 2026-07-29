@@ -52,6 +52,16 @@ WATCHLIST_DATABASE_URL=${DATABASE_URL}
 
 # Watchlist Settings
 WATCHLIST_POLL_INTERVAL=60
+
+# Player-card PNG generation (see PLAYER_CARD_PNG_PIPELINE.md) -
+# S3-compatible object storage, e.g. Cloudflare R2 or AWS S3
+AWS_ACCESS_KEY_ID=
+AWS_SECRET_ACCESS_KEY=
+AWS_S3_BUCKET=
+AWS_PUBLIC_BASE_URL=
+# Only needed for a non-AWS S3-compatible provider (e.g. R2):
+# S3_ENDPOINT=
+# S3_FORCE_PATH_STYLE=1
 ```
 
 ### Quick Generate Secrets (PowerShell):
