@@ -20,6 +20,7 @@ from pydantic import BaseModel
 
 from app.db import get_player_db, get_player_pool
 from app.routers.admin import require_admin
+from app.services.player_card_backfill import get_backfill_status, start_backfill
 from app.services.player_card_data import fetch_player_render_data
 from app.services.player_card_generation import (
     PlayerCardNotFoundError,
@@ -81,6 +82,40 @@ async def get_player_card_render_data(
             "leagueImage": row.get("league_image"),
         }
     }
+
+
+class BackfillRequest(BaseModel):
+    mode: str = "missing"  # "missing" | "stale"
+    limit: int = 200
+    concurrency: int = 1
+    force: bool = False
+
+
+# Registered before /{card_id}/... below: {card_id} is typed as a plain
+# str, so it would otherwise happily "match" the literal segment
+# "backfill" too - same path-ordering gotcha players.py's own comment
+# calls out for /batch/... vs /{card_id}/....
+@admin_router.post("/backfill")
+async def start_player_card_backfill(
+    payload: BackfillRequest = BackfillRequest(),
+    admin=Depends(require_admin),
+):
+    if payload.mode not in ("missing", "stale"):
+        raise HTTPException(status_code=400, detail="mode must be 'missing' or 'stale'")
+    if not (1 <= payload.limit <= 2000):
+        raise HTTPException(status_code=400, detail="limit must be between 1 and 2000")
+    if not (1 <= payload.concurrency <= 4):
+        raise HTTPException(status_code=400, detail="concurrency must be between 1 and 4 (Chromium is heavy)")
+
+    pool = await get_player_pool()
+    return await start_backfill(
+        pool, mode=payload.mode, limit=payload.limit, concurrency=payload.concurrency, force=payload.force
+    )
+
+
+@admin_router.get("/backfill/status")
+async def player_card_backfill_status(admin=Depends(require_admin)):
+    return get_backfill_status()
 
 
 class GenerateCardRequest(BaseModel):

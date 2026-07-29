@@ -18,27 +18,21 @@ import asyncio
 import logging
 import os
 import sys
-from typing import List, Optional
 
 import asyncpg
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 
-from app.services.player_card_data import fetch_player_render_data
+from app.services.player_card_backfill import candidate_card_ids, is_actually_stale
 from app.services.player_card_generation import (
     PlayerCardNotFoundError,
     ensure_generated_player_card,
 )
-from app.services.player_card_hash import compute_card_render_hash
 
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("generate_player_cards")
-
-# Fetched in pages rather than one giant IN-memory list - a full catalog
-# backfill shouldn't need to hold every eligible card_id in RAM at once.
-_PAGE_SIZE = 500
 
 
 def _parse_args() -> argparse.Namespace:
@@ -51,47 +45,6 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--concurrency", type=int, default=1, help="parallel generations (Chromium is heavy - keep this low)")
     p.add_argument("--force", action="store_true", help="regenerate even if the stored hash already matches")
     return p.parse_args()
-
-
-async def _candidate_card_ids(pool: asyncpg.Pool, args: argparse.Namespace) -> List[str]:
-    if args.player_id:
-        return [args.player_id]
-
-    async with pool.acquire() as conn:
-        if args.stale:
-            # Hash comparison needs each row's full data, so pull a bounded
-            # page of "has been generated before" cards and let the caller
-            # filter by recomputed hash below rather than trying to express
-            # "hash mismatch" in SQL against JSON-derived data.
-            rows = await conn.fetch(
-                """
-                SELECT card_id FROM fut_players
-                WHERE generated_card_status = 'ready' AND generated_card_hash IS NOT NULL
-                ORDER BY generated_card_at ASC NULLS FIRST
-                LIMIT $1
-                """,
-                args.limit,
-            )
-        else:
-            # Default / --missing: never generated, or last attempt errored.
-            rows = await conn.fetch(
-                """
-                SELECT card_id FROM fut_players
-                WHERE generated_card_url IS NULL OR generated_card_status = 'error'
-                ORDER BY card_id ASC
-                LIMIT $1
-                """,
-                args.limit,
-            )
-    return [str(r["card_id"]) for r in rows]
-
-
-async def _is_actually_stale(pool: asyncpg.Pool, card_id: str) -> bool:
-    async with pool.acquire() as conn:
-        row = await fetch_player_render_data(conn, card_id)
-    if row is None:
-        return False
-    return compute_card_render_hash(row) != row.get("generated_card_hash")
 
 
 async def _run_one(pool, browser, card_id: str, force: bool) -> bool:
@@ -124,14 +77,11 @@ async def main() -> int:
         return 1
 
     pool = await asyncpg.create_pool(dsn=dsn, min_size=1, max_size=max(2, args.concurrency))
-    card_ids = await _candidate_card_ids(pool, args)
+    mode = "stale" if args.stale else "missing"
+    card_ids = await candidate_card_ids(pool, mode, args.limit, player_id=args.player_id)
 
-    if args.stale:
-        filtered = []
-        for cid in card_ids:
-            if await _is_actually_stale(pool, cid):
-                filtered.append(cid)
-        card_ids = filtered
+    if args.stale and not args.player_id:
+        card_ids = [cid for cid in card_ids if await is_actually_stale(pool, cid)]
 
     total = len(card_ids)
     logger.info("Eligible cards this run: %d", total)
