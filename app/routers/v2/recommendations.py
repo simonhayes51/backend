@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict
+from datetime import datetime
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from app.auth.entitlements import require_feature
@@ -22,6 +23,13 @@ def _player_pool(request: Request):
     return pool
 
 
+def _versioned_card_url(url: Optional[str], generated_at: Optional[datetime]) -> Optional[str]:
+    if not url or not generated_at:
+        return url
+    separator = "&" if "?" in url else "?"
+    return f"{url}{separator}v={int(generated_at.timestamp() * 1000)}"
+
+
 def _row_to_dict(row) -> Dict[str, Any]:
     d = dict(row)
     for key in _JSONB_COLUMNS:
@@ -31,15 +39,19 @@ def _row_to_dict(row) -> Dict[str, Any]:
         d["computed_at"] = d["computed_at"].isoformat()
     if d.get("expected_net_roi") is None and "expected_net_roi_source" not in d:
         d["expected_net_roi_source"] = "unavailable_until_validated_model"
-    # One canonical public name for every consumer.
     d["display_name"] = d.get("display_name") or d.get("nickname") or d.get("card_name") or d.get("name")
+    d["generated_card_url"] = _versioned_card_url(
+        d.get("generated_card_url"), d.get("generated_card_at")
+    )
+    if d.get("generated_card_at"):
+        d["generated_card_at"] = d["generated_card_at"].isoformat()
     return d
 
 
 _PLAYER_COLUMNS = """
     p.name, p.display_name, p.nickname, p.rating, p.version, p.position, p.image_url,
     p.card_bg_image, p.card_cutout_image, p.card_cutout_type, p.card_name,
-    p.generated_card_url, p.generated_card_status,
+    p.generated_card_url, p.generated_card_status, p.generated_card_at,
     p.nation_image, p.league_image, p.club_image,
     p.pace, p.shooting, p.passing, p.dribbling, p.defending, p.physicality
 """
@@ -65,16 +77,27 @@ async def generated_card_images(request: Request, card_ids: str = Query("")) -> 
     ids = []
     for raw in card_ids.split(","):
         try:
-            if raw.strip(): ids.append(int(raw.strip()))
+            if raw.strip():
+                ids.append(int(raw.strip()))
         except ValueError:
             pass
     ids = list(dict.fromkeys(ids))[:100]
-    if not ids: return {"images": {}}
+    if not ids:
+        return {"images": {}}
     async with _player_pool(request).acquire() as conn:
-        rows = await conn.fetch("""SELECT card_id, generated_card_url FROM fut_players
+        rows = await conn.fetch(
+            """SELECT card_id, generated_card_url, generated_card_at FROM fut_players
             WHERE card_id=ANY($1::bigint[]) AND generated_card_status='ready'
-            AND generated_card_url IS NOT NULL""", ids)
-    return {"images": {str(r["card_id"]): r["generated_card_url"] for r in rows}}
+            AND generated_card_url IS NOT NULL""", ids,
+        )
+    return {
+        "images": {
+            str(r["card_id"]): _versioned_card_url(
+                r["generated_card_url"], r["generated_card_at"]
+            )
+            for r in rows
+        }
+    }
 
 
 async def _feed(pool, where: str, order: str, limit: int) -> Dict[str, Any]:
@@ -104,7 +127,7 @@ async def high_confidence(request: Request, limit: int=Query(20,ge=1,le=100), mi
 
 
 @router.get("/recommendations/avoid")
-async def avoid(request: Request, limit: int=Query(20,ge=1,le=100)) -> Dict[str,Any]:
+async def avoid(request: Request, limit: int=Query(20,ge=1,le=100))->Dict[str,Any]:
     await require_feature("opportunity_feed")(request)
     return await _feed(_player_pool(request),"r.status='AVOID'","r.computed_at DESC",limit)
 
@@ -118,8 +141,6 @@ _STRATEGY_ORDER: Dict[str,str] = {
  "sbc":"COALESCE((r.strategy_results->'sbc'->>'score')::numeric,0) DESC, r.likely_net_roi DESC NULLS LAST",
 }
 
-# A strategy should remain useful even while the strict engine is sparse. These
-# fallbacks are deliberately different, not six aliases of Lazy Buyer.
 _STRATEGY_FALLBACK = {
  "quick_flip":"r.status='BUY' AND r.score_liquidity >= 55 AND r.likely_net_roi > 0",
  "swing_trade":"r.status='BUY' AND r.score_momentum >= 45 AND r.likely_net_roi >= 3",
@@ -138,7 +159,8 @@ async def highest_likely_roi(request: Request, limit:int=Query(20,ge=1,le=100))-
 
 @router.get("/recommendations/strategy/{strategy_name}")
 async def strategy_feed(strategy_name:str, request:Request, limit:int=Query(20,ge=1,le=100))->Dict[str,Any]:
-    if strategy_name not in _STRATEGY_ORDER: raise HTTPException(404,f"Unknown strategy: {strategy_name}")
+    if strategy_name not in _STRATEGY_ORDER:
+        raise HTTPException(404,f"Unknown strategy: {strategy_name}")
     await require_feature("opportunity_feed")(request)
     order=_STRATEGY_ORDER[strategy_name]
     pool=_player_pool(request)
@@ -146,7 +168,6 @@ async def strategy_feed(strategy_name:str, request:Request, limit:int=Query(20,g
         rows=await conn.fetch(f"""SELECT r.*, {_PLAYER_COLUMNS} FROM recommendations_latest r
           LEFT JOIN fut_players p ON p.card_id=r.card_id
           WHERE r.qualified_strategies @> $2::jsonb ORDER BY {order} LIMIT $1""",limit,json.dumps([strategy_name]))
-        # Fill a thin strict feed with strategy-specific candidates. Deduplicate in SQL.
         if len(rows) < limit:
             existing=[r["card_id"] for r in rows]
             extra=await conn.fetch(f"""SELECT r.*, {_PLAYER_COLUMNS} FROM recommendations_latest r
