@@ -86,7 +86,8 @@ def _reasoning_text(status: Optional[str], qualified_strategies: List[str], fail
         names = ", ".join(s.replace("_", " ") for s in qualified_strategies) or "a strategy"
         return f"Qualifies for: {names}."
     if status == "SELL":
-        return "; ".join(held_decision_reasons) or "Selling now looks better than continuing to hold."
+        names = "; ".join(r.replace("_", " ").lower() for r in held_decision_reasons)
+        return names or "Selling now looks better than continuing to hold."
     if status == "AVOID":
         return "The likely outcome is a net loss after EA's sale tax."
     if status == "INSUFFICIENT_DATA":
