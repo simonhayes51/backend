@@ -1,5 +1,4 @@
 # app/services/player_card_data.py
-#
 # Single source of truth for everything drawn on the generated player card.
 from __future__ import annotations
 
@@ -15,7 +14,7 @@ _LIVE_CARD_LAYERS_TIMEOUT = 3.0
 _SELECT_FIELDS = """
     card_id, name, nickname, card_name, rating, version, position, altposition,
     pace, shooting, passing, dribbling, defending, physicality,
-    skill_moves, weak_foot, foot, accelerate_type,
+    skill_moves, weak_foot, foot, accelerate_type, futbin_rating,
     image_url, card_bg_image, card_cutout_image, card_cutout_type,
     player_url, nation, nation_image, club, club_image, league, league_image,
     generated_card_url, generated_card_key, generated_card_hash,

@@ -5,7 +5,7 @@ import hashlib
 import json
 from typing import Any, Dict
 
-PLAYER_CARD_RENDER_VERSION = 3
+PLAYER_CARD_RENDER_VERSION = 4
 
 _HASHED_FIELDS = (
     "card_id",
@@ -25,6 +25,7 @@ _HASHED_FIELDS = (
     "skill_moves",
     "weak_foot",
     "foot",
+    "futbin_rating",
     "accelerate_type",
     "image_url",
     "card_bg_image",

@@ -62,6 +62,7 @@ async def get_player_card_render_data(
             "skillMoves": row.get("skill_moves"),
             "weakFoot": row.get("weak_foot"),
             "preferredFoot": row.get("foot"),
+            "futbinRating": row.get("futbin_rating"),
             "bgImage": row.get("card_bg_image"),
             "cutoutImage": row.get("card_cutout_image"),
             "cutoutType": row.get("card_cutout_type"),
