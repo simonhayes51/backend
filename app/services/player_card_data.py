@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 
 import aiohttp
 import asyncpg
@@ -52,6 +54,28 @@ def _best_image_url(image) -> Optional[str]:
     return image.get("src")
 
 
+def _infer_cutout_type(url: Optional[str], parsed_type: Optional[str]) -> Optional[str]:
+    """Infer FUTBIN's two player-image models from the asset filename.
+
+    Full-card special cutouts use names such as ``p50579499.png``. Base/icon
+    portraits use a plain numeric player id such as ``1183.png``. Some icon
+    pages include both image elements in the hero markup, so choosing merely
+    by which class BeautifulSoup finds first can incorrectly mark a numeric
+    portrait as ``special`` (Cannavaro is a confirmed example).
+    """
+    if not url:
+        return parsed_type
+
+    filename = urlparse(url).path.rsplit("/", 1)[-1].lower()
+    stem = filename.rsplit(".", 1)[0]
+
+    if re.fullmatch(r"p\d+", stem):
+        return "special"
+    if re.fullmatch(r"\d+", stem):
+        return "base"
+    return parsed_type
+
+
 async def _fetch_live_card_assets(player_url: str) -> Dict[str, Optional[str]]:
     empty = {
         "bgImageUrl": None,
@@ -79,7 +103,14 @@ async def _fetch_live_card_assets(player_url: str) -> Dict[str, Optional[str]]:
     background = scope.find("img", class_="playercard-26-bg")
     special_cutout = scope.find("img", class_="playercard-26-special-img")
     base_cutout = scope.find("img", class_="playercard-26-base-img")
-    cutout = special_cutout or base_cutout
+
+    # Prefer the base portrait when both nodes exist. Hidden/alternate special
+    # nodes can be present on icon pages; the numeric filename then confirms
+    # which rendering model is actually required.
+    cutout = base_cutout or special_cutout
+    parsed_type = "base" if base_cutout else ("special" if special_cutout else None)
+    cutout_url = _best_image_url(cutout)
+
     name_element = scope.find("div", class_="playercard-26-name")
     info_row = scope.find("div", class_="playercard-26-info-row")
 
@@ -89,8 +120,8 @@ async def _fetch_live_card_assets(player_url: str) -> Dict[str, Optional[str]]:
 
     return {
         "bgImageUrl": _best_image_url(background),
-        "cutoutImageUrl": _best_image_url(cutout),
-        "cutoutType": "special" if special_cutout else ("base" if base_cutout else None),
+        "cutoutImageUrl": cutout_url,
+        "cutoutType": _infer_cutout_type(cutout_url, parsed_type),
         "cardName": name_element.get_text(strip=True) if name_element else None,
         "nationImageUrl": _best_image_url(nation),
         "leagueImageUrl": _best_image_url(league),
@@ -130,5 +161,12 @@ async def fetch_player_render_data(conn: asyncpg.Connection, card_id: str) -> Op
             row["nation_image"] = assets.get("nationImageUrl") or row.get("nation_image")
             row["league_image"] = assets.get("leagueImageUrl") or row.get("league_image")
             row["club_image"] = assets.get("clubImageUrl") or row.get("club_image")
+
+    # Apply the same deterministic inference to stored fallback data. This
+    # prevents one stale card_cutout_type value from defeating the correct
+    # rendering model when the live FUTBIN request times out.
+    row["card_cutout_type"] = _infer_cutout_type(
+        row.get("card_cutout_image"), row.get("card_cutout_type")
+    )
 
     return row
