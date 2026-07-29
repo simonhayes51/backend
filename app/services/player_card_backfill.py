@@ -1,19 +1,4 @@
 # app/services/player_card_backfill.py
-#
-# Shared candidate-selection logic for "generate every missing/stale card"
-# (used by both the CLI script scripts/generate_player_cards.py and the
-# admin-triggered in-process job below), plus the job runner itself.
-#
-# The admin API route can't just call the CLI script as a subprocess (the
-# deploy environment has no shell access - see app/routers/admin.py's own
-# docstring on exactly this constraint), so this runs as a plain asyncio
-# background task inside the running web process instead: one global job
-# at a time, progress tracked in a module-level dict the status endpoint
-# polls. That's a real limitation (a Railway restart mid-run loses
-# progress state, and there's no cross-instance coordination if the web
-# service ever scales beyond one replica) - acceptable here because this
-# is an occasional, admin-operated action, not a hot path, and reruns are
-# idempotent (already-generated cards are simply skipped next time).
 from __future__ import annotations
 
 import asyncio
@@ -30,15 +15,30 @@ from app.services.player_card_generation import (
     ensure_generated_player_card,
 )
 from app.services.player_card_hash import compute_card_render_hash
+from app.services.player_card_render import (
+    EXPORT_DEVICE_SCALE,
+    EXPORT_HEIGHT,
+    EXPORT_WIDTH,
+)
 
 logger = logging.getLogger("player_card_backfill")
 
 VALID_MODES = ("missing", "stale")
+DEFAULT_MAX_CARDS = 50_000
 
 
 async def candidate_card_ids(
-    pool: asyncpg.Pool, mode: str, limit: int, player_id: Optional[str] = None
+    pool: asyncpg.Pool,
+    mode: str,
+    limit: int = DEFAULT_MAX_CARDS,
+    player_id: Optional[str] = None,
 ) -> List[str]:
+    """Return the complete work list for this run, up to a generous safety cap.
+
+    The previous implementation treated limit as a small batch and stopped at
+    2,000, which forced an admin to keep restarting the same job. A run now
+    drains the eligible backlog in one go; limit is only a safety ceiling.
+    """
     if player_id:
         return [player_id]
 
@@ -74,9 +74,16 @@ async def is_actually_stale(pool: asyncpg.Pool, card_id: str) -> bool:
     return compute_card_render_hash(row) != row.get("generated_card_hash")
 
 
-# ---------------------------------------------------------------------------
-# In-process job runner for the admin-triggered "Backfill" button.
-# ---------------------------------------------------------------------------
+async def _filter_stale(pool: asyncpg.Pool, card_ids: List[str]) -> List[str]:
+    semaphore = asyncio.Semaphore(20)
+
+    async def check(card_id: str) -> Optional[str]:
+        async with semaphore:
+            return card_id if await is_actually_stale(pool, card_id) else None
+
+    checked = await asyncio.gather(*(check(card_id) for card_id in card_ids))
+    return [card_id for card_id in checked if card_id]
+
 
 _state: Dict[str, Any] = {"running": False}
 
@@ -85,40 +92,61 @@ def get_backfill_status() -> Dict[str, Any]:
     return dict(_state)
 
 
+def _update_rate() -> None:
+    elapsed = max(0.001, time.time() - float(_state.get("started_at") or time.time()))
+    processed = int(_state.get("processed") or 0)
+    total = int(_state.get("total") or 0)
+    rate_per_minute = processed / elapsed * 60
+    remaining = max(0, total - processed)
+    _state["rate_per_minute"] = round(rate_per_minute, 1)
+    _state["remaining"] = remaining
+    _state["eta_seconds"] = round(remaining / (rate_per_minute / 60)) if rate_per_minute > 0 else None
+
+
 async def start_backfill(
     pool: asyncpg.Pool,
     mode: str = "missing",
-    limit: int = 200,
-    concurrency: int = 1,
+    limit: int = DEFAULT_MAX_CARDS,
+    concurrency: int = 3,
     force: bool = False,
 ) -> Dict[str, Any]:
     if _state.get("running"):
         return {"ok": False, "already_running": True, **_state}
 
-    card_ids = await candidate_card_ids(pool, mode, limit)
-    if mode == "stale":
-        card_ids = [cid for cid in card_ids if await is_actually_stale(pool, cid)]
-
     _state.clear()
     _state.update(
         {
             "running": True,
+            "phase": "selecting",
             "mode": mode,
             "limit": limit,
             "concurrency": concurrency,
             "force": force,
-            "total": len(card_ids),
+            "total": 0,
             "processed": 0,
             "succeeded": 0,
             "failed": 0,
+            "remaining": 0,
+            "rate_per_minute": 0,
+            "eta_seconds": None,
             "started_at": time.time(),
             "finished_at": None,
             "last_error": None,
         }
     )
 
+    card_ids = await candidate_card_ids(pool, mode, limit)
+    if mode == "stale":
+        _state["phase"] = "checking_stale"
+        card_ids = await _filter_stale(pool, card_ids)
+
+    _state["phase"] = "rendering"
+    _state["total"] = len(card_ids)
+    _state["remaining"] = len(card_ids)
+
     if not card_ids:
         _state["running"] = False
+        _state["phase"] = "finished"
         _state["finished_at"] = time.time()
         return {"ok": True, "already_running": False, **_state}
 
@@ -127,7 +155,9 @@ async def start_backfill(
 
 
 async def _run(pool: asyncpg.Pool, card_ids: List[str], concurrency: int, force: bool) -> None:
-    semaphore = asyncio.Semaphore(max(1, concurrency))
+    queue: asyncio.Queue[str] = asyncio.Queue()
+    for card_id in card_ids:
+        queue.put_nowait(card_id)
 
     try:
         async with async_playwright() as pw:
@@ -136,33 +166,61 @@ async def _run(pool: asyncpg.Pool, card_ids: List[str], concurrency: int, force:
                 args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
             )
 
-            async def _one(card_id: str) -> None:
-                ok = False
+            async def worker(worker_number: int) -> None:
+                context = await browser.new_context(
+                    viewport={"width": EXPORT_WIDTH, "height": EXPORT_HEIGHT},
+                    device_scale_factor=EXPORT_DEVICE_SCALE,
+                )
+                page = await context.new_page()
                 try:
-                    result = await ensure_generated_player_card(pool, card_id, force=force, browser=browser)
-                    ok = result.get("status") != "error"
-                except PlayerCardNotFoundError:
-                    logger.warning("backfill: card_id=%s not found, skipping", card_id)
-                except Exception:
-                    logger.exception("backfill: card_id=%s unexpected failure", card_id)
+                    while True:
+                        try:
+                            card_id = queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            return
 
-                _state["processed"] = _state.get("processed", 0) + 1
-                if ok:
-                    _state["succeeded"] = _state.get("succeeded", 0) + 1
-                else:
-                    _state["failed"] = _state.get("failed", 0) + 1
+                        ok = False
+                        try:
+                            result = await ensure_generated_player_card(
+                                pool,
+                                card_id,
+                                force=force,
+                                page=page,
+                            )
+                            ok = result.get("status") != "error"
+                        except PlayerCardNotFoundError:
+                            logger.warning("backfill: card_id=%s not found, skipping", card_id)
+                        except Exception:
+                            logger.exception(
+                                "backfill worker=%s card_id=%s unexpected failure",
+                                worker_number,
+                                card_id,
+                            )
+                        finally:
+                            queue.task_done()
 
-            async def _bounded(card_id: str) -> None:
-                async with semaphore:
-                    await _one(card_id)
+                        _state["processed"] = int(_state.get("processed") or 0) + 1
+                        if ok:
+                            _state["succeeded"] = int(_state.get("succeeded") or 0) + 1
+                        else:
+                            _state["failed"] = int(_state.get("failed") or 0) + 1
+                        _update_rate()
+                finally:
+                    await context.close()
 
             try:
-                await asyncio.gather(*(_bounded(cid) for cid in card_ids))
+                workers = [
+                    asyncio.create_task(worker(number + 1))
+                    for number in range(max(1, concurrency))
+                ]
+                await asyncio.gather(*workers)
             finally:
                 await browser.close()
     except Exception as exc:
         logger.exception("backfill job crashed")
         _state["last_error"] = str(exc)[:500]
     finally:
+        _update_rate()
         _state["running"] = False
+        _state["phase"] = "finished"
         _state["finished_at"] = time.time()
