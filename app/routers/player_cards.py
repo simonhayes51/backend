@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -41,6 +42,13 @@ def _resolved_cutout_type(row: Dict[str, Any]) -> Optional[str]:
     return row.get("card_cutout_type")
 
 
+def _versioned_url(url: Optional[str], generated_at: Optional[datetime]) -> Optional[str]:
+    if not url or not generated_at:
+        return url
+    separator = "&" if "?" in url else "?"
+    return f"{url}{separator}v={int(generated_at.timestamp() * 1000)}"
+
+
 @internal_router.get("/render/player-card/{card_id}")
 async def get_player_card_render_data(
     card_id: str,
@@ -58,7 +66,7 @@ async def get_player_card_render_data(
         "data": {
             "cardId": row["card_id"],
             "name": row["name"],
-            "displayName": row.get("nickname") or row.get("card_name") or row["name"],
+            "displayName": row.get("display_name") or row.get("nickname") or row.get("card_name") or row["name"],
             "rating": row["rating"],
             "position": row["position"],
             "altPositions": _split_alt_positions(row.get("altposition")),
@@ -88,8 +96,6 @@ async def get_player_card_render_data(
 
 class BackfillRequest(BaseModel):
     mode: str = "missing"
-    # This is now a safety ceiling, not a manual batch size. The default is
-    # deliberately large enough to drain the complete FC26 catalogue.
     limit: int = 50_000
     concurrency: int = 3
     force: bool = False
@@ -151,14 +157,15 @@ async def get_player_card_status(
     row = await fetch_player_render_data(conn, card_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Player not found")
+    generated_at = row.get("generated_card_at")
     return {
         "ok": True,
         "cardId": row["card_id"],
-        "imageUrl": row.get("generated_card_url"),
+        "imageUrl": _versioned_url(row.get("generated_card_url"), generated_at),
         "hash": row.get("generated_card_hash"),
         "width": row.get("generated_card_width"),
         "height": row.get("generated_card_height"),
         "status": row.get("generated_card_status"),
         "error": row.get("generated_card_error"),
-        "generatedAt": row["generated_card_at"].isoformat() if row.get("generated_card_at") else None,
+        "generatedAt": generated_at.isoformat() if generated_at else None,
     }
