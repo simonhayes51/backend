@@ -7,7 +7,7 @@ import struct
 from dataclasses import dataclass
 from typing import Optional
 
-from playwright.async_api import Browser, async_playwright
+from playwright.async_api import Browser, Page, async_playwright
 
 from app.services.player_card_token import make_render_token
 
@@ -43,41 +43,40 @@ def _png_dimensions(data: bytes) -> tuple[int, int]:
     return width, height
 
 
-async def _capture(browser: Browser, card_id: str) -> RenderedCard:
+async def _capture_page(page: Page, card_id: str) -> RenderedCard:
+    """Render one card using an existing page.
+
+    Bulk jobs reuse one page per worker. That avoids creating a fresh browser
+    context and page for every card and lets Chromium reuse fonts, JS and image
+    cache across the whole run.
+    """
     token = make_render_token(str(card_id))
     url = f"{_FRONTEND_URL}/#/internal/render/player-card/{card_id}?token={token}"
 
-    context = await browser.new_context(
-        viewport={"width": EXPORT_WIDTH, "height": EXPORT_HEIGHT},
-        device_scale_factor=EXPORT_DEVICE_SCALE,
-    )
+    page.set_default_timeout(_NAV_TIMEOUT_MS)
+    # cardReady is the real readiness contract. Waiting for networkidle as well
+    # made every card wait on unrelated long-lived/browser requests.
+    await page.goto(url, wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS)
+
+    card = page.locator(_EXPORT_SELECTOR)
+    await card.wait_for(state="attached", timeout=_NAV_TIMEOUT_MS)
+
     try:
-        page = await context.new_page()
-        page.set_default_timeout(_NAV_TIMEOUT_MS)
-        await page.goto(url, wait_until="networkidle", timeout=_NAV_TIMEOUT_MS)
+        await page.wait_for_function(
+            "document.documentElement.dataset.cardReady === 'true'",
+            timeout=_READY_TIMEOUT_MS,
+        )
+    except Exception as exc:
+        raise PlayerCardRenderError(
+            f"Card {card_id} never signalled data-card-ready within {_READY_TIMEOUT_MS}ms "
+            "(fonts/images/data likely failed to settle)"
+        ) from exc
 
-        card = page.locator(_EXPORT_SELECTOR)
-        await card.wait_for(state="attached", timeout=_NAV_TIMEOUT_MS)
+    error_marker = await card.get_attribute("data-card-export-error")
+    if error_marker:
+        raise PlayerCardRenderError(f"Card {card_id} export marked itself failed: {error_marker}")
 
-        try:
-            await page.wait_for_function(
-                "document.documentElement.dataset.cardReady === 'true'",
-                timeout=_READY_TIMEOUT_MS,
-            )
-        except Exception as exc:
-            raise PlayerCardRenderError(
-                f"Card {card_id} never signalled data-card-ready within {_READY_TIMEOUT_MS}ms "
-                "(fonts/images/data likely failed to settle)"
-            ) from exc
-
-        error_marker = await card.get_attribute("data-card-export-error")
-        if error_marker:
-            raise PlayerCardRenderError(f"Card {card_id} export marked itself failed: {error_marker}")
-
-        png_bytes = await card.screenshot(type="png", omit_background=True)
-    finally:
-        await context.close()
-
+    png_bytes = await card.screenshot(type="png", omit_background=True)
     if not png_bytes:
         raise PlayerCardRenderError(f"Card {card_id} screenshot returned an empty buffer")
 
@@ -85,7 +84,25 @@ async def _capture(browser: Browser, card_id: str) -> RenderedCard:
     return RenderedCard(png_bytes=png_bytes, width=width, height=height)
 
 
-async def render_player_card_png(card_id: str, browser: Optional[Browser] = None) -> RenderedCard:
+async def _capture(browser: Browser, card_id: str) -> RenderedCard:
+    context = await browser.new_context(
+        viewport={"width": EXPORT_WIDTH, "height": EXPORT_HEIGHT},
+        device_scale_factor=EXPORT_DEVICE_SCALE,
+    )
+    try:
+        page = await context.new_page()
+        return await _capture_page(page, card_id)
+    finally:
+        await context.close()
+
+
+async def render_player_card_png(
+    card_id: str,
+    browser: Optional[Browser] = None,
+    page: Optional[Page] = None,
+) -> RenderedCard:
+    if page is not None:
+        return await _capture_page(page, card_id)
     if browser is not None:
         return await _capture(browser, card_id)
 

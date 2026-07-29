@@ -31,16 +31,6 @@ def _split_alt_positions(raw: Optional[str]) -> List[str]:
 
 
 def _resolved_cutout_type(row: Dict[str, Any]) -> Optional[str]:
-    """Return the correct FUTBIN cutout layout model.
-
-    Special cutouts use filenames such as p50579499.png and fill the whole
-    252x350 card canvas. Base/icon portrait assets use a plain numeric filename
-    such as 1183.png and render in FUTBIN's 162x162 portrait box.
-
-    The URL shape is used as a defensive fallback because older/stored rows can
-    carry a missing or incorrect card_cutout_type even when the live image URL
-    itself is unambiguous.
-    """
     cutout_url = str(row.get("card_cutout_image") or "")
     filename = urlparse(cutout_url).path.rsplit("/", 1)[-1].lower()
 
@@ -98,8 +88,10 @@ async def get_player_card_render_data(
 
 class BackfillRequest(BaseModel):
     mode: str = "missing"
-    limit: int = 200
-    concurrency: int = 1
+    # This is now a safety ceiling, not a manual batch size. The default is
+    # deliberately large enough to drain the complete FC26 catalogue.
+    limit: int = 50_000
+    concurrency: int = 3
     force: bool = False
 
 
@@ -110,14 +102,18 @@ async def start_player_card_backfill(
 ):
     if payload.mode not in ("missing", "stale"):
         raise HTTPException(status_code=400, detail="mode must be 'missing' or 'stale'")
-    if not (1 <= payload.limit <= 2000):
-        raise HTTPException(status_code=400, detail="limit must be between 1 and 2000")
+    if not (1 <= payload.limit <= 50_000):
+        raise HTTPException(status_code=400, detail="limit must be between 1 and 50000")
     if not (1 <= payload.concurrency <= 4):
         raise HTTPException(status_code=400, detail="concurrency must be between 1 and 4 (Chromium is heavy)")
 
     pool = await get_player_pool()
     return await start_backfill(
-        pool, mode=payload.mode, limit=payload.limit, concurrency=payload.concurrency, force=payload.force
+        pool,
+        mode=payload.mode,
+        limit=payload.limit,
+        concurrency=payload.concurrency,
+        force=payload.force,
     )
 
 

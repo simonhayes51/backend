@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 import asyncpg
-from playwright.async_api import Browser
+from playwright.async_api import Browser, Page
 
 from app.services.object_storage import upload_png
 from app.services.player_card_data import fetch_player_render_data
@@ -27,17 +27,7 @@ from app.services.player_card_render import (
 
 logger = logging.getLogger("player_card_generation")
 
-# A 'generating' row older than this is treated as abandoned (crashed
-# worker, killed request) rather than a real in-flight job, so it doesn't
-# permanently wedge that card out of ever being regenerated again.
 _STALE_GENERATING_AFTER_SECONDS = 5 * 60
-
-# One lock per card_id, scoped to this process - enough to stop N
-# concurrent admin clicks (or a bulk run overlapping an admin click) on the
-# *same* card from launching N simultaneous Chromium instances for it.
-# Cross-process de-duplication isn't attempted (no queue/advisory lock)
-# because generation is admin-triggered/bulk-script-triggered, not a public
-# hot path where cross-process races are expected in practice.
 _locks: Dict[str, asyncio.Lock] = {}
 
 
@@ -90,6 +80,7 @@ async def ensure_generated_player_card(
     card_id: str,
     force: bool = False,
     browser: Optional[Browser] = None,
+    page: Optional[Page] = None,
 ) -> Dict[str, Any]:
     async with _lock_for(str(card_id)):
         async with pool.acquire() as conn:
@@ -106,10 +97,6 @@ async def ensure_generated_player_card(
                 generating_is_stale = age > _STALE_GENERATING_AFTER_SECONDS
 
             if not force and is_generating and not generating_is_stale:
-                # Another request is already generating this exact card
-                # right now (different process, so the in-process lock
-                # above didn't catch it) - don't pile on a second Chromium
-                # launch, just report the in-progress state honestly.
                 return _public_result(player_row, generated=False)
 
             up_to_date = (
@@ -124,14 +111,14 @@ async def ensure_generated_player_card(
             await _mark_status(conn, card_id, "generating")
 
         try:
-            rendered = await render_player_card_png(card_id, browser=browser)
+            rendered = await render_player_card_png(card_id, browser=browser, page=page)
         except PlayerCardRenderError as exc:
             logger.error("Card %s render failed: %s", card_id, exc)
             async with pool.acquire() as conn:
                 await _mark_status(conn, card_id, "error", str(exc)[:2000])
                 row = await fetch_player_render_data(conn, card_id)
             return _public_result(row, generated=False)
-        except Exception as exc:  # unexpected - still record, still don't lose the old URL
+        except Exception as exc:
             logger.exception("Card %s render raised an unexpected error", card_id)
             async with pool.acquire() as conn:
                 await _mark_status(conn, card_id, "error", f"Unexpected error: {exc}"[:2000])
@@ -175,10 +162,6 @@ async def ensure_generated_player_card(
                     str(card_id), image_url, key, current_hash, rendered.width, rendered.height,
                 )
         except Exception:
-            # The object landed in the bucket but the DB write failed - log
-            # everything needed to find and either retry-link or garbage
-            # collect the orphaned object by hand; never invent a fake
-            # success response.
             logger.error(
                 "Card %s: PNG uploaded to key=%s hash=%s but the DB update failed - orphaned object",
                 card_id, key, current_hash,
