@@ -5,7 +5,6 @@ import json
 from typing import Any, Dict
 
 from fastapi import APIRouter, HTTPException, Query, Request
-
 from app.auth.entitlements import require_feature
 
 router = APIRouter(tags=["v2-recommendations"])
@@ -32,11 +31,13 @@ def _row_to_dict(row) -> Dict[str, Any]:
         d["computed_at"] = d["computed_at"].isoformat()
     if d.get("expected_net_roi") is None and "expected_net_roi_source" not in d:
         d["expected_net_roi_source"] = "unavailable_until_validated_model"
+    # One canonical public name for every consumer.
+    d["display_name"] = d.get("display_name") or d.get("nickname") or d.get("card_name") or d.get("name")
     return d
 
 
 _PLAYER_COLUMNS = """
-    p.name, p.rating, p.version, p.position, p.image_url,
+    p.name, p.display_name, p.nickname, p.rating, p.version, p.position, p.image_url,
     p.card_bg_image, p.card_cutout_image, p.card_cutout_type, p.card_name,
     p.generated_card_url, p.generated_card_status,
     p.nation_image, p.league_image, p.club_image,
@@ -47,11 +48,12 @@ _PLAYER_COLUMNS = """
 @router.get("/players/{card_id}/recommendation")
 async def get_player_recommendation(card_id: int, request: Request) -> Dict[str, Any]:
     await require_feature("ai_recommendations")(request)
-    pool = _player_pool(request)
-    async with pool.acquire() as conn:
+    async with _player_pool(request).acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT * FROM recommendations_latest WHERE card_id = $1 AND platform = 'ps'",
-            card_id,
+            f"""SELECT r.*, {_PLAYER_COLUMNS}
+            FROM recommendations_latest r
+            LEFT JOIN fut_players p ON p.card_id=r.card_id
+            WHERE r.card_id=$1 AND r.platform='ps'""", card_id,
         )
     if not row:
         raise HTTPException(404, "No recommendation computed for this card yet")
@@ -59,57 +61,27 @@ async def get_player_recommendation(card_id: int, request: Request) -> Dict[str,
 
 
 @router.get("/recommendations/card-images")
-async def generated_card_images(
-    request: Request,
-    card_ids: str = Query("", description="Comma-separated card IDs"),
-) -> Dict[str, Any]:
-    """Return the latest saved transparent card PNGs for a dashboard batch.
-
-    This stays ungated because it contains artwork only, not recommendation
-    logic. It lets compact dashboard lists use the already-generated image
-    instead of rebuilding card layers in the browser or making one request
-    per player.
-    """
+async def generated_card_images(request: Request, card_ids: str = Query("")) -> Dict[str, Any]:
     ids = []
     for raw in card_ids.split(","):
-        raw = raw.strip()
-        if not raw:
-            continue
         try:
-            ids.append(int(raw))
+            if raw.strip(): ids.append(int(raw.strip()))
         except ValueError:
-            continue
+            pass
     ids = list(dict.fromkeys(ids))[:100]
-    if not ids:
-        return {"images": {}}
-
+    if not ids: return {"images": {}}
     async with _player_pool(request).acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT card_id, generated_card_url
-            FROM fut_players
-            WHERE card_id = ANY($1::bigint[])
-              AND generated_card_status = 'ready'
-              AND generated_card_url IS NOT NULL
-            """,
-            ids,
-        )
+        rows = await conn.fetch("""SELECT card_id, generated_card_url FROM fut_players
+            WHERE card_id=ANY($1::bigint[]) AND generated_card_status='ready'
+            AND generated_card_url IS NOT NULL""", ids)
     return {"images": {str(r["card_id"]): r["generated_card_url"] for r in rows}}
 
 
 async def _feed(pool, where: str, order: str, limit: int) -> Dict[str, Any]:
     async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            f"""
-            SELECT r.*, {_PLAYER_COLUMNS}
-            FROM recommendations_latest r
-            LEFT JOIN fut_players p ON p.card_id = r.card_id
-            WHERE {where}
-            ORDER BY {order}
-            LIMIT $1
-            """,
-            limit,
-        )
+        rows = await conn.fetch(f"""SELECT r.*, {_PLAYER_COLUMNS}
+            FROM recommendations_latest r LEFT JOIN fut_players p ON p.card_id=r.card_id
+            WHERE {where} ORDER BY {order} LIMIT $1""", limit)
     items = [_row_to_dict(r) for r in rows]
     return {"items": items, "count": len(items)}
 
@@ -117,82 +89,70 @@ async def _feed(pool, where: str, order: str, limit: int) -> Dict[str, Any]:
 @router.get("/recommendations/opportunities")
 async def opportunities(request: Request, limit: int = Query(20, ge=1, le=100)) -> Dict[str, Any]:
     await require_feature("opportunity_feed")(request)
-    return await _feed(_player_pool(request), "r.status = 'BUY'", "r.confidence DESC NULLS LAST", limit)
+    return await _feed(_player_pool(request), "r.status='BUY'", "r.confidence DESC NULLS LAST", limit)
 
 
 @router.get("/recommendations/high-confidence")
-async def high_confidence(
-    request: Request,
-    limit: int = Query(20, ge=1, le=100),
-    min_confidence: float = Query(70, ge=0, le=100),
-) -> Dict[str, Any]:
+async def high_confidence(request: Request, limit: int=Query(20,ge=1,le=100), min_confidence: float=Query(70,ge=0,le=100)) -> Dict[str,Any]:
     await require_feature("opportunity_feed")(request)
-    pool = _player_pool(request)
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            f"""
-            SELECT r.*, {_PLAYER_COLUMNS}
-            FROM recommendations_latest r
-            LEFT JOIN fut_players p ON p.card_id = r.card_id
-            WHERE r.status = 'BUY' AND r.confidence >= $1
-            ORDER BY r.confidence DESC NULLS LAST
-            LIMIT $2
-            """,
-            min_confidence, limit,
-        )
-    items = [_row_to_dict(r) for r in rows]
-    return {"items": items, "count": len(items)}
+    async with _player_pool(request).acquire() as conn:
+        rows=await conn.fetch(f"""SELECT r.*, {_PLAYER_COLUMNS} FROM recommendations_latest r
+        LEFT JOIN fut_players p ON p.card_id=r.card_id WHERE r.status='BUY' AND r.confidence >= $1
+        ORDER BY r.confidence DESC NULLS LAST LIMIT $2""",min_confidence,limit)
+    items=[_row_to_dict(r) for r in rows]
+    return {"items":items,"count":len(items)}
 
 
 @router.get("/recommendations/avoid")
-async def avoid(request: Request, limit: int = Query(20, ge=1, le=100)) -> Dict[str, Any]:
+async def avoid(request: Request, limit: int=Query(20,ge=1,le=100)) -> Dict[str,Any]:
     await require_feature("opportunity_feed")(request)
-    return await _feed(_player_pool(request), "r.status = 'AVOID'", "r.computed_at DESC", limit)
+    return await _feed(_player_pool(request),"r.status='AVOID'","r.computed_at DESC",limit)
 
 
-_STRATEGY_ORDER: Dict[str, str] = {
-    "quick_flip": "r.score_liquidity DESC NULLS LAST, r.likely_net_roi DESC NULLS LAST, r.score_confidence DESC NULLS LAST",
-    "swing_trade": "r.likely_net_roi DESC NULLS LAST, r.score_confidence DESC NULLS LAST",
-    "low_risk": "r.score_confidence DESC NULLS LAST, r.score_risk ASC NULLS LAST, r.conservative_net_roi DESC NULLS LAST",
-    "long_hold": "r.bullish_net_roi DESC NULLS LAST, r.score_momentum DESC NULLS LAST, r.score_confidence DESC NULLS LAST",
-    "lazy_buyer": "r.score_liquidity DESC NULLS LAST, r.likely_net_roi DESC NULLS LAST",
-    "sbc": "r.likely_net_roi DESC NULLS LAST",
+_STRATEGY_ORDER: Dict[str,str] = {
+ "quick_flip":"r.score_liquidity DESC NULLS LAST, r.likely_net_roi DESC NULLS LAST, r.score_confidence DESC NULLS LAST",
+ "swing_trade":"r.likely_net_roi DESC NULLS LAST, r.score_momentum DESC NULLS LAST, r.score_confidence DESC NULLS LAST",
+ "low_risk":"r.score_risk ASC NULLS LAST, r.score_confidence DESC NULLS LAST, r.conservative_net_roi DESC NULLS LAST",
+ "long_hold":"r.score_momentum DESC NULLS LAST, r.bullish_net_roi DESC NULLS LAST, r.score_confidence DESC NULLS LAST",
+ "lazy_buyer":"r.score_liquidity DESC NULLS LAST, r.likely_net_roi DESC NULLS LAST",
+ "sbc":"COALESCE((r.strategy_results->'sbc'->>'score')::numeric,0) DESC, r.likely_net_roi DESC NULLS LAST",
+}
+
+# A strategy should remain useful even while the strict engine is sparse. These
+# fallbacks are deliberately different, not six aliases of Lazy Buyer.
+_STRATEGY_FALLBACK = {
+ "quick_flip":"r.status='BUY' AND r.score_liquidity >= 55 AND r.likely_net_roi > 0",
+ "swing_trade":"r.status='BUY' AND r.score_momentum >= 45 AND r.likely_net_roi >= 3",
+ "low_risk":"r.status='BUY' AND r.score_risk <= 45 AND r.score_confidence >= 55",
+ "long_hold":"r.status='BUY' AND r.score_momentum >= 55 AND r.bullish_net_roi > 0",
+ "lazy_buyer":"r.status='BUY' AND r.score_liquidity >= 45 AND r.likely_net_roi > 0",
+ "sbc":"r.status='BUY' AND (r.market_drivers::text ILIKE '%sbc%' OR r.strategy_results ? 'sbc')",
 }
 
 
 @router.get("/recommendations/highest-likely-roi")
-async def highest_likely_roi(request: Request, limit: int = Query(20, ge=1, le=100)) -> Dict[str, Any]:
+async def highest_likely_roi(request: Request, limit:int=Query(20,ge=1,le=100))->Dict[str,Any]:
     await require_feature("opportunity_feed")(request)
-    return await _feed(
-        _player_pool(request),
-        "r.status = 'BUY' AND jsonb_array_length(r.qualified_strategies) > 0",
-        "r.likely_net_roi DESC NULLS LAST",
-        limit,
-    )
+    return await _feed(_player_pool(request),"r.status='BUY' AND jsonb_array_length(r.qualified_strategies)>0","r.likely_net_roi DESC NULLS LAST",limit)
 
 
 @router.get("/recommendations/strategy/{strategy_name}")
-async def strategy_feed(
-    strategy_name: str,
-    request: Request,
-    limit: int = Query(20, ge=1, le=100),
-) -> Dict[str, Any]:
-    if strategy_name not in _STRATEGY_ORDER:
-        raise HTTPException(404, f"Unknown strategy: {strategy_name}")
+async def strategy_feed(strategy_name:str, request:Request, limit:int=Query(20,ge=1,le=100))->Dict[str,Any]:
+    if strategy_name not in _STRATEGY_ORDER: raise HTTPException(404,f"Unknown strategy: {strategy_name}")
     await require_feature("opportunity_feed")(request)
-    order = _STRATEGY_ORDER[strategy_name]
-    pool = _player_pool(request)
+    order=_STRATEGY_ORDER[strategy_name]
+    pool=_player_pool(request)
     async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            f"""
-            SELECT r.*, {_PLAYER_COLUMNS}
-            FROM recommendations_latest r
-            LEFT JOIN fut_players p ON p.card_id = r.card_id
-            WHERE r.qualified_strategies @> $2::jsonb
-            ORDER BY {order}
-            LIMIT $1
-            """,
-            limit, json.dumps([strategy_name]),
-        )
-    items = [_row_to_dict(r) for r in rows]
-    return {"strategy": strategy_name, "items": items, "count": len(items)}
+        rows=await conn.fetch(f"""SELECT r.*, {_PLAYER_COLUMNS} FROM recommendations_latest r
+          LEFT JOIN fut_players p ON p.card_id=r.card_id
+          WHERE r.qualified_strategies @> $2::jsonb ORDER BY {order} LIMIT $1""",limit,json.dumps([strategy_name]))
+        # Fill a thin strict feed with strategy-specific candidates. Deduplicate in SQL.
+        if len(rows) < limit:
+            existing=[r["card_id"] for r in rows]
+            extra=await conn.fetch(f"""SELECT r.*, {_PLAYER_COLUMNS} FROM recommendations_latest r
+              LEFT JOIN fut_players p ON p.card_id=r.card_id
+              WHERE {_STRATEGY_FALLBACK[strategy_name]} AND NOT (r.card_id=ANY($2::bigint[]))
+              ORDER BY {order} LIMIT $1""",limit-len(rows),existing or [-1])
+            rows=list(rows)+list(extra)
+    items=[_row_to_dict(r) for r in rows]
+    return {"strategy":strategy_name,"items":items,"count":len(items),"strict_count":len(items)-max(0,len(items)-limit)}
