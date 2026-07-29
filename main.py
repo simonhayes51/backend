@@ -979,6 +979,15 @@ app.include_router(v2_router)               # /api/v2/*
 from app.routers.admin import router as admin_router
 app.include_router(admin_router)            # /api/admin/*
 
+# Generated player-card PNGs: admin generate/status + the internal,
+# token-gated render-data route Chromium fetches from (see
+# app/routers/player_cards.py's header comment for the two trust
+# boundaries this file covers).
+from app.routers.player_cards import admin_router as player_cards_admin_router
+from app.routers.player_cards import internal_router as player_cards_internal_router
+app.include_router(player_cards_admin_router)   # /api/admin/player-cards/*
+app.include_router(player_cards_internal_router)  # /api/internal/render/*
+
 # Premium-only — mount at /api/smart-buy
 app.include_router(
     smart_buy_router,
@@ -1524,7 +1533,8 @@ async def get_player_definition(card_id: str):
         SELECT name, rating, version, position, altposition,
                club, nation, league, club_image, nation_image, league_image,
                foot, skill_moves, weak_foot, pace, shooting, passing,
-               dribbling, defending, physicality, accelerate_type, player_url
+               dribbling, defending, physicality, accelerate_type, player_url,
+               generated_card_url, generated_card_at
         FROM fut_players
         WHERE card_id::text = $1
         """,
@@ -1562,6 +1572,8 @@ async def get_player_definition(card_id: str):
             "cutoutImageUrl": layers["cutoutImageUrl"],
             "cutoutType": layers.get("cutoutType"),
             "cardName": layers.get("cardName"),
+            "generatedCardUrl": row["generated_card_url"],
+            "generatedCardAt": row["generated_card_at"].isoformat() if row["generated_card_at"] else None,
         }
     }
 

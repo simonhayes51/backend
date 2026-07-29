@@ -10,5 +10,16 @@ cmds = [
   "/opt/venv/bin/pip install -r requirements.txt"
 ]
 
+# Player-card PNG generation (app/services/player_card_render.py) needs the
+# actual Chromium *browser binary*, not just the playwright Python package
+# (already installed above via requirements.txt) - a separate phase so it
+# runs after and inherits the venv/PATH "install" set up, same pattern as
+# the auto_sync repo's nixpacks.toml uses for its own Playwright worker.
+# --with-deps additionally installs the OS-level shared libraries Chromium
+# needs to actually launch (Railway's base image doesn't have them).
+[phases.playwright]
+dependsOn = ["install"]
+cmds = ["/opt/venv/bin/playwright install --with-deps chromium"]
+
 [start]
 cmd = "/opt/venv/bin/uvicorn main:app --host 0.0.0.0 --port $PORT"

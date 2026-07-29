@@ -438,7 +438,8 @@ async def get_player(card_id: str, conn = Depends(get_player_db)):
                top_chem_style_console, top_chem_style_pc,
                card_bg_image, card_cutout_image, card_cutout_type, card_name, player_url,
                pace, shooting, passing, dribbling, defending, physicality,
-               nation_image, league_image, club_image
+               nation_image, league_image, club_image,
+               generated_card_url, generated_card_at
         FROM fut_players
         WHERE card_id::text = $1
         """,
