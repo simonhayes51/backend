@@ -75,7 +75,7 @@ async def open_trade(request: Request, trade: OpenTrade):
                 recommendation_fair_value, recommendation_snapshot
             ) VALUES (
                 $1,$2,$3,$4,NULL,$5,$6,0,0,$7,$8,$9,$10,
-                $8,NULL,'open',$11,$12,$13,$14,$15,$16,$17,$18,$19
+                $11,NULL,'open',$12,$13,$14,$15,$16,$17,$18,$19,$20
             )""",
             user_id,
             trade.player.strip(),
@@ -87,6 +87,7 @@ async def open_trade(request: Request, trade: OpenTrade):
             bought_at,
             trade_id,
             trade.card_id,
+            bought_at,
             trade.target_sell,
             rec.status if rec else None,
             rec.strategy if rec else None,
