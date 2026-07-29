@@ -12,9 +12,9 @@ import hashlib
 import json
 from typing import Any, Dict
 
-# Bump this on any visual/layout change to the export card template
-# (frontend PlayerCardArt exportMode) or to the fields hashed below.
-PLAYER_CARD_RENDER_VERSION = 1
+# Version 2 switches the PNG route to the dedicated PlayerCardExportArt
+# composition and invalidates the original low-quality generated images.
+PLAYER_CARD_RENDER_VERSION = 2
 
 # Every field that can change what's drawn on the card. Deliberately
 # excludes volatile, non-visible fields (price, price_num, price_updated_at,
