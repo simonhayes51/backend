@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -27,6 +28,27 @@ def _split_alt_positions(raw: Optional[str]) -> List[str]:
     if not raw:
         return []
     return [p for p in _ALT_POSITION_SPLIT_RE.split(raw.strip()) if p]
+
+
+def _resolved_cutout_type(row: Dict[str, Any]) -> Optional[str]:
+    """Return the correct FUTBIN cutout layout model.
+
+    Special cutouts use filenames such as p50579499.png and fill the whole
+    252x350 card canvas. Base/icon portrait assets use a plain numeric filename
+    such as 1183.png and render in FUTBIN's 162x162 portrait box.
+
+    The URL shape is used as a defensive fallback because older/stored rows can
+    carry a missing or incorrect card_cutout_type even when the live image URL
+    itself is unambiguous.
+    """
+    cutout_url = str(row.get("card_cutout_image") or "")
+    filename = urlparse(cutout_url).path.rsplit("/", 1)[-1].lower()
+
+    if filename and re.fullmatch(r"\d+\.png", filename):
+        return "base"
+    if filename.startswith("p") and filename.endswith(".png"):
+        return "special"
+    return row.get("card_cutout_type")
 
 
 @internal_router.get("/render/player-card/{card_id}")
@@ -65,7 +87,7 @@ async def get_player_card_render_data(
             "futbinRating": row.get("futbin_rating"),
             "bgImage": row.get("card_bg_image"),
             "cutoutImage": row.get("card_cutout_image"),
-            "cutoutType": row.get("card_cutout_type"),
+            "cutoutType": _resolved_cutout_type(row),
             "fallbackImage": row.get("image_url"),
             "nationImage": row.get("nation_image"),
             "clubImage": row.get("club_image"),
