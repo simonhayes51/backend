@@ -24,7 +24,28 @@ from app.services.player_card_render import (
 logger = logging.getLogger("player_card_backfill")
 
 VALID_MODES = ("missing", "stale")
+VALID_CARD_GROUPS = ("all", "special", "gold", "silver", "bronze")
 DEFAULT_MAX_CARDS = 50_000
+
+# A special card normally has card_cutout_type='special'. Older imported rows
+# can have that field blank, so the p*.png cutout filename is used as a safe
+# fallback. Base cards use a numeric cutout filename.
+_SPECIAL_SQL = """(
+    LOWER(COALESCE(card_cutout_type, '')) = 'special'
+    OR COALESCE(card_cutout_image, '') ~* '/p[^/]*\\.png(?:\\?.*)?$'
+)"""
+
+
+def _group_sql(card_group: str) -> str:
+    if card_group == "special":
+        return _SPECIAL_SQL
+    if card_group == "gold":
+        return f"NOT {_SPECIAL_SQL} AND COALESCE(rating, 0) >= 75"
+    if card_group == "silver":
+        return f"NOT {_SPECIAL_SQL} AND COALESCE(rating, 0) BETWEEN 65 AND 74"
+    if card_group == "bronze":
+        return f"NOT {_SPECIAL_SQL} AND COALESCE(rating, 0) < 65"
+    return "TRUE"
 
 
 async def candidate_card_ids(
@@ -32,37 +53,31 @@ async def candidate_card_ids(
     mode: str,
     limit: int = DEFAULT_MAX_CARDS,
     player_id: Optional[str] = None,
+    card_group: str = "all",
 ) -> List[str]:
-    """Return the complete work list for this run, up to a generous safety cap.
-
-    The previous implementation treated limit as a small batch and stopped at
-    2,000, which forced an admin to keep restarting the same job. A run now
-    drains the eligible backlog in one go; limit is only a safety ceiling.
-    """
+    """Return the filtered work list for this run, up to the safety cap."""
     if player_id:
         return [player_id]
 
+    group_filter = _group_sql(card_group)
+    if mode == "stale":
+        eligibility = "generated_card_status = 'ready' AND generated_card_hash IS NOT NULL"
+        order_by = "generated_card_at ASC NULLS FIRST"
+    else:
+        eligibility = "(generated_card_url IS NULL OR generated_card_status = 'error')"
+        order_by = "card_id ASC"
+
+    query = f"""
+        SELECT card_id
+        FROM fut_players
+        WHERE {eligibility}
+          AND ({group_filter})
+        ORDER BY {order_by}
+        LIMIT $1
+    """
+
     async with pool.acquire() as conn:
-        if mode == "stale":
-            rows = await conn.fetch(
-                """
-                SELECT card_id FROM fut_players
-                WHERE generated_card_status = 'ready' AND generated_card_hash IS NOT NULL
-                ORDER BY generated_card_at ASC NULLS FIRST
-                LIMIT $1
-                """,
-                limit,
-            )
-        else:
-            rows = await conn.fetch(
-                """
-                SELECT card_id FROM fut_players
-                WHERE generated_card_url IS NULL OR generated_card_status = 'error'
-                ORDER BY card_id ASC
-                LIMIT $1
-                """,
-                limit,
-            )
+        rows = await conn.fetch(query, limit)
     return [str(r["card_id"]) for r in rows]
 
 
@@ -109,6 +124,7 @@ async def start_backfill(
     limit: int = DEFAULT_MAX_CARDS,
     concurrency: int = 3,
     force: bool = False,
+    card_group: str = "all",
 ) -> Dict[str, Any]:
     if _state.get("running"):
         return {"ok": False, "already_running": True, **_state}
@@ -119,6 +135,7 @@ async def start_backfill(
             "running": True,
             "phase": "selecting",
             "mode": mode,
+            "card_group": card_group,
             "limit": limit,
             "concurrency": concurrency,
             "force": force,
@@ -135,7 +152,7 @@ async def start_backfill(
         }
     )
 
-    card_ids = await candidate_card_ids(pool, mode, limit)
+    card_ids = await candidate_card_ids(pool, mode, limit, card_group=card_group)
     if mode == "stale":
         _state["phase"] = "checking_stale"
         card_ids = await _filter_stale(pool, card_ids)
