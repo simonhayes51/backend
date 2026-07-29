@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
@@ -44,20 +45,38 @@ class PlayerCardNotFoundError(RuntimeError):
 
 
 def _storage_key(card_id: str, render_hash: str) -> str:
-    return f"fc26/generated-player-cards/{card_id}/{render_hash[:16]}.png"
+    """Return an immutable, unique object key for every actual render.
+
+    R2 objects are served with a one-year immutable cache header. Reusing a key
+    during force regeneration therefore leaves browsers/CDNs showing the old
+    pixels. A short random revision makes every successful render a new URL
+    while retaining the card id and render hash for traceability.
+    """
+    revision = secrets.token_hex(6)
+    return f"fc26/generated-player-cards/{card_id}/{render_hash[:16]}-{revision}.png"
+
+
+def _versioned_url(url: Optional[str], generated_at: Optional[datetime]) -> Optional[str]:
+    """Cache-bust legacy rows whose object key was overwritten in place."""
+    if not url or not generated_at:
+        return url
+    separator = "&" if "?" in url else "?"
+    version = int(generated_at.timestamp() * 1000)
+    return f"{url}{separator}v={version}"
 
 
 def _public_result(row: Dict[str, Any], generated: bool) -> Dict[str, Any]:
+    generated_at = row.get("generated_card_at")
     return {
         "ok": True,
         "generated": generated,
-        "imageUrl": row.get("generated_card_url"),
+        "imageUrl": _versioned_url(row.get("generated_card_url"), generated_at),
         "hash": row.get("generated_card_hash"),
         "width": row.get("generated_card_width"),
         "height": row.get("generated_card_height"),
         "status": row.get("generated_card_status"),
         "error": row.get("generated_card_error"),
-        "generatedAt": row["generated_card_at"].isoformat() if row.get("generated_card_at") else None,
+        "generatedAt": generated_at.isoformat() if generated_at else None,
     }
 
 
