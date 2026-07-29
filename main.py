@@ -70,6 +70,7 @@ from app.services.fair_value import refresher_loop as fair_value_refresher_loop
 from app.services.event_impact import refresher_loop as event_impact_refresher_loop
 from app.services.analytics_engine import refresher_loop as analytics_engine_refresher_loop
 from app.services.recommendation_engine import refresher_loop as recommendation_engine_refresher_loop
+from app.services.recommendation_engine_v2 import refresher_loop_v2 as recommendation_engine_v2_refresher_loop
 
 
 # ----------------- BOOTSTRAP -----------------
@@ -493,13 +494,28 @@ async def lifespan(app: FastAPI):
     )
     logging.info("✅ Analytics Engine refresher started (poll every %ss)", analytics_poll)
 
-    # AI Recommendation Engine: rule_v1, self-synchronized on
-    # card_scores_latest's watermark (needs scores to exist first).
+    # AI Recommendation Engine. RECOMMENDATION_ENGINE_VERSION selects
+    # which engine actually writes `recommendations` - defaults to
+    # rule_v1_2 (the tax-aware engine; see app/services/
+    # recommendation_engine_v2.py) now that it exists and is verified.
+    # rule_v1 (recommendation_engine.py's RuleV1Strategy) is left
+    # selectable via this same env var for rollback - a config change,
+    # not a destructive cutover, per the working rules this was built
+    # under. rule_v1's own bug (see recommendation_engine_v2.py's module
+    # docstring for the exact line reference) is why rule_v1_2 exists and
+    # is now the default rather than an opt-in.
+    recommendation_engine_version = os.getenv("RECOMMENDATION_ENGINE_VERSION", "rule_v1_2")
     recommendation_poll = int(os.getenv("RECOMMENDATION_ENGINE_POLL_SECONDS", "60"))
-    app.state.recommendation_engine_task = asyncio.create_task(
-        recommendation_engine_refresher_loop(pool, player_pool, recommendation_poll)
-    )
-    logging.info("✅ Recommendation Engine refresher started (poll every %ss)", recommendation_poll)
+    if recommendation_engine_version == "rule_v1":
+        app.state.recommendation_engine_task = asyncio.create_task(
+            recommendation_engine_refresher_loop(pool, player_pool, recommendation_poll)
+        )
+        logging.info("✅ Recommendation Engine refresher started: rule_v1 (poll every %ss)", recommendation_poll)
+    else:
+        app.state.recommendation_engine_task = asyncio.create_task(
+            recommendation_engine_v2_refresher_loop(player_pool, recommendation_poll)
+        )
+        logging.info("✅ Recommendation Engine refresher started: rule_v1_2 (poll every %ss)", recommendation_poll)
 
     # The "social trading features" users-table ALTER/index block that used
     # to run here is now part of migrations/015_consolidate_core_bootstrap.sql

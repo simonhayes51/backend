@@ -27,6 +27,7 @@ INSUFFICIENT_DATA / MISSING_HELD_COST_BASIS rather than guessing.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -634,3 +635,68 @@ async def _persist(conn: asyncpg.Connection, r: EvaluationResult) -> int:
         r.incremental_hold_value, r.requested_by, r.champion_source, r.model_version,
     )
     return int(row["id"])
+
+
+# =============================================================================
+# Batch runner + self-synchronizing refresher loop - mirrors
+# recommendation_engine.py's run_pass()/refresher_loop() shape so this
+# can be wired into main.py as a drop-in alternative (selected by the
+# RECOMMENDATION_ENGINE_VERSION env var, not a destructive replacement).
+# Unlike rule_v1, this engine computes its own scores directly from
+# fair_value_mv/sales_history/bin_history rather than depending on
+# analytics_engine's card_scores_latest, so it self-synchronizes on
+# fair_value_mv's own computed_at watermark instead.
+# =============================================================================
+
+MIN_SALES_24H_FLOOR = 3  # same floor as recommendation_engine.py's rule_v1
+
+
+async def run_pass_v2(player_pool: asyncpg.Pool, *, requested_by: str = "scheduled") -> int:
+    """One pass over every card with enough liquidity to evaluate.
+    Returns the number of evaluations written."""
+    written = 0
+    async with player_pool.acquire() as conn:
+        candidates = await conn.fetch(
+            """
+            SELECT card_id
+            FROM fair_value_mv
+            WHERE sales_24h >= $1 AND NOT data_quality_suspect
+            """,
+            MIN_SALES_24H_FLOOR,
+        )
+
+    for row in candidates:
+        card_id = row["card_id"]
+        async with player_pool.acquire() as conn:
+            try:
+                result = await evaluate_card(conn, card_id, requested_by=requested_by)
+                if result is not None:
+                    written += 1
+            except Exception:
+                log.exception("recommendation_engine_v2: evaluation failed for card_id=%s", card_id)
+
+    async with player_pool.acquire() as conn:
+        got = await conn.fetchval("SELECT pg_try_advisory_lock($1)", 7741007)  # distinct lock key
+        if got:
+            try:
+                await conn.execute("REFRESH MATERIALIZED VIEW CONCURRENTLY recommendations_latest")
+            finally:
+                await conn.execute("SELECT pg_advisory_unlock($1)", 7741007)
+
+    return written
+
+
+async def refresher_loop_v2(player_pool: asyncpg.Pool, poll_seconds: int = 60) -> None:
+    await asyncio.sleep(12)
+    last_watermark: Optional[datetime] = None
+    while True:
+        try:
+            async with player_pool.acquire() as conn:
+                watermark = await conn.fetchval("SELECT max(computed_at) FROM fair_value_mv")
+            if watermark and watermark != last_watermark:
+                n = await run_pass_v2(player_pool)
+                log.info("recommendation_engine_v2 pass: %d evaluations written", n)
+                last_watermark = watermark
+        except Exception as e:  # never let the loop die
+            log.error("recommendation_engine_v2 refresher iteration failed: %s", e)
+        await asyncio.sleep(poll_seconds)
