@@ -1,19 +1,4 @@
 # app/services/player_card_render.py
-#
-# Server-side "flatten the live PlayerCardArt component into one
-# transparent PNG" renderer. There's no headless-browser usage anywhere
-# else in this repo (confirmed: no playwright/puppeteer/selenium) and the
-# frontend is a Vite SPA with no server runtime of its own (no Next.js
-# API routes/RSC to host a renderer inside), so the only way to reuse the
-# *actual* React component - rather than reimplementing the card visually
-# a second time in Python/Pillow - is to point real Chromium at the
-# deployed frontend's own internal render route and screenshot just that
-# one element.
-#
-# Unlike auto_sync's futbin_sbc_sync.py (which needs headed Chromium +
-# Xvfb because FUTBIN's Cloudflare blocks headless requests from Railway's
-# IP range), this navigates to our *own* frontend, so plain headless
-# Chromium is fine - no Xvfb, no anti-bot fingerprinting concerns.
 from __future__ import annotations
 
 import logging
@@ -28,21 +13,15 @@ from app.services.player_card_token import make_render_token
 
 logger = logging.getLogger("player_card_render")
 
-# CSS pixel canvas. Chosen to match PlayerCardArt's own default aspect
-# ratio (0.75, i.e. width/height - see cardAspect's useState default in
-# PlayerCardArt.jsx) so exportMode doesn't distort the card versus its
-# live on-screen proportions, close to a FUTBIN mobile standalone export's
-# ~435x576 (0.755) without introducing an odd, non-round pixel size.
-EXPORT_WIDTH = 432
-EXPORT_HEIGHT = 576
-# 2x device scale -> 864x1152 actual PNG output, crisp on high-DPI
-# surfaces without the layout ever having to know about scaling.
+# Exact measured FUTBIN large-card wrapper: 252px wide, 350px artwork,
+# 354.8px total wrapper height. DPR 2 produces a crisp 504x710 PNG.
+EXPORT_WIDTH = 252
+EXPORT_HEIGHT = 355
 EXPORT_DEVICE_SCALE = 2
 
 _FRONTEND_URL = os.getenv("FRONTEND_URL", "https://app.futhub.co.uk").rstrip("/")
 _NAV_TIMEOUT_MS = int(os.getenv("PLAYER_CARD_RENDER_TIMEOUT_MS", "20000"))
 _READY_TIMEOUT_MS = int(os.getenv("PLAYER_CARD_READY_TIMEOUT_MS", "15000"))
-
 _EXPORT_SELECTOR = "[data-player-card-export]"
 
 
@@ -58,9 +37,6 @@ class RenderedCard:
 
 
 def _png_dimensions(data: bytes) -> tuple[int, int]:
-    """Reads width/height straight out of the IHDR chunk - no Pillow
-    dependency exists anywhere in this repo, and we only need two ints,
-    not general image decoding."""
     if len(data) < 24 or data[:8] != b"\x89PNG\r\n\x1a\n":
         raise PlayerCardRenderError("Screenshot buffer is not a valid PNG")
     width, height = struct.unpack(">II", data[16:24])
@@ -110,11 +86,6 @@ async def _capture(browser: Browser, card_id: str) -> RenderedCard:
 
 
 async def render_player_card_png(card_id: str, browser: Optional[Browser] = None) -> RenderedCard:
-    """Renders one card's export PNG. Pass an already-launched `browser` to
-    reuse it across many cards (the bulk script does this - see
-    scripts/generate_player_cards.py); omit it for a single ad-hoc
-    generation (the admin API route does this), in which case a Chromium
-    instance is launched and closed just for this one call."""
     if browser is not None:
         return await _capture(browser, card_id)
 
