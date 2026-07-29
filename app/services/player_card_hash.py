@@ -5,7 +5,7 @@ import hashlib
 import json
 from typing import Any, Dict
 
-PLAYER_CARD_RENDER_VERSION = 6
+PLAYER_CARD_RENDER_VERSION = 7
 
 _HASHED_FIELDS = (
     "card_id",
