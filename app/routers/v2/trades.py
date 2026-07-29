@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
@@ -61,6 +62,7 @@ async def open_trade(request: Request, trade: OpenTrade):
     bought_at = trade.bought_at or datetime.now(timezone.utc)
     trade_id = int(bought_at.timestamp() * 1000)
     snapshot: Optional[Dict[str, Any]] = trade.recommendation.model_dump() if trade.recommendation else None
+    snapshot_json = json.dumps(snapshot) if snapshot is not None else None
     rec = trade.recommendation
 
     async with _pool(request).acquire() as conn:
@@ -75,7 +77,7 @@ async def open_trade(request: Request, trade: OpenTrade):
                 recommendation_fair_value, recommendation_snapshot
             ) VALUES (
                 $1,$2,$3,$4,NULL,$5,$6,0,0,$7,$8,$9,$10,
-                $11,NULL,'open',$12,$13,$14,$15,$16,$17,$18,$19,$20
+                $11,NULL,'open',$12,$13,$14,$15,$16,$17,$18,$19,$20::jsonb
             )""",
             user_id,
             trade.player.strip(),
@@ -84,7 +86,7 @@ async def open_trade(request: Request, trade: OpenTrade):
             trade.quantity,
             trade.platform,
             trade.notes or None,
-            bought_at,
+            bought_at.isoformat(),
             trade_id,
             trade.card_id,
             bought_at,
@@ -96,7 +98,7 @@ async def open_trade(request: Request, trade: OpenTrade):
             rec.buy_below if rec else None,
             rec.sell_around if rec else None,
             rec.fair_value if rec else None,
-            snapshot,
+            snapshot_json,
         )
     return {"ok": True, "trade_id": trade_id, "status": "open", "target_sell": trade.target_sell}
 
