@@ -1,36 +1,57 @@
+-- Run this migration against PLAYER_DATABASE_URL only.
 BEGIN;
 
 ALTER TABLE fut_players ADD COLUMN IF NOT EXISTS display_name TEXT;
 
-UPDATE fut_players
-SET display_name = COALESCE(
-  NULLIF(BTRIM(nickname), ''),
-  NULLIF(BTRIM(card_name), ''),
-  NULLIF(BTRIM(CONCAT_WS(' ', first_name, last_name)), ''),
-  NULLIF(BTRIM(name), '')
-)
-WHERE display_name IS NULL OR BTRIM(display_name) = '';
+CREATE TABLE IF NOT EXISTS player_name_overrides (
+  id BIGSERIAL PRIMARY KEY,
+  match_name TEXT,
+  match_card_name TEXT,
+  match_card_id BIGINT,
+  display_name TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CHECK (match_name IS NOT NULL OR match_card_name IS NOT NULL OR match_card_id IS NOT NULL)
+);
 
--- Known EA legal-name/card-name mismatches. Keep these at source so every UI,
--- search result, generated image and notification uses the football name.
-UPDATE fut_players SET display_name='Gilberto Silva', card_name='Gilberto Silva', nickname='Gilberto Silva'
-WHERE name ILIKE '%Aparecido da Silva%' OR card_name ILIKE '%Gilberto Silva%';
-UPDATE fut_players SET display_name='Nico Williams', card_name='Nico Williams', nickname='Nico Williams'
-WHERE name ILIKE '%Nicholas Williams Arthuer%' OR card_name ILIKE '%Nico Williams%';
-UPDATE fut_players SET display_name='Bobby Moore', card_name='Bobby Moore', nickname='Bobby Moore'
-WHERE (name ILIKE '%Robert Frederick Chelsea Moore%' OR (card_name='Moore' AND version ILIKE '%Icon%'));
+CREATE UNIQUE INDEX IF NOT EXISTS uq_player_name_override_card_id
+  ON player_name_overrides(match_card_id) WHERE match_card_id IS NOT NULL;
+
+INSERT INTO player_name_overrides (match_name, display_name)
+VALUES
+  ('Aparecido da Silva', 'Gilberto Silva'),
+  ('Nicholas Williams Arthuer', 'Nico Williams'),
+  ('Robert Frederick Chelsea Moore', 'Bobby Moore')
+ON CONFLICT DO NOTHING;
+
+UPDATE fut_players p
+SET display_name = COALESCE(
+  (
+    SELECT o.display_name
+    FROM player_name_overrides o
+    WHERE (o.match_card_id IS NOT NULL AND o.match_card_id = p.card_id)
+       OR (o.match_name IS NOT NULL AND p.name ILIKE '%' || o.match_name || '%')
+       OR (o.match_card_name IS NOT NULL AND p.card_name ILIKE '%' || o.match_card_name || '%')
+    ORDER BY (o.match_card_id IS NOT NULL) DESC, o.id
+    LIMIT 1
+  ),
+  NULLIF(BTRIM(p.nickname), ''),
+  NULLIF(BTRIM(p.card_name), ''),
+  NULLIF(BTRIM(CONCAT_WS(' ', p.first_name, p.last_name)), ''),
+  NULLIF(BTRIM(p.name), '')
+);
+
+-- Keep the public card fields aligned for known exceptions so legacy screens,
+-- generated card images and search results also receive the canonical name.
+UPDATE fut_players p
+SET card_name = o.display_name,
+    nickname = o.display_name,
+    display_name = o.display_name
+FROM player_name_overrides o
+WHERE (o.match_card_id IS NOT NULL AND o.match_card_id = p.card_id)
+   OR (o.match_name IS NOT NULL AND p.name ILIKE '%' || o.match_name || '%')
+   OR (o.match_card_name IS NOT NULL AND p.card_name ILIKE '%' || o.match_card_name || '%');
 
 CREATE INDEX IF NOT EXISTS idx_fut_players_display_name ON fut_players (LOWER(display_name));
-
-ALTER TABLE trades ADD COLUMN IF NOT EXISTS card_id BIGINT;
-ALTER TABLE trades ADD COLUMN IF NOT EXISTS bought_at TIMESTAMPTZ;
-ALTER TABLE trades ADD COLUMN IF NOT EXISTS sold_at TIMESTAMPTZ;
-ALTER TABLE trades ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'closed';
-ALTER TABLE trades ALTER COLUMN sell DROP NOT NULL;
-
-UPDATE trades SET bought_at=COALESCE(bought_at, timestamp), sold_at=COALESCE(sold_at, timestamp), status='closed'
-WHERE sell IS NOT NULL;
-
-CREATE INDEX IF NOT EXISTS idx_trades_user_status ON trades(user_id, status, bought_at DESC);
+CREATE INDEX IF NOT EXISTS idx_player_name_overrides_match_name ON player_name_overrides (LOWER(match_name));
 
 COMMIT;
