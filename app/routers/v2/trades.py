@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from app.auth.entitlements import compute_entitlements
@@ -139,9 +139,68 @@ async def list_open_trades(request: Request):
     return {"trades": [dict(row) for row in rows], "count": len(rows)}
 
 
+@router.get("/history")
+async def trade_history(request: Request, limit: int = Query(100, ge=1, le=500)):
+    user_id = await _user_id(request)
+    async with _pool(request).acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT * FROM trades WHERE user_id=$1 AND status='closed'
+            ORDER BY sold_at DESC NULLS LAST LIMIT $2""",
+            user_id,
+            limit,
+        )
+    return {"trades": [dict(row) for row in rows], "count": len(rows)}
+
+
+@router.get("/profit-timeline")
+async def profit_timeline(request: Request, days: int = Query(30, ge=7, le=365)):
+    user_id = await _user_id(request)
+    async with _pool(request).acquire() as conn:
+        rows = await conn.fetch(
+            """WITH dates AS (
+                SELECT generate_series(
+                    CURRENT_DATE - ($2::int - 1), CURRENT_DATE, INTERVAL '1 day'
+                )::date AS day
+            ), daily AS (
+                SELECT sold_at::date AS day, SUM(profit)::bigint AS profit
+                FROM trades
+                WHERE user_id=$1 AND status='closed'
+                  AND sold_at >= CURRENT_DATE - ($2::int - 1)
+                GROUP BY sold_at::date
+            )
+            SELECT dates.day, COALESCE(daily.profit, 0)::bigint AS profit,
+                   SUM(COALESCE(daily.profit, 0)) OVER (ORDER BY dates.day)::bigint AS cumulative_profit
+            FROM dates LEFT JOIN daily USING(day)
+            ORDER BY dates.day""",
+            user_id,
+            days,
+        )
+    return {"items": [dict(row) for row in rows]}
+
+
+@router.get("/community/{card_id}")
+async def card_community(card_id: int, request: Request):
+    await _user_id(request)
+    async with _pool(request).acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT
+                COUNT(DISTINCT user_id) AS users_traded,
+                COUNT(*) FILTER (WHERE status='open') AS currently_holding,
+                COUNT(*) FILTER (WHERE status='closed') AS already_sold,
+                ROUND(AVG(buy))::bigint AS average_buy,
+                ROUND(AVG(sell) FILTER (WHERE status='closed'))::bigint AS average_sell
+            FROM trades WHERE card_id=$1""",
+            card_id,
+        )
+    data = dict(row or {})
+    total = int(data.get("currently_holding") or 0) + int(data.get("already_sold") or 0)
+    data["holding_percent"] = round((int(data.get("currently_holding") or 0) / total) * 100, 1) if total else 0
+    data["sold_percent"] = round((int(data.get("already_sold") or 0) / total) * 100, 1) if total else 0
+    return data
+
+
 @router.get("/performance")
 async def trading_performance(request: Request):
-    """Return the user's headline results and strategy accuracy from closed trades."""
     user_id = await _user_id(request)
     async with _pool(request).acquire() as conn:
         summary = await conn.fetchrow(
@@ -167,35 +226,24 @@ async def trading_performance(request: Request):
         )
         strategies = await conn.fetch(
             """
-            SELECT
-              COALESCE(recommendation_strategy, 'Unlabelled') AS strategy,
-              COUNT(*) AS trades,
-              COUNT(*) FILTER (WHERE profit > 0) AS wins,
+            SELECT COALESCE(recommendation_strategy, 'Unlabelled') AS strategy,
+              COUNT(*) AS trades, COUNT(*) FILTER (WHERE profit > 0) AS wins,
               COALESCE(SUM(profit), 0) AS profit,
               COALESCE(AVG((profit::numeric / NULLIF(buy * quantity, 0)) * 100), 0) AS roi
-            FROM trades
-            WHERE user_id=$1 AND status='closed'
-            GROUP BY COALESCE(recommendation_strategy, 'Unlabelled')
-            ORDER BY profit DESC
+            FROM trades WHERE user_id=$1 AND status='closed'
+            GROUP BY COALESCE(recommendation_strategy, 'Unlabelled') ORDER BY profit DESC
             """,
             user_id,
         )
         confidence = await conn.fetch(
             """
-            SELECT
-              CASE
-                WHEN recommendation_confidence >= 80 THEN '80-100'
+            SELECT CASE WHEN recommendation_confidence >= 80 THEN '80-100'
                 WHEN recommendation_confidence >= 60 THEN '60-79'
-                WHEN recommendation_confidence >= 40 THEN '40-59'
-                ELSE '0-39'
-              END AS band,
-              COUNT(*) AS trades,
-              COUNT(*) FILTER (WHERE profit > 0) AS wins,
+                WHEN recommendation_confidence >= 40 THEN '40-59' ELSE '0-39' END AS band,
+              COUNT(*) AS trades, COUNT(*) FILTER (WHERE profit > 0) AS wins,
               COALESCE(AVG(profit), 0) AS average_profit
-            FROM trades
-            WHERE user_id=$1 AND status='closed' AND recommendation_confidence IS NOT NULL
-            GROUP BY 1
-            ORDER BY 1 DESC
+            FROM trades WHERE user_id=$1 AND status='closed' AND recommendation_confidence IS NOT NULL
+            GROUP BY 1 ORDER BY 1 DESC
             """,
             user_id,
         )
