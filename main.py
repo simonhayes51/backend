@@ -71,6 +71,8 @@ from app.services.event_impact import refresher_loop as event_impact_refresher_l
 from app.services.analytics_engine import refresher_loop as analytics_engine_refresher_loop
 from app.services.recommendation_engine import refresher_loop as recommendation_engine_refresher_loop
 from app.services.recommendation_engine_v2 import refresher_loop_v2 as recommendation_engine_v2_refresher_loop
+from app.services.ml_feature_pipeline import refresher_loop as ml_feature_pipeline_refresher_loop
+from app.services.ml_label_filler import refresher_loop as ml_label_filler_refresher_loop
 
 
 # ----------------- BOOTSTRAP -----------------
@@ -517,6 +519,26 @@ async def lifespan(app: FastAPI):
         )
         logging.info("✅ Recommendation Engine refresher started: rule_v1_2 (poll every %ss)", recommendation_poll)
 
+    # ML feature snapshot + label filling pipeline (Recommendation Engine
+    # V1.2 Phase 7). Starts collecting training data now, before any
+    # model exists - see app/services/ml_feature_pipeline.py and
+    # ml_label_filler.py's module docstrings. Genuinely hourly (not
+    # watermark-reactive like the engines above), and independent of
+    # RECOMMENDATION_ENGINE_VERSION - runs regardless of which engine is
+    # live, since it's the rule engine's own gate/score logic
+    # (evaluate()) that's used to derive snapshot eligibility either way.
+    ml_snapshot_poll = int(os.getenv("ML_FEATURE_SNAPSHOT_POLL_SECONDS", "3600"))
+    app.state.ml_feature_pipeline_task = asyncio.create_task(
+        ml_feature_pipeline_refresher_loop(player_pool, ml_snapshot_poll)
+    )
+    logging.info("✅ ML feature snapshot pipeline started (poll every %ss)", ml_snapshot_poll)
+
+    ml_label_poll = int(os.getenv("ML_LABEL_FILLER_POLL_SECONDS", "3600"))
+    app.state.ml_label_filler_task = asyncio.create_task(
+        ml_label_filler_refresher_loop(player_pool, ml_label_poll)
+    )
+    logging.info("✅ ML label filler started (poll every %ss)", ml_label_poll)
+
     # The "social trading features" users-table ALTER/index block that used
     # to run here is now part of migrations/015_consolidate_core_bootstrap.sql
     # (same columns/indexes, applied once via run_on_boot() above).
@@ -533,7 +555,10 @@ async def lifespan(app: FastAPI):
             fv_task.cancel()
             with suppress(asyncio.CancelledError):
                 await fv_task
-        for task_attr in ("event_impact_task", "analytics_engine_task", "recommendation_engine_task"):
+        for task_attr in (
+            "event_impact_task", "analytics_engine_task", "recommendation_engine_task",
+            "ml_feature_pipeline_task", "ml_label_filler_task",
+        ):
             task = getattr(app.state, task_attr, None)
             if task:
                 task.cancel()
