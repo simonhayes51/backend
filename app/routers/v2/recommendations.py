@@ -91,7 +91,10 @@ async def _feed(pool, where: str, order: str, limit: int) -> Dict[str, Any]:
 @router.get("/recommendations/opportunities")
 async def opportunities(request: Request, limit: int = Query(20, ge=1, le=100)) -> Dict[str, Any]:
     await require_feature("opportunity_feed")(request)
-    return await _feed(_player_pool(request), "r.recommendation = 'buy'", "r.confidence DESC", limit)
+    # r.status is the real V1.2 decision field - r.recommendation is only
+    # kept as a derived, deprecated compatibility column (see migration
+    # 024's docstring), so new queries read status directly.
+    return await _feed(_player_pool(request), "r.status = 'BUY'", "r.confidence DESC NULLS LAST", limit)
 
 
 @router.get("/recommendations/high-confidence")
@@ -105,8 +108,8 @@ async def high_confidence(request: Request, limit: int = Query(20, ge=1, le=100)
                    p.card_bg_image, p.card_cutout_image, p.card_cutout_type, p.card_name
             FROM recommendations_latest r
             LEFT JOIN fut_players p ON p.card_id = r.card_id
-            WHERE r.recommendation = 'buy' AND r.confidence >= $1
-            ORDER BY r.confidence DESC
+            WHERE r.status = 'BUY' AND r.confidence >= $1
+            ORDER BY r.confidence DESC NULLS LAST
             LIMIT $2
             """,
             min_confidence, limit,

@@ -33,21 +33,69 @@ router = APIRouter(tags=["v2-dashboard"])
 # not stocks, and isn't assumed to know those terms.
 _STATE_LABEL = {"bullish": "Good Time to Buy", "bearish": "Prices Dropping", "illiquid": "Slow Trading", "normal": "Steady Market"}
 
-# recommendation_engine.py's RuleV1Strategy only ever assigns
-# recommendation in {"buy", "hold", "avoid"} - "hold" really does mean
-# "no strong edge either way, wait" (see its own reasoning text), so
-# WAIT is an accurate rename, not a stronger claim than the data
-# supports. There is no real "sell" signal (avoid means "don't buy
-# this", not "liquidate what you own") - frontend callers that want a
-# SELL slot fall back to AVOID when none exists, same as the reference
-# design's own pickRecommendation() fallback chain.
-_ACTION_LABEL = {"buy": "BUY", "hold": "WAIT", "avoid": "AVOID"}
+# Recommendation Engine V1.2 (recommendation_engine_v2.py) writes a real
+# status enum - BUY/WAIT/SELL/AVOID/INSUFFICIENT_DATA - straight onto
+# `status`. This is now the source of truth; the legacy lowercase
+# `recommendation` column (still written, see _legacy_recommendation())
+# is kept only for callers that haven't migrated off the deprecated
+# shape yet.
+_STATUS_LABEL = {"BUY": "BUY", "WAIT": "WAIT", "SELL": "SELL", "AVOID": "AVOID", "INSUFFICIENT_DATA": "INSUFFICIENT_DATA"}
+
+# Per-strategy nominal holding period, shown once a card actually
+# qualifies for that strategy (see strategy_config.py) - never a single
+# global "holding period" figure. First match in this order wins when a
+# card qualifies for more than one.
+_STRATEGY_HOLDING_LABEL = {
+    "quick_flip": "~24h", "swing_trade": "~48h", "low_risk": "Flexible",
+    "lazy_buyer": "Flexible", "sbc": "Flexible", "long_hold": "~7d",
+}
 
 _FACTOR_LABEL = {
     "discount_vs_fair_value": lambda v: f"Trading {float(v):.1f}% below its real 24h median.",
     "liquidity_sales_per_hour": lambda v: f"{float(v):.1f} sales/hour liquidity.",
     "trend_falling": lambda v: "Price is in a confirmed downward trend, not a discount.",
 }
+
+
+def _holding_period_label(qualified_strategies: List[str]) -> str:
+    for name in _STRATEGY_HOLDING_LABEL:
+        if name in (qualified_strategies or []):
+            return _STRATEGY_HOLDING_LABEL[name]
+    return "Unavailable"
+
+
+def _risk_label(score_risk: Optional[float]) -> str:
+    if score_risk is None:
+        return "Unknown"
+    v = float(score_risk)
+    if v < 0.33:
+        return "Low"
+    if v < 0.66:
+        return "Medium"
+    return "High"
+
+
+def _reasoning_text(status: Optional[str], qualified_strategies: List[str], failed_gate_reasons: List[str], held_decision_reasons: List[str]) -> str:
+    """Short, honest reasoning derived from the real V1.2 decision
+    fields - reasoning/market_drivers on the recommendations row itself
+    are legacy rule_v1 columns the V1.2 engine never populates (see
+    recommendation_engine_v2.py's _persist()), so a blank string there
+    would silently look like a bug rather than "no engine wrote this
+    column." Never claims more than the reason codes actually say."""
+    if status == "BUY":
+        names = ", ".join(s.replace("_", " ") for s in qualified_strategies) or "a strategy"
+        return f"Qualifies for: {names}."
+    if status == "SELL":
+        return "; ".join(held_decision_reasons) or "Selling now looks better than continuing to hold."
+    if status == "AVOID":
+        return "The likely outcome is a net loss after EA's sale tax."
+    if status == "INSUFFICIENT_DATA":
+        if failed_gate_reasons:
+            return "Missing: " + ", ".join(r.replace("_", " ").lower() for r in failed_gate_reasons) + "."
+        return "Not enough live market data yet."
+    if status == "WAIT":
+        return "Doesn't clear any strategy's threshold yet."
+    return ""
 
 
 def _drivers_to_strings(drivers: List[Dict[str, Any]]) -> List[str]:
@@ -83,8 +131,25 @@ def _to_recommendation(d: Dict[str, Any], scores: Optional[Dict[str, float]] = N
     recommendations_latest themselves - every query building `d` LEFT
     JOINs fair_value_mv alongside fut_players so these come through as
     plain keys, live-current rather than a stale scored-at-the-time
-    snapshot."""
+    snapshot.
+
+    `status` (BUY/WAIT/SELL/AVOID/INSUFFICIENT_DATA) is the real V1.2
+    decision; `d` may lack it entirely for synthetic rows that were never
+    evaluated (e.g. the "biggest movers" cards below, which are a raw
+    price-activity signal, not an AI verdict) - `has_evaluation` guards
+    every field that would otherwise fabricate an opinion out of absent
+    data."""
     computed_at = d.get("computed_at")
+    status = d.get("status")
+    has_evaluation = status is not None
+    qualified_strategies = d.get("qualified_strategies") or []
+    failed_gate_reasons = d.get("failed_gate_reasons") or []
+    held_decision_reasons = d.get("held_decision_reasons") or []
+
+    def pct(field: str) -> Optional[float]:
+        v = d.get(field)
+        return float(v) * 100 if v is not None else None
+
     return {
         "cardId": d.get("card_id"),
         "player": {
@@ -113,20 +178,45 @@ def _to_recommendation(d: Dict[str, Any], scores: Optional[Dict[str, float]] = N
             "leagueImage": d.get("league_image"),
             "clubImage": d.get("club_image"),
         },
-        "recommendation": _ACTION_LABEL.get(d.get("recommendation"), "WAIT"),
+        "status": status,
+        "recommendation": _STATUS_LABEL.get(status, "WAIT") if has_evaluation else None,
         "confidence": float(d.get("confidence") or 0),
-        "expectedRoi": float(d["expected_roi_pct"]) if d.get("expected_roi_pct") is not None else None,
-        "holdingPeriod": f"{d['holding_period_days']}d" if d.get("holding_period_days") else "Unavailable",
-        "risk": (d.get("risk_rating") or "medium").capitalize(),
+        # Deprecated alias kept for callers still on the pre-V1.2 shape -
+        # always the after-tax likely-case ROI now (see
+        # recommendation_engine_v2.py's _persist()), never the old
+        # pre-tax discount-as-profit figure. New callers should read
+        # netRoi.likely / netRoi.conservative instead.
+        "expectedRoi": pct("likely_net_roi"),
+        "netRoi": {
+            "conservative": pct("conservative_net_roi"),
+            "likely": pct("likely_net_roi"),
+            "bullish": pct("bullish_net_roi"),
+            "potential": pct("potential_net_roi"),
+        },
+        # Null with an explicit source string until a validated ML model
+        # is promoted - never a fabricated/heuristic prediction (see
+        # migration 024 + trading_math.py's module docstring).
+        "expectedNetRoi": pct("expected_net_roi"),
+        "expectedNetRoiSource": d.get("expected_net_roi_source"),
+        "entryPrice": d.get("entry_price"),
+        "breakEvenPrice": d.get("break_even_sale_price"),
+        "holdingPeriod": _holding_period_label(qualified_strategies) if has_evaluation else "Unavailable",
+        "risk": _risk_label(d.get("score_risk")),
+        "qualifiedStrategies": qualified_strategies,
+        "failedGateReasons": failed_gate_reasons,
         "currentBin": d.get("current_bin"),
         "fairValue": d.get("fair_value_24h"),
         "sales24h": d.get("sales_24h"),
         "sales7d": d.get("sales_7d"),
         "dataQuality": "SUSPECT" if d.get("data_quality_suspect") else ("GOOD" if d.get("sales_24h") else "LIMITED"),
         "updatedAt": computed_at.isoformat() if hasattr(computed_at, "isoformat") else computed_at,
-        "reasoning": d.get("reasoning") or "",
+        "reasoning": _reasoning_text(status, qualified_strategies, failed_gate_reasons, held_decision_reasons) if has_evaluation else "",
         "marketDrivers": _drivers_to_strings(d.get("market_drivers") or []),
         "historicalSimilarEvents": d.get("similar_events") or [],
+        "isHeld": bool(d.get("is_held")),
+        "heldDecision": d.get("held_decision"),
+        "heldDecisionReasons": held_decision_reasons,
+        "purchasePrice": d.get("purchase_price"),
         "scores": scores or {},
         "modelVersion": d.get("engine_version"),
     }
@@ -134,7 +224,10 @@ def _to_recommendation(d: Dict[str, Any], scores: Optional[Dict[str, float]] = N
 
 def _decode_rec_row(r) -> Dict[str, Any]:
     d = dict(r)
-    for key in ("market_drivers", "similar_events", "inputs"):
+    for key in (
+        "market_drivers", "similar_events", "inputs",
+        "qualified_strategies", "strategy_results", "failed_gate_reasons", "held_decision_reasons",
+    ):
         if isinstance(d.get(key), str):
             d[key] = json.loads(d[key])
     return d
@@ -208,8 +301,8 @@ async def get_dashboard(request: Request) -> Dict[str, Any]:
                 FROM recommendations_latest r
                 LEFT JOIN fut_players p ON p.card_id = r.card_id
                 LEFT JOIN fair_value_mv fv ON fv.card_id = r.card_id
-                WHERE r.recommendation = 'buy'
-                ORDER BY r.confidence DESC LIMIT 8
+                WHERE r.status = 'BUY'
+                ORDER BY r.confidence DESC NULLS LAST LIMIT 8
                 """
             )
             avoid_rows = await conn.fetch(
@@ -222,7 +315,7 @@ async def get_dashboard(request: Request) -> Dict[str, Any]:
                 FROM recommendations_latest r
                 LEFT JOIN fut_players p ON p.card_id = r.card_id
                 LEFT JOIN fair_value_mv fv ON fv.card_id = r.card_id
-                WHERE r.recommendation = 'avoid'
+                WHERE r.status = 'AVOID'
                 ORDER BY r.computed_at DESC LIMIT 6
                 """
             )
@@ -284,10 +377,10 @@ async def get_dashboard(request: Request) -> Dict[str, Any]:
             "image_url": m["image_url"], "card_bg_image": m.get("card_bg_image"),
             "card_cutout_image": m.get("card_cutout_image"), "card_cutout_type": m.get("card_cutout_type"),
             "card_name": m.get("card_name"),
-            # Movers are a price-activity signal, not an AI verdict - only
-            # attach a real recommendation if this exact card has one;
-            # never invent a BUY/AVOID call a mover didn't earn.
-            "recommendation": None, "confidence": 0,
+            # Movers are a price-activity signal, not an AI verdict - no
+            # "status" key means _to_recommendation()'s has_evaluation
+            # guard renders recommendation=None rather than inventing a
+            # BUY/AVOID call a mover didn't earn.
         }))
 
     # --- Watchlist alerts: real query against alerts_log. Its writer
