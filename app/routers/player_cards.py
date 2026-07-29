@@ -11,7 +11,11 @@ from pydantic import BaseModel
 
 from app.db import get_player_db, get_player_pool
 from app.routers.admin import require_admin
-from app.services.player_card_backfill import get_backfill_status, start_backfill
+from app.services.player_card_backfill import (
+    VALID_CARD_GROUPS,
+    get_backfill_status,
+    start_backfill,
+)
 from app.services.player_card_data import fetch_player_render_data
 from app.services.player_card_generation import (
     PlayerCardNotFoundError,
@@ -96,6 +100,7 @@ async def get_player_card_render_data(
 
 class BackfillRequest(BaseModel):
     mode: str = "missing"
+    card_group: str = "all"
     limit: int = 50_000
     concurrency: int = 3
     force: bool = False
@@ -108,6 +113,11 @@ async def start_player_card_backfill(
 ):
     if payload.mode not in ("missing", "stale"):
         raise HTTPException(status_code=400, detail="mode must be 'missing' or 'stale'")
+    if payload.card_group not in VALID_CARD_GROUPS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"card_group must be one of: {', '.join(VALID_CARD_GROUPS)}",
+        )
     if not (1 <= payload.limit <= 50_000):
         raise HTTPException(status_code=400, detail="limit must be between 1 and 50000")
     if not (1 <= payload.concurrency <= 4):
@@ -117,6 +127,7 @@ async def start_player_card_backfill(
     return await start_backfill(
         pool,
         mode=payload.mode,
+        card_group=payload.card_group,
         limit=payload.limit,
         concurrency=payload.concurrency,
         force=payload.force,
