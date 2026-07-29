@@ -1,15 +1,4 @@
 # app/routers/player_cards.py
-#
-# Two small, distinct trust boundaries live in this one file:
-#
-#  - GET /api/internal/render/player-card/{card_id}: called by the
-#    frontend's own internal render route, not by end users. Gated by a
-#    short-lived signed token (player_card_token.py) instead of
-#    require_admin, because the caller is headless Chromium with no user
-#    session - see player_card_render.py's header comment for why.
-#
-#  - /api/admin/player-cards/*: gated by the same require_admin dependency
-#    every other admin route in app/routers/admin.py already uses.
 from __future__ import annotations
 
 import re
@@ -57,7 +46,7 @@ async def get_player_card_render_data(
         "data": {
             "cardId": row["card_id"],
             "name": row["name"],
-            "displayName": row.get("card_name") or row["name"],
+            "displayName": row.get("nickname") or row.get("card_name") or row["name"],
             "rating": row["rating"],
             "position": row["position"],
             "altPositions": _split_alt_positions(row.get("altposition")),
@@ -85,16 +74,12 @@ async def get_player_card_render_data(
 
 
 class BackfillRequest(BaseModel):
-    mode: str = "missing"  # "missing" | "stale"
+    mode: str = "missing"
     limit: int = 200
     concurrency: int = 1
     force: bool = False
 
 
-# Registered before /{card_id}/... below: {card_id} is typed as a plain
-# str, so it would otherwise happily "match" the literal segment
-# "backfill" too - same path-ordering gotcha players.py's own comment
-# calls out for /batch/... vs /{card_id}/....
 @admin_router.post("/backfill")
 async def start_player_card_backfill(
     payload: BackfillRequest = BackfillRequest(),

@@ -1,12 +1,6 @@
 # app/services/player_card_data.py
 #
-# Single source of truth for "everything that appears on the rendered
-# player-card PNG" - used by both the render-hash computation (so the hash
-# actually reflects what will be drawn) and the internal render route's
-# data endpoint (so the frontend draws exactly what the hash was computed
-# from). Deliberately a superset of players.py's `/api/players/{card_id}`
-# select plus main.py's `/api/fut-player-definition/{card_id}` select
-# (foot/skill_moves/weak_foot live only in the latter today).
+# Single source of truth for everything drawn on the generated player card.
 from __future__ import annotations
 
 import asyncio
@@ -16,12 +10,10 @@ import asyncpg
 
 from app.futbin_client import fetch_card_layers
 
-# Matches app/routers/v2/players.py's _LIVE_CARD_LAYERS_TIMEOUT rationale:
-# bounded so a slow/blocked futbin.com response can't hang generation.
 _LIVE_CARD_LAYERS_TIMEOUT = 3.0
 
 _SELECT_FIELDS = """
-    card_id, name, card_name, rating, version, position, altposition,
+    card_id, name, nickname, card_name, rating, version, position, altposition,
     pace, shooting, passing, dribbling, defending, physicality,
     skill_moves, weak_foot, foot, accelerate_type,
     image_url, card_bg_image, card_cutout_image, card_cutout_type,
@@ -33,10 +25,6 @@ _SELECT_FIELDS = """
 
 
 async def fetch_player_card_row(conn: asyncpg.Connection, card_id: str) -> Optional[Dict[str, Any]]:
-    """Raw fut_players row (including current generated_card_* state), or
-    None if the card doesn't exist. No live card-layers fallback here -
-    callers that need the render-ready shape should use
-    fetch_player_render_data instead."""
     row = await conn.fetchrow(
         f"SELECT {_SELECT_FIELDS} FROM fut_players WHERE card_id::text = $1",
         str(card_id),
@@ -45,11 +33,6 @@ async def fetch_player_card_row(conn: asyncpg.Connection, card_id: str) -> Optio
 
 
 async def fetch_player_render_data(conn: asyncpg.Connection, card_id: str) -> Optional[Dict[str, Any]]:
-    """Everything the export card needs to draw itself, with the same
-    live-fallback-when-not-backfilled behaviour as the v1/v2 Player Page
-    routes: card_bg_image/card_cutout_image are usually null (the backfill
-    worker was never scheduled - see migration 022's own comment), so fetch
-    them live off player_url when missing, bounded to 3s and exception-safe."""
     row = await fetch_player_card_row(conn, card_id)
     if row is None:
         return None
