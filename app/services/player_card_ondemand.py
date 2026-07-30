@@ -34,7 +34,7 @@ _CLAIM_SQL = """
 async def _run_claimed(pool: asyncpg.Pool, card_id: str) -> None:
     async with _ONDEMAND_SEMAPHORE:
         try:
-            await ensure_generated_player_card(pool, card_id)
+            await ensure_generated_player_card(pool, card_id, already_claimed=True)
         except Exception:
             logger.exception("on-demand card generation failed for card_id=%s", card_id)
 
