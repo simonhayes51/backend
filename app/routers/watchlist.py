@@ -6,13 +6,15 @@
 # app/routes/watchlist.py against a same-named `watchlist` table on the core
 # pool instead - confirmed dead (never imported by main.py) and removed.
 #
-# app/services/watchlist_engine.py + its `watchlist_items` table are a
-# separate, ALSO CURRENTLY DEAD alerting engine: process_price_tick()/
-# watchlist_poll_loop() are defined but never called from anywhere in this
-# repo, so no threshold-alert polling actually runs today. Don't build v2
-# alerting on top of it without first deciding whether to wire it up for
-# real or replace it - and don't add a third "watchlist" concept alongside
-# these two.
+# Threshold alerting (price/liquidity, quiet hours, cool-off, DM +
+# channel fallback) is live today, but not via a separate service module
+# - it's main.py's own /api/watchlist-alerts endpoints + _alerts_poll_loop
+# / _eval_alerts_for_pair, against a `watchlist_alerts` table on this same
+# WATCHLIST_DATABASE_URL pool. app/services/watchlist_engine.py (a
+# near-identical, earlier implementation against a differently-named
+# `watchlist_items` table) was a dead superseded duplicate - never wired
+# up - and has been removed; don't resurrect it or add a third
+# "watchlist" concept alongside these two.
 from __future__ import annotations
 
 import asyncio

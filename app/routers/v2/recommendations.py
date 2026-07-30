@@ -62,6 +62,80 @@ def _needs_card(d: Dict[str, Any]) -> bool:
     return d.get("generated_card_status") != "ready" or bool(d.get("generated_card_flagged"))
 
 
+_TRACK_RECORD_LABEL = {
+    "quick_flip": "Quick Flip",
+    "swing_trade": "Swing Trade",
+    "long_hold": "Long Hold",
+}
+
+# ml_feature_pipeline.py opens one ml_labels row per horizon for every
+# card it snapshots (not just ones a live BUY was issued for), so a raw
+# hit-rate over every label would understate the engine's real accuracy
+# with cards that never would have qualified for a live call in the
+# first place. eligibility_tier='LIVE_ELIGIBLE' is the same hard-gate
+# result the live engine itself would have produced (see
+# ml_feature_pipeline.snapshot_card's would_pass_live_gates), so this is
+# "how did the calls we'd have actually made turn out", not "how did
+# every card in the database do" - see HORIZON_STRATEGY in
+# ml_feature_pipeline.py for the horizon->strategy mapping this mirrors.
+_TRACK_RECORD_MIN_SAMPLE = 20
+
+
+@router.get("/track-record")
+async def track_record(request: Request) -> Dict[str, Any]:
+    """Aggregated, honest hit-rate per strategy from ml_labels - real
+    closed-window outcomes, not a claim invented for marketing copy.
+    Deliberately ungated (no require_feature call): this is a trust
+    signal, and a trust signal only free/prospective users have to take
+    on faith is not doing its job."""
+    pool = _player_pool(request)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+                l.horizon,
+                COUNT(*) FILTER (WHERE l.label_closed_at IS NOT NULL) AS closed_count,
+                COUNT(*) FILTER (WHERE l.label_closed_at IS NOT NULL AND l.target_reached) AS hit_count,
+                AVG(l.strategy_realized_return) FILTER (WHERE l.label_closed_at IS NOT NULL) AS avg_realized_return,
+                MIN(s.snapshot_at) FILTER (WHERE l.label_closed_at IS NOT NULL) AS earliest_snapshot_at,
+                MAX(l.label_closed_at) AS latest_closed_at
+            FROM ml_labels l
+            JOIN ml_feature_snapshots s ON s.id = l.feature_snapshot_id
+            WHERE s.eligibility_tier = 'LIVE_ELIGIBLE'
+              AND s.snapshot_at >= now() - interval '90 days'
+            GROUP BY l.horizon
+            """
+        )
+
+    by_horizon = {r["horizon"]: r for r in rows}
+    strategies = []
+    for horizon, strategy_name in (("24h", "quick_flip"), ("48h", "swing_trade"), ("7d", "long_hold")):
+        r = by_horizon.get(horizon)
+        closed = int(r["closed_count"]) if r else 0
+        hits = int(r["hit_count"]) if r else 0
+        has_enough_data = closed >= _TRACK_RECORD_MIN_SAMPLE
+        strategies.append({
+            "strategy": strategy_name,
+            "label": _TRACK_RECORD_LABEL[strategy_name],
+            "horizon": horizon,
+            "sampleSize": closed,
+            "hasEnoughData": has_enough_data,
+            "hitRatePct": round(100 * hits / closed, 1) if has_enough_data else None,
+            "avgRealizedReturnPct": round(float(r["avg_realized_return"]) * 100, 1) if has_enough_data and r["avg_realized_return"] is not None else None,
+            "windowStart": r["earliest_snapshot_at"].isoformat() if r and r["earliest_snapshot_at"] else None,
+            "windowEnd": r["latest_closed_at"].isoformat() if r and r["latest_closed_at"] else None,
+        })
+
+    return {
+        "strategies": strategies,
+        "methodology": (
+            "Every recommendation the engine could have made is snapshotted and graded against what "
+            "actually happened in the real market afterwards - this is not a backtest or a projection, "
+            "only closed, already-happened outcomes count."
+        ),
+    }
+
+
 @router.get("/players/{card_id}/recommendation")
 async def get_player_recommendation(card_id: int, request: Request) -> Dict[str, Any]:
     await require_feature("ai_recommendations")(request)
