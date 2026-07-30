@@ -1,0 +1,23 @@
+-- Migration 025: card-type/rarity column on fut_players
+-- target: player
+-- requires-table: fut_players
+--
+-- fut_players.version already exists but tracks card EDITION (Normal vs
+-- TOTW/TOTS/Icon/etc promos - see bin_sales_history_sync.py's own
+-- docstring), not the Bronze/Silver/Gold Common/Gold Rare card-type tier.
+-- A `rarity` column already exists on some live deployments (added ad hoc,
+-- outside this migration history - confirmed by grep: no prior migration
+-- in this repo defines it) but is mostly empty, since nothing has ever
+-- written to it. This migration only formalizes the column so schema
+-- history is accurate; it does not populate it - see the new backfill
+-- logic in auto_sync/futbin_card_art_backfill.py, which is the only place
+-- futbin actually exposes this value (the per-card player page's info
+-- row, e.g. "/26/players?version=gold_rare" -> "Gold Rare" - futbin's own
+-- query-param name happens to collide with this schema's unrelated
+-- `version` column, pure naming coincidence). The listing-page crawl
+-- (futbin_full_sync.py) never sees this value at all.
+--
+-- IF NOT EXISTS is a true no-op wherever the column already exists (ad
+-- hoc or otherwise) - never overwrites existing data.
+
+ALTER TABLE fut_players ADD COLUMN IF NOT EXISTS rarity TEXT;
