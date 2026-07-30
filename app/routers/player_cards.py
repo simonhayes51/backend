@@ -203,6 +203,112 @@ async def generate_player_card(
     return result
 
 
+class FlagCardRequest(BaseModel):
+    reason: str
+
+
+@admin_router.post("/{card_id}/flag")
+async def flag_player_card(
+    card_id: str,
+    payload: FlagCardRequest,
+    admin=Depends(require_admin),
+):
+    """Mark a generated card as known-bad (wrong player, face-only crop,
+    etc). Does not reset generated_card_status/url itself - the on-demand
+    claim query (app/services/player_card_ondemand.py) already treats a
+    ready+flagged card as eligible for regeneration on the next request for
+    it, same retry mechanism as an 'error' status, so the currently-served
+    (bad) image stays up until a real replacement is ready."""
+    pool = await get_player_pool()
+    row = await pool.fetchrow(
+        """
+        UPDATE fut_players
+           SET generated_card_flagged = TRUE,
+               generated_card_flag_reason = $2,
+               generated_card_flagged_at = NOW()
+         WHERE card_id::text = $1
+        RETURNING card_id::text AS card_id, generated_card_flagged,
+                  generated_card_flag_reason, generated_card_flagged_at
+        """,
+        str(card_id), payload.reason,
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Player not found")
+    return {
+        "ok": True,
+        "cardId": row["card_id"],
+        "flagged": row["generated_card_flagged"],
+        "flagReason": row["generated_card_flag_reason"],
+        "flaggedAt": row["generated_card_flagged_at"].isoformat() if row["generated_card_flagged_at"] else None,
+    }
+
+
+@admin_router.post("/{card_id}/unflag")
+async def unflag_player_card(
+    card_id: str,
+    admin=Depends(require_admin),
+):
+    pool = await get_player_pool()
+    row = await pool.fetchrow(
+        """
+        UPDATE fut_players
+           SET generated_card_flagged = FALSE,
+               generated_card_flag_reason = NULL,
+               generated_card_flagged_at = NULL
+         WHERE card_id::text = $1
+        RETURNING card_id::text AS card_id
+        """,
+        str(card_id),
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Player not found")
+    return {"ok": True, "cardId": row["card_id"], "flagged": False}
+
+
+@admin_router.get("/flagged")
+async def list_flagged_player_cards(
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    admin=Depends(require_admin),
+):
+    """Paginated review queue of currently-flagged cards for admin tooling /
+    the frontend admin tab."""
+    pool = await get_player_pool()
+    async with pool.acquire() as conn:
+        total = await conn.fetchval(
+            "SELECT COUNT(*) FROM fut_players WHERE generated_card_flagged = TRUE"
+        )
+        rows = await conn.fetch(
+            """
+            SELECT card_id::text AS card_id, name, generated_card_url,
+                   generated_card_status, generated_card_flag_reason,
+                   generated_card_flagged_at
+              FROM fut_players
+             WHERE generated_card_flagged = TRUE
+             ORDER BY generated_card_flagged_at DESC NULLS LAST
+             LIMIT $1 OFFSET $2
+            """,
+            limit, offset,
+        )
+    return {
+        "ok": True,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "items": [
+            {
+                "cardId": r["card_id"],
+                "name": r["name"],
+                "imageUrl": r["generated_card_url"],
+                "status": r["generated_card_status"],
+                "flagReason": r["generated_card_flag_reason"],
+                "flaggedAt": r["generated_card_flagged_at"].isoformat() if r["generated_card_flagged_at"] else None,
+            }
+            for r in rows
+        ],
+    }
+
+
 @admin_router.get("/{card_id}/status")
 async def get_player_card_status(
     card_id: str,

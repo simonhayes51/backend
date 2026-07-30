@@ -76,6 +76,22 @@ async def _capture_page(page: Page, card_id: str) -> RenderedCard:
     if error_marker:
         raise PlayerCardRenderError(f"Card {card_id} export marked itself failed: {error_marker}")
 
+    # cardReady can become true via a timeout fallback even when one or more
+    # background/cutout card-frame image layers never actually finished
+    # loading - that's exactly the "face-only crop" bug seen in production.
+    # The frontend sets data-card-degraded='true' in that case; treat it as
+    # a hard failure rather than letting a partial render report success, so
+    # it goes through ensure_generated_player_card's normal error/retry path
+    # instead of getting cached forever as a good card.
+    is_degraded = await page.evaluate(
+        "document.documentElement.dataset.cardDegraded === 'true'"
+    )
+    if is_degraded:
+        raise PlayerCardRenderError(
+            f"Card {card_id}: degraded render - background/cutout image layer(s) "
+            "failed to load before the ready-timeout fallback fired"
+        )
+
     png_bytes = await card.screenshot(type="png", omit_background=True)
     if not png_bytes:
         raise PlayerCardRenderError(f"Card {card_id} screenshot returned an empty buffer")

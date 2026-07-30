@@ -23,8 +23,9 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from app.auth.entitlements import compute_entitlements
-from app.db import get_watchlist_db, get_player_db
+from app.db import get_watchlist_db, get_player_db, get_player_pool
 from app.futbin_client import fetch_price_by_card_id
+from app.services.player_card_ondemand import ensure_cards_requested
 
 router = APIRouter(prefix="/api/watchlist", tags=["watchlist"])
 
@@ -106,7 +107,8 @@ async def list_watch_items(
     meta_rows = await pdb.fetch(
         """
         SELECT card_id, name, rating, club, nation, version, image_url,
-               card_bg_image, card_cutout_image, card_cutout_type, card_name
+               card_bg_image, card_cutout_image, card_cutout_type, card_name,
+               generated_card_url, generated_card_status, generated_card_flagged
         FROM fut_players
         WHERE card_id = ANY($1::bigint[])
         """,
@@ -124,9 +126,20 @@ async def list_watch_items(
             "card_cutout_image": m["card_cutout_image"],
             "card_cutout_type": m["card_cutout_type"],
             "card_name": m["card_name"],
+            "generated_card_url": m["generated_card_url"],
+            "generated_card_status": m["generated_card_status"],
+            "generated_card_flagged": m["generated_card_flagged"],
         }
         for m in meta_rows
     }
+
+    needs_card = [
+        str(cid) for cid, m in meta_map.items()
+        if m.get("generated_card_status") != "ready" or m.get("generated_card_flagged")
+    ]
+    if needs_card:
+        player_pool = await get_player_pool()
+        await ensure_cards_requested(player_pool, needs_card)
 
     # live prices (console by row platform)
     tasks = [_fetch_price(int(it["card_id"]), _plat(it["platform"])) for it in items]
@@ -171,6 +184,9 @@ async def list_watch_items(
             "card_cutout_image": m.get("card_cutout_image"),
             "card_cutout_type": m.get("card_cutout_type"),
             "card_name": m.get("card_name"),
+            "generated_card_url": m.get("generated_card_url"),
+            "generated_card_status": m.get("generated_card_status"),
+            "generated_card_flagged": m.get("generated_card_flagged"),
         })
 
     return {"ok": True, "items": enriched}

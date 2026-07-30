@@ -28,7 +28,8 @@ _SELECT_FIELDS = """
     player_url, nation, nation_image, club, club_image, league, league_image,
     generated_card_url, generated_card_key, generated_card_hash,
     generated_card_width, generated_card_height, generated_card_at,
-    generated_card_status, generated_card_error
+    generated_card_status, generated_card_error,
+    generated_card_flagged, generated_card_flag_reason, generated_card_flagged_at
 """
 
 
@@ -115,6 +116,24 @@ def _infer_cutout_type(
 async def _fetch_live_card_assets(
     player_url: str,
 ) -> Dict[str, Optional[str]]:
+    # INVESTIGATION NOTE (wrong-player-card bug report): fetch_player_card_row's
+    # DB lookup is keyed on card_id, which is fut_players' primary key, so it
+    # cannot itself return a different player's row. The "shows a completely
+    # different player's card" symptom is therefore most plausibly upstream of
+    # here, in how `player_url` on the *correct* row got populated in the
+    # first place - the auto_sync/futbin catalog crawl that writes
+    # fut_players.player_url is a separate service (not in this repo) and is
+    # exactly the kind of scraper URL-resolution issue app/routers/players.py
+    # already documents a confirmed prior incident of (a card's own sales
+    # attributed to the wrong card_id via a URL-resolution bug, "now fixed" -
+    # see get_player_market_metrics_route's docstring). If a fut_players row's
+    # stored player_url points at a different player's FUTBIN page, this
+    # function will faithfully render that other player's background/cutout/
+    # name/color - correct code, wrong input data. Fixing this for good needs
+    # a data audit (e.g. spot-checking player_url against name/rating) in
+    # whichever service populates it, not a change here; not attempted in
+    # this pass since it's outside this repo's scraper/ingestion code.
+
     empty = {
         "bgImageUrl": None,
         "cutoutImageUrl": None,
@@ -223,7 +242,24 @@ async def fetch_player_card_row(
         str(card_id),
     )
 
-    return dict(row) if row else None
+    if row is None:
+        return None
+
+    # card_id is fut_players' primary key (migrations/017_fut_players_bootstrap.sql),
+    # so this query can only ever return the requested row or no row at all -
+    # there is no join or non-unique key here that could silently substitute
+    # a different player. This assertion exists purely as a tripwire in case
+    # that invariant is ever broken (e.g. a future refactor to a non-PK
+    # lookup). It deliberately does NOT cover the "wrong player entirely"
+    # bug reports - see this module's _fetch_live_card_assets, which is the
+    # actual suspect (module docstring / investigation notes below).
+    result = dict(row)
+    assert str(result["card_id"]) == str(card_id), (
+        f"fetch_player_card_row returned card_id={result['card_id']!r} for "
+        f"requested card_id={card_id!r} - this should be impossible given "
+        "card_id is fut_players' primary key"
+    )
+    return result
 
 
 async def fetch_player_render_data(

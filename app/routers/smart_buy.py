@@ -18,6 +18,7 @@ router = APIRouter(
 )
 
 from app.services.price_history import get_price_history
+from app.services.player_card_ondemand import ensure_cards_requested
 
 smart_buy_router = APIRouter(prefix="/smart-buy", tags=["smart-buy"])
 
@@ -247,7 +248,8 @@ async def suggestions(
           SELECT
             card_id, name, rating, COALESCE(version,'Standard') AS version,
             image_url, club, league, nation, position, altposition,
-            price::int AS price_int
+            price::int AS price_int,
+            generated_card_url, generated_card_status, generated_card_flagged
           FROM fut_players
           WHERE price ~ '^[0-9]+$'
             AND price::int BETWEEN 300 AND $1
@@ -409,6 +411,9 @@ async def suggestions(
                 "rating": rating,
                 "version": row["version"] or "Standard",
                 "image_url": row["image_url"] or None,
+                "generated_card_url": row["generated_card_url"],
+                "generated_card_status": row["generated_card_status"],
+                "generated_card_flagged": row["generated_card_flagged"],
                 "club": row["club"] or None,
                 "league": row["league"] or None,
                 "nation": row["nation"] or None,
@@ -423,6 +428,13 @@ async def suggestions(
 
     selected.sort(key=lambda x: (x["priority_score"], x["confidence_score"], x["expected_profit"]), reverse=True)
     selected = selected[:limit]
+
+    needs_card = [
+        it["card_id"] for it in selected
+        if it.get("generated_card_status") != "ready" or it.get("generated_card_flagged")
+    ]
+    if needs_card:
+        await ensure_cards_requested(ppool, needs_card)
 
     # Persist best-effort (non-blocking if it fails)
     if selected:

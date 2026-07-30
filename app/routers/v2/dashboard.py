@@ -25,6 +25,7 @@ from fastapi import APIRouter, Request
 
 from app.auth.entitlements import compute_entitlements
 from app.db import get_core_pool, get_player_pool, get_watchlist_db
+from app.services.player_card_ondemand import ensure_cards_requested
 
 router = APIRouter(tags=["v2-dashboard"])
 
@@ -163,6 +164,9 @@ def _to_recommendation(d: Dict[str, Any], scores: Optional[Dict[str, float]] = N
             "cardCutoutImage": d.get("card_cutout_image"),
             "cardCutoutType": d.get("card_cutout_type"),
             "cardName": d.get("card_name"),
+            "generatedCardUrl": d.get("generated_card_url"),
+            "generatedCardStatus": d.get("generated_card_status"),
+            "generatedCardFlagged": d.get("generated_card_flagged"),
             # Same bg+cutout+overlay rendering PlayerCardArt already uses
             # on the Player Search/Compare pages - stats/nation-league-club
             # images are only present here so that component's full (non-
@@ -296,6 +300,7 @@ async def get_dashboard(request: Request) -> Dict[str, Any]:
                 """
                 SELECT r.*, p.name, p.rating, p.version, p.position, p.image_url,
                        p.card_bg_image, p.card_cutout_image, p.card_cutout_type, p.card_name,
+                       p.generated_card_url, p.generated_card_status, p.generated_card_flagged,
                        p.pace, p.shooting, p.passing, p.dribbling, p.defending, p.physicality,
                        p.nation_image, p.league_image, p.club_image,
                        fv.current_bin, fv.fair_value_24h, fv.sales_24h, fv.sales_7d, fv.data_quality_suspect
@@ -310,6 +315,7 @@ async def get_dashboard(request: Request) -> Dict[str, Any]:
                 """
                 SELECT r.*, p.name, p.rating, p.version, p.position, p.image_url,
                        p.card_bg_image, p.card_cutout_image, p.card_cutout_type, p.card_name,
+                       p.generated_card_url, p.generated_card_status, p.generated_card_flagged,
                        p.pace, p.shooting, p.passing, p.dribbling, p.defending, p.physicality,
                        p.nation_image, p.league_image, p.club_image,
                        fv.current_bin, fv.fair_value_24h, fv.sales_24h, fv.sales_7d, fv.data_quality_suspect
@@ -324,6 +330,7 @@ async def get_dashboard(request: Request) -> Dict[str, Any]:
                 """
                 SELECT r.*, p.name, p.rating, p.version, p.position, p.image_url,
                        p.card_bg_image, p.card_cutout_image, p.card_cutout_type, p.card_name,
+                       p.generated_card_url, p.generated_card_status, p.generated_card_flagged,
                        p.pace, p.shooting, p.passing, p.dribbling, p.defending, p.physicality,
                        p.nation_image, p.league_image, p.club_image,
                        fv.current_bin, fv.fair_value_24h, fv.sales_24h, fv.sales_7d, fv.data_quality_suspect
@@ -344,6 +351,13 @@ async def get_dashboard(request: Request) -> Dict[str, Any]:
         cards_to_avoid = [_to_recommendation(_decode_rec_row(r), scores_map.get(r["card_id"])) for r in avoid_rows]
         recent_predictions = [_to_recommendation(_decode_rec_row(r), scores_map.get(r["card_id"])) for r in recent_rows]
 
+        needs_card = [
+            str(r["card_id"]) for r in [*buy_rows, *avoid_rows, *recent_rows]
+            if r["generated_card_status"] != "ready" or r["generated_card_flagged"]
+        ]
+        if needs_card:
+            await ensure_cards_requested(player_pool, list(dict.fromkeys(needs_card)))
+
     # --- Biggest movers (ungated - same 3 slots dashboard.py's /stats already computes) ---
     async with player_pool.acquire() as conn:
         movers_row = await conn.fetchrow(
@@ -351,38 +365,49 @@ async def get_dashboard(request: Request) -> Dict[str, Any]:
             SELECT
                 (SELECT row_to_json(m) FROM (
                     SELECT card_id, name, rating, version, position, volatility_24h AS metric,
-                           image_url, card_bg_image, card_cutout_image, card_cutout_type, card_name
+                           image_url, card_bg_image, card_cutout_image, card_cutout_type, card_name,
+                           generated_card_url, generated_card_status, generated_card_flagged
                     FROM fair_value_mv WHERE volatility_24h IS NOT NULL ORDER BY volatility_24h DESC LIMIT 1
                 ) m) AS largest_mover,
                 (SELECT row_to_json(m) FROM (
                     SELECT card_id, name, rating, version, position, sales_24h AS metric,
-                           image_url, card_bg_image, card_cutout_image, card_cutout_type, card_name
+                           image_url, card_bg_image, card_cutout_image, card_cutout_type, card_name,
+                           generated_card_url, generated_card_status, generated_card_flagged
                     FROM fair_value_mv WHERE sales_24h IS NOT NULL ORDER BY sales_24h DESC LIMIT 1
                 ) m) AS most_traded,
                 (SELECT row_to_json(m) FROM (
                     SELECT card_id, name, rating, version, position, sales_per_hour_24h AS metric,
-                           image_url, card_bg_image, card_cutout_image, card_cutout_type, card_name
+                           image_url, card_bg_image, card_cutout_image, card_cutout_type, card_name,
+                           generated_card_url, generated_card_status, generated_card_flagged
                     FROM fair_value_mv WHERE sales_per_hour_24h IS NOT NULL ORDER BY sales_per_hour_24h DESC LIMIT 1
                 ) m) AS highest_liquidity
             """
         )
     mover_cards = []
+    movers_needing_cards: List[str] = []
     for key in ("largest_mover", "most_traded", "highest_liquidity"):
         raw = movers_row[key]
         if not raw:
             continue
         m = json.loads(raw) if isinstance(raw, str) else raw
+        if m.get("generated_card_status") != "ready" or m.get("generated_card_flagged"):
+            movers_needing_cards.append(str(m["card_id"]))
         mover_cards.append(_to_recommendation({
             "card_id": m["card_id"], "name": m["name"], "rating": m["rating"], "version": m["version"],
             "position": m.get("position"),
             "image_url": m["image_url"], "card_bg_image": m.get("card_bg_image"),
             "card_cutout_image": m.get("card_cutout_image"), "card_cutout_type": m.get("card_cutout_type"),
             "card_name": m.get("card_name"),
+            "generated_card_url": m.get("generated_card_url"),
+            "generated_card_status": m.get("generated_card_status"),
+            "generated_card_flagged": m.get("generated_card_flagged"),
             # Movers are a price-activity signal, not an AI verdict - no
             # "status" key means _to_recommendation()'s has_evaluation
             # guard renders recommendation=None rather than inventing a
             # BUY/AVOID call a mover didn't earn.
         }))
+    if movers_needing_cards:
+        await ensure_cards_requested(player_pool, list(dict.fromkeys(movers_needing_cards)))
 
     # --- Watchlist alerts: real query against alerts_log. Its writer
     # (app/services/watchlist_engine.py) is confirmed dead code (never

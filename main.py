@@ -44,6 +44,8 @@ from app.auth.entitlements import (
 from app.services.price_history import get_price_history
 from app.services.prices import get_player_price  # optional
 from app.services.deal_confidence import compute_deal_confidence
+from app.services.player_card_ondemand import ensure_cards_requested
+from app.services.player_card_generation import close_shared_browser
 from app.routers.smart_buy import router as smart_buy_router
 from app.routers.trade_finder import router as trade_finder_router
 from app.routers.auth_me import router as auth_me_router
@@ -569,6 +571,11 @@ async def lifespan(app: FastAPI):
                 await p.close()
         if HTTP_SESSION:
             await HTTP_SESSION.close()
+        # Best-effort close of the shared on-demand player-card Chromium
+        # instance (app/services/player_card_generation.py). No-op if it was
+        # never launched this process.
+        with suppress(Exception):
+            await close_shared_browser()
 
 # --- FastAPI app ---
 app = FastAPI(lifespan=lifespan)
@@ -1534,7 +1541,7 @@ async def get_player_definition(card_id: str):
                club, nation, league, club_image, nation_image, league_image,
                foot, skill_moves, weak_foot, pace, shooting, passing,
                dribbling, defending, physicality, accelerate_type, player_url,
-               generated_card_url, generated_card_at
+               generated_card_url, generated_card_at, generated_card_status, generated_card_flagged
         FROM fut_players
         WHERE card_id::text = $1
         """,
@@ -1542,6 +1549,9 @@ async def get_player_definition(card_id: str):
     )
     if not row:
         return {"error": "Player not found"}
+
+    if row["generated_card_status"] != "ready" or row["generated_card_flagged"]:
+        await ensure_cards_requested(player_pool, [str(card_id)])
 
     layers = {"bgImageUrl": None, "cutoutImageUrl": None, "cutoutType": None, "cardName": None}
     if row["player_url"]:
@@ -1574,6 +1584,8 @@ async def get_player_definition(card_id: str):
             "cardName": layers.get("cardName"),
             "generatedCardUrl": row["generated_card_url"],
             "generatedCardAt": row["generated_card_at"].isoformat() if row["generated_card_at"] else None,
+            "generatedCardStatus": row["generated_card_status"],
+            "generatedCardFlagged": row["generated_card_flagged"],
         }
     }
 
@@ -2778,7 +2790,8 @@ async def search_players(request: Request, q: str = "", pos: Optional[str] = Non
             sql = f"""
                 SELECT
                   card_id, name, rating, version, image_url, club, league, nation,
-                  position, altposition, price
+                  position, altposition, price,
+                  generated_card_url, generated_card_status, generated_card_flagged
                 FROM fut_players
                 WHERE {base_where}
                 ORDER BY
@@ -2803,9 +2816,19 @@ async def search_players(request: Request, q: str = "", pos: Optional[str] = Non
                 "position": r["position"],
                 "altposition": r["altposition"],
                 "price": r["price"],
+                "generated_card_url": r["generated_card_url"],
+                "generated_card_status": r["generated_card_status"],
+                "generated_card_flagged": r["generated_card_flagged"],
             }
             for r in rows
         ]
+
+        needs_card = [
+            str(r["card_id"]) for r in rows
+            if r["generated_card_status"] != "ready" or r["generated_card_flagged"]
+        ]
+        if needs_card:
+            await ensure_cards_requested(request.app.state.player_pool, needs_card)
 
         return {"players": players}
     except Exception as e:
@@ -3020,11 +3043,19 @@ async def player_compare(
 
     async with request.app.state.player_pool.acquire() as pconn:
         meta_rows = await pconn.fetch("""
-            SELECT card_id, name, rating, position, league, nation, club, image_url
+            SELECT card_id, name, rating, position, league, nation, club, image_url,
+                   generated_card_url, generated_card_status, generated_card_flagged
             FROM fut_players
             WHERE card_id::text = ANY($1::text[])
         """, raw_ids)
     meta = {str(r["card_id"]): dict(r) for r in meta_rows}
+
+    needs_card = [
+        cid for cid, m in meta.items()
+        if m.get("generated_card_status") != "ready" or m.get("generated_card_flagged")
+    ]
+    if needs_card:
+        await ensure_cards_requested(request.app.state.player_pool, needs_card)
 
     players_out: List[Dict[str, Any]] = []
     for cid_str in raw_ids:
@@ -3062,6 +3093,9 @@ async def player_compare(
             "nation": m.get("nation"),
             "club": m.get("club"),
             "image": m.get("image_url"),
+            "generatedCardUrl": m.get("generated_card_url"),
+            "generatedCardStatus": m.get("generated_card_status"),
+            "generatedCardFlagged": m.get("generated_card_flagged"),
             "prices": {"console": console_price, "pc": pc_price},
             "priceRange": pr,
             "trend": {

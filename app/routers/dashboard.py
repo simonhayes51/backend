@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Query
 
 from app.db import get_core_pool, get_player_pool
+from app.services.player_card_ondemand import ensure_cards_requested
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
 
@@ -164,19 +165,22 @@ async def dashboard_stats() -> Dict[str, Any]:
                 SELECT
                     (SELECT row_to_json(m) FROM (
                         SELECT card_id, name, rating, version, volatility_24h,
-                               image_url, card_bg_image, card_cutout_image, card_cutout_type, card_name
+                               image_url, card_bg_image, card_cutout_image, card_cutout_type, card_name,
+                               generated_card_url, generated_card_status, generated_card_flagged
                         FROM fair_value_mv WHERE volatility_24h IS NOT NULL
                         ORDER BY volatility_24h DESC LIMIT 1
                     ) m) AS largest_mover,
                     (SELECT row_to_json(m) FROM (
                         SELECT card_id, name, rating, version, sales_24h,
-                               image_url, card_bg_image, card_cutout_image, card_cutout_type, card_name
+                               image_url, card_bg_image, card_cutout_image, card_cutout_type, card_name,
+                               generated_card_url, generated_card_status, generated_card_flagged
                         FROM fair_value_mv WHERE sales_24h IS NOT NULL
                         ORDER BY sales_24h DESC LIMIT 1
                     ) m) AS most_traded_today,
                     (SELECT row_to_json(m) FROM (
                         SELECT card_id, name, rating, version, sales_per_hour_24h,
-                               image_url, card_bg_image, card_cutout_image, card_cutout_type, card_name
+                               image_url, card_bg_image, card_cutout_image, card_cutout_type, card_name,
+                               generated_card_url, generated_card_status, generated_card_flagged
                         FROM fair_value_mv WHERE sales_per_hour_24h IS NOT NULL
                         ORDER BY sales_per_hour_24h DESC LIMIT 1
                     ) m) AS highest_liquidity
@@ -184,6 +188,13 @@ async def dashboard_stats() -> Dict[str, Any]:
             )
         # row_to_json comes back from asyncpg as a JSON string, not a dict.
         movers = {k: (json.loads(v) if v else None) for k, v in dict(movers).items()}
+
+        movers_needing_cards = [
+            str(m["card_id"]) for m in movers.values()
+            if m and (m.get("generated_card_status") != "ready" or m.get("generated_card_flagged"))
+        ]
+        if movers_needing_cards:
+            await ensure_cards_requested(player_pool, list(dict.fromkeys(movers_needing_cards)))
     except Exception:
         # fair_value_mv doesn't exist until migrations 011-013 have applied
         # (which themselves wait on sales_history/bin_history existing).
@@ -259,13 +270,23 @@ async def dashboard_activity(limit: int = Query(20, ge=1, le=100)) -> Dict[str, 
     core_pool = await get_core_pool()
 
     events: List[Dict[str, Any]] = []
+    needs_card: List[str] = []
+
+    def _track_card(r: Any) -> None:
+        if r["card_id"] is not None and (
+            r["generated_card_status"] != "ready" or r["generated_card_flagged"]
+        ):
+            needs_card.append(str(r["card_id"]))
 
     # card_id/rating/version + the 4 card-art columns are carried through
     # on the 3 card-related event types (sale/bin/player_update) so v2's
     # ActivityFeedSection can link to the Player Page and render real card
     # art instead of plain text - sync events have no single card to
     # reference and correctly keep card_id: None.
-    _ART_COLS = "p.card_bg_image, p.card_cutout_image, p.card_cutout_type, p.card_name"
+    _ART_COLS = (
+        "p.card_bg_image, p.card_cutout_image, p.card_cutout_type, p.card_name, "
+        "p.generated_card_url, p.generated_card_status, p.generated_card_flagged"
+    )
 
     try:
         async with player_pool.acquire() as conn:
@@ -281,6 +302,7 @@ async def dashboard_activity(limit: int = Query(20, ge=1, le=100)) -> Dict[str, 
                 limit,
             )
         for r in sales:
+            _track_card(r)
             events.append({
                 "type": "sale",
                 "message": f"New sale recorded: {r['name'] or 'Unknown player'} sold for {r['sold_price']:,} coins",
@@ -288,7 +310,8 @@ async def dashboard_activity(limit: int = Query(20, ge=1, le=100)) -> Dict[str, 
                 "card_id": r["card_id"], "rating": r["rating"], "version": r["version"],
                 "image_url": r["image_url"], "card_bg_image": r["card_bg_image"],
                 "card_cutout_image": r["card_cutout_image"], "card_cutout_type": r["card_cutout_type"],
-                "card_name": r["card_name"],
+                "card_name": r["card_name"], "generated_card_url": r["generated_card_url"],
+                "generated_card_status": r["generated_card_status"],
             })
     except Exception:
         pass
@@ -307,6 +330,7 @@ async def dashboard_activity(limit: int = Query(20, ge=1, le=100)) -> Dict[str, 
                 limit,
             )
         for r in bins:
+            _track_card(r)
             events.append({
                 "type": "bin",
                 "message": f"BIN changed: {r['name'] or 'Unknown player'} now {r['lowest_bin']:,} ({r['platform']})",
@@ -314,7 +338,8 @@ async def dashboard_activity(limit: int = Query(20, ge=1, le=100)) -> Dict[str, 
                 "card_id": r["card_id"], "rating": r["rating"], "version": r["version"],
                 "image_url": r["image_url"], "card_bg_image": r["card_bg_image"],
                 "card_cutout_image": r["card_cutout_image"], "card_cutout_type": r["card_cutout_type"],
-                "card_name": r["card_name"],
+                "card_name": r["card_name"], "generated_card_url": r["generated_card_url"],
+                "generated_card_status": r["generated_card_status"],
             })
     except Exception:
         pass
@@ -332,6 +357,7 @@ async def dashboard_activity(limit: int = Query(20, ge=1, le=100)) -> Dict[str, 
                 limit,
             )
         for r in updated:
+            _track_card(r)
             events.append({
                 "type": "player_update",
                 "message": f"Player updated: {r['name'] or r['card_id']}",
@@ -339,7 +365,8 @@ async def dashboard_activity(limit: int = Query(20, ge=1, le=100)) -> Dict[str, 
                 "card_id": r["card_id"], "rating": r["rating"], "version": r["version"],
                 "image_url": r["image_url"], "card_bg_image": r["card_bg_image"],
                 "card_cutout_image": r["card_cutout_image"], "card_cutout_type": r["card_cutout_type"],
-                "card_name": r["card_name"],
+                "card_name": r["card_name"], "generated_card_url": r["generated_card_url"],
+                "generated_card_status": r["generated_card_status"],
             })
     except Exception:
         pass
@@ -363,6 +390,11 @@ async def dashboard_activity(limit: int = Query(20, ge=1, le=100)) -> Dict[str, 
     events.sort(key=lambda e: e["at"] or epoch, reverse=True)
     top = events[:limit]
 
+    if needs_card:
+        # Dedup across the three event sources; one claim call for the
+        # whole page rather than one per event row.
+        await ensure_cards_requested(player_pool, list(dict.fromkeys(needs_card)))
+
     return {
         "events": [
             {
@@ -370,7 +402,8 @@ async def dashboard_activity(limit: int = Query(20, ge=1, le=100)) -> Dict[str, 
                 "card_id": e.get("card_id"), "rating": e.get("rating"), "version": e.get("version"),
                 "image_url": e.get("image_url"), "card_bg_image": e.get("card_bg_image"),
                 "card_cutout_image": e.get("card_cutout_image"), "card_cutout_type": e.get("card_cutout_type"),
-                "card_name": e.get("card_name"),
+                "card_name": e.get("card_name"), "generated_card_url": e.get("generated_card_url"),
+                "generated_card_status": e.get("generated_card_status"),
             }
             for e in top
         ]

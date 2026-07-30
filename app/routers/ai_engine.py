@@ -8,6 +8,7 @@ from pydantic import BaseModel
 from app.db import get_db
 from app.auth.entitlements import compute_entitlements
 from app.services.price_history import get_price_history
+from app.services.player_card_ondemand import ensure_cards_requested
 
 router = APIRouter(prefix="/api/ai", tags=["AI Engine"])
 
@@ -74,8 +75,11 @@ async def top_buys(
                     price_num,
                     club,
                     league,
-                    nation
-                FROM fut_players 
+                    nation,
+                    generated_card_url,
+                    generated_card_status,
+                    generated_card_flagged
+                FROM fut_players
                 WHERE (
                     (price_num IS NOT NULL AND price_num > 1000 AND price_num < 2000000)
                     OR 
@@ -172,7 +176,10 @@ async def top_buys(
                     "rating": row["rating"],
                     "position": row["position"],
                     "version": row["version"] or "Standard",
-                    "image_url": row["image_url"]
+                    "image_url": row["image_url"],
+                    "generated_card_url": row["generated_card_url"],
+                    "generated_card_status": row["generated_card_status"],
+                    "generated_card_flagged": row["generated_card_flagged"],
                 },
                 "current": current_price,
                 "median7": int(round(median7)),
@@ -180,6 +187,13 @@ async def top_buys(
                 "vol24": vol24,
                 "risk_label": risk_label
             })
+
+        needs_card = [
+            r["player_card_id"] for r in results
+            if r["player"].get("generated_card_status") != "ready" or r["player"].get("generated_card_flagged")
+        ]
+        if needs_card:
+            await ensure_cards_requested(app.state.player_pool, needs_card)
 
         return results
         

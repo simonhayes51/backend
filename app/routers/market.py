@@ -1,8 +1,9 @@
-# app/routers/market.py 
+# app/routers/market.py
 from fastapi import APIRouter, Depends, HTTPException
 from typing import List, Dict, Any
-from app.db import get_player_db
+from app.db import get_player_db, get_player_pool
 from app.services.indicators import ema, rsi, bollinger, atr
+from app.services.player_card_ondemand import ensure_cards_requested
 
 router = APIRouter(prefix="/api/market", tags=["Market"])
 
@@ -247,10 +248,18 @@ async def get_market_sentiment(
         names: Dict[int, Any] = {}
         if mover_ids:
             name_rows = await db.fetch(
-                "SELECT card_id, name, rating, image_url FROM fut_players WHERE card_id = ANY($1::bigint[])",
+                """SELECT card_id, name, rating, image_url,
+                          generated_card_url, generated_card_status, generated_card_flagged
+                   FROM fut_players WHERE card_id = ANY($1::bigint[])""",
                 mover_ids,
             )
             names = {int(r["card_id"]): dict(r) for r in name_rows}
+            needs_card = [
+                str(cid) for cid, meta in names.items()
+                if meta.get("generated_card_status") != "ready" or meta.get("generated_card_flagged")
+            ]
+            if needs_card:
+                await ensure_cards_requested(await get_player_pool(), needs_card)
 
         def _enrich(m: Dict[str, Any]) -> Dict[str, Any]:
             meta = names.get(m["player_id"], {})
@@ -259,6 +268,9 @@ async def get_market_sentiment(
                 "name": meta.get("name"),
                 "rating": meta.get("rating"),
                 "image_url": meta.get("image_url"),
+                "generated_card_url": meta.get("generated_card_url"),
+                "generated_card_status": meta.get("generated_card_status"),
+                "generated_card_flagged": meta.get("generated_card_flagged"),
             }
 
         return {

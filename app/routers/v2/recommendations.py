@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from app.auth.entitlements import require_feature
+from app.services.player_card_ondemand import ensure_cards_requested
 
 router = APIRouter(tags=["v2-recommendations"])
 
@@ -51,10 +52,14 @@ def _row_to_dict(row) -> Dict[str, Any]:
 _PLAYER_COLUMNS = """
     p.name, p.display_name, p.nickname, p.rating, p.version, p.position, p.image_url,
     p.card_bg_image, p.card_cutout_image, p.card_cutout_type, p.card_name,
-    p.generated_card_url, p.generated_card_status, p.generated_card_at,
+    p.generated_card_url, p.generated_card_status, p.generated_card_at, p.generated_card_flagged,
     p.nation_image, p.league_image, p.club_image,
     p.pace, p.shooting, p.passing, p.dribbling, p.defending, p.physicality
 """
+
+
+def _needs_card(d: Dict[str, Any]) -> bool:
+    return d.get("generated_card_status") != "ready" or bool(d.get("generated_card_flagged"))
 
 
 @router.get("/players/{card_id}/recommendation")
@@ -69,7 +74,10 @@ async def get_player_recommendation(card_id: int, request: Request) -> Dict[str,
         )
     if not row:
         raise HTTPException(404, "No recommendation computed for this card yet")
-    return _row_to_dict(row)
+    d = _row_to_dict(row)
+    if _needs_card(d):
+        await ensure_cards_requested(_player_pool(request), [str(card_id)])
+    return d
 
 
 @router.get("/recommendations/card-images")
@@ -84,20 +92,41 @@ async def generated_card_images(request: Request, card_ids: str = Query("")) -> 
     ids = list(dict.fromkeys(ids))[:100]
     if not ids:
         return {"images": {}}
-    async with _player_pool(request).acquire() as conn:
-        rows = await conn.fetch(
-            """SELECT card_id, generated_card_url, generated_card_at FROM fut_players
-            WHERE card_id=ANY($1::bigint[]) AND generated_card_status='ready'
-            AND generated_card_url IS NOT NULL""", ids,
+    pool = _player_pool(request)
+    async with pool.acquire() as conn:
+        all_rows = await conn.fetch(
+            """SELECT card_id, generated_card_url, generated_card_at,
+                      generated_card_status, generated_card_flagged
+            FROM fut_players WHERE card_id=ANY($1::bigint[])""", ids,
         )
+
+    needs_card = [
+        str(r["card_id"]) for r in all_rows
+        if r["generated_card_status"] != "ready" or r["generated_card_flagged"]
+    ]
+    if needs_card:
+        await ensure_cards_requested(pool, needs_card)
+
     return {
         "images": {
             str(r["card_id"]): _versioned_card_url(
                 r["generated_card_url"], r["generated_card_at"]
             )
-            for r in rows
-        }
+            for r in all_rows
+            if r["generated_card_status"] == "ready"
+            and r["generated_card_url"]
+            and not r["generated_card_flagged"]
+        },
+        "statuses": {
+            str(r["card_id"]): r["generated_card_status"] for r in all_rows
+        },
     }
+
+
+async def _trigger_missing_cards(pool, items: list) -> None:
+    needs_card = [str(item["card_id"]) for item in items if _needs_card(item)]
+    if needs_card:
+        await ensure_cards_requested(pool, needs_card)
 
 
 async def _feed(pool, where: str, order: str, limit: int) -> Dict[str, Any]:
@@ -106,6 +135,7 @@ async def _feed(pool, where: str, order: str, limit: int) -> Dict[str, Any]:
             FROM recommendations_latest r LEFT JOIN fut_players p ON p.card_id=r.card_id
             WHERE {where} ORDER BY {order} LIMIT $1""", limit)
     items = [_row_to_dict(r) for r in rows]
+    await _trigger_missing_cards(pool, items)
     return {"items": items, "count": len(items)}
 
 
@@ -118,11 +148,13 @@ async def opportunities(request: Request, limit: int = Query(20, ge=1, le=100)) 
 @router.get("/recommendations/high-confidence")
 async def high_confidence(request: Request, limit: int=Query(20,ge=1,le=100), min_confidence: float=Query(70,ge=0,le=100)) -> Dict[str,Any]:
     await require_feature("opportunity_feed")(request)
-    async with _player_pool(request).acquire() as conn:
+    pool = _player_pool(request)
+    async with pool.acquire() as conn:
         rows=await conn.fetch(f"""SELECT r.*, {_PLAYER_COLUMNS} FROM recommendations_latest r
         LEFT JOIN fut_players p ON p.card_id=r.card_id WHERE r.status='BUY' AND r.confidence >= $1
         ORDER BY r.confidence DESC NULLS LAST LIMIT $2""",min_confidence,limit)
     items=[_row_to_dict(r) for r in rows]
+    await _trigger_missing_cards(pool, items)
     return {"items":items,"count":len(items)}
 
 
@@ -176,4 +208,5 @@ async def strategy_feed(strategy_name:str, request:Request, limit:int=Query(20,g
               ORDER BY {order} LIMIT $1""",limit-len(rows),existing or [-1])
             rows=list(rows)+list(extra)
     items=[_row_to_dict(r) for r in rows]
+    await _trigger_missing_cards(pool, items)
     return {"strategy":strategy_name,"items":items,"count":len(items),"strict_count":len(items)-max(0,len(items)-limit)}
