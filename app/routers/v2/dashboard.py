@@ -288,75 +288,93 @@ async def get_dashboard(request: Request) -> Dict[str, Any]:
             "metrics": {"liquidCards": 0, "avgVolatility": 0, "avgValueGap": 0},
         }
 
-    # --- Recommendation feeds (gated) ---
+    # --- Recommendation feeds (gated, with a free preview) ---
+    # Free/Pro users used to get an all-empty feed with nothing to show
+    # the AI actually works - the one thing a free tier needs to prove
+    # before anyone upgrades. FREE_PREVIEW_COUNT real BUY calls are now
+    # always included (never a fabricated example); PREVIEW_LOCKED_COUNT
+    # exists purely so the frontend can render "N more, upgrade to see
+    # them" instead of the feed just looking short.
+    FREE_PREVIEW_COUNT = 1
     todays_opportunities: List[Dict[str, Any]] = []
     high_confidence: List[Dict[str, Any]] = []
     cards_to_avoid: List[Dict[str, Any]] = []
     recent_predictions: List[Dict[str, Any]] = []
+    preview_locked_count = 0
+
+    async with player_pool.acquire() as conn:
+        buy_rows = await conn.fetch(
+            """
+            SELECT r.*, p.name, p.rating, p.version, p.position, p.image_url,
+                   p.card_bg_image, p.card_cutout_image, p.card_cutout_type, p.card_name,
+                   p.generated_card_url, p.generated_card_status, p.generated_card_flagged,
+                   p.pace, p.shooting, p.passing, p.dribbling, p.defending, p.physicality,
+                   p.nation_image, p.league_image, p.club_image,
+                   fv.current_bin, fv.fair_value_24h, fv.sales_24h, fv.sales_7d, fv.data_quality_suspect
+            FROM recommendations_latest r
+            LEFT JOIN fut_players p ON p.card_id = r.card_id
+            LEFT JOIN fair_value_mv fv ON fv.card_id = r.card_id
+            WHERE r.status = 'BUY'
+            ORDER BY r.confidence DESC NULLS LAST LIMIT 8
+            """
+        )
+        avoid_rows = await conn.fetch(
+            """
+            SELECT r.*, p.name, p.rating, p.version, p.position, p.image_url,
+                   p.card_bg_image, p.card_cutout_image, p.card_cutout_type, p.card_name,
+                   p.generated_card_url, p.generated_card_status, p.generated_card_flagged,
+                   p.pace, p.shooting, p.passing, p.dribbling, p.defending, p.physicality,
+                   p.nation_image, p.league_image, p.club_image,
+                   fv.current_bin, fv.fair_value_24h, fv.sales_24h, fv.sales_7d, fv.data_quality_suspect
+            FROM recommendations_latest r
+            LEFT JOIN fut_players p ON p.card_id = r.card_id
+            LEFT JOIN fair_value_mv fv ON fv.card_id = r.card_id
+            WHERE r.status = 'AVOID'
+            ORDER BY r.computed_at DESC LIMIT 6
+            """
+        )
+        recent_rows = await conn.fetch(
+            """
+            SELECT r.*, p.name, p.rating, p.version, p.position, p.image_url,
+                   p.card_bg_image, p.card_cutout_image, p.card_cutout_type, p.card_name,
+                   p.generated_card_url, p.generated_card_status, p.generated_card_flagged,
+                   p.pace, p.shooting, p.passing, p.dribbling, p.defending, p.physicality,
+                   p.nation_image, p.league_image, p.club_image,
+                   fv.current_bin, fv.fair_value_24h, fv.sales_24h, fv.sales_7d, fv.data_quality_suspect
+            FROM recommendations r
+            LEFT JOIN fut_players p ON p.card_id = r.card_id
+            LEFT JOIN fair_value_mv fv ON fv.card_id = r.card_id
+            ORDER BY r.computed_at DESC LIMIT 8
+            """
+        )
+        all_ids = list({r["card_id"] for r in [*buy_rows, *avoid_rows, *recent_rows]})
+        scores_map = await _scores_by_card(conn, all_ids)
+
+    buys = [_decode_rec_row(r) for r in buy_rows]
+    all_opportunities = [_to_recommendation(d, scores_map.get(d["card_id"])) for d in buys]
+    all_high_confidence = [
+        _to_recommendation(d, scores_map.get(d["card_id"])) for d in buys if float(d.get("confidence") or 0) >= 70
+    ]
 
     if opportunities_unlocked:
-        async with player_pool.acquire() as conn:
-            buy_rows = await conn.fetch(
-                """
-                SELECT r.*, p.name, p.rating, p.version, p.position, p.image_url,
-                       p.card_bg_image, p.card_cutout_image, p.card_cutout_type, p.card_name,
-                       p.generated_card_url, p.generated_card_status, p.generated_card_flagged,
-                       p.pace, p.shooting, p.passing, p.dribbling, p.defending, p.physicality,
-                       p.nation_image, p.league_image, p.club_image,
-                       fv.current_bin, fv.fair_value_24h, fv.sales_24h, fv.sales_7d, fv.data_quality_suspect
-                FROM recommendations_latest r
-                LEFT JOIN fut_players p ON p.card_id = r.card_id
-                LEFT JOIN fair_value_mv fv ON fv.card_id = r.card_id
-                WHERE r.status = 'BUY'
-                ORDER BY r.confidence DESC NULLS LAST LIMIT 8
-                """
-            )
-            avoid_rows = await conn.fetch(
-                """
-                SELECT r.*, p.name, p.rating, p.version, p.position, p.image_url,
-                       p.card_bg_image, p.card_cutout_image, p.card_cutout_type, p.card_name,
-                       p.generated_card_url, p.generated_card_status, p.generated_card_flagged,
-                       p.pace, p.shooting, p.passing, p.dribbling, p.defending, p.physicality,
-                       p.nation_image, p.league_image, p.club_image,
-                       fv.current_bin, fv.fair_value_24h, fv.sales_24h, fv.sales_7d, fv.data_quality_suspect
-                FROM recommendations_latest r
-                LEFT JOIN fut_players p ON p.card_id = r.card_id
-                LEFT JOIN fair_value_mv fv ON fv.card_id = r.card_id
-                WHERE r.status = 'AVOID'
-                ORDER BY r.computed_at DESC LIMIT 6
-                """
-            )
-            recent_rows = await conn.fetch(
-                """
-                SELECT r.*, p.name, p.rating, p.version, p.position, p.image_url,
-                       p.card_bg_image, p.card_cutout_image, p.card_cutout_type, p.card_name,
-                       p.generated_card_url, p.generated_card_status, p.generated_card_flagged,
-                       p.pace, p.shooting, p.passing, p.dribbling, p.defending, p.physicality,
-                       p.nation_image, p.league_image, p.club_image,
-                       fv.current_bin, fv.fair_value_24h, fv.sales_24h, fv.sales_7d, fv.data_quality_suspect
-                FROM recommendations r
-                LEFT JOIN fut_players p ON p.card_id = r.card_id
-                LEFT JOIN fair_value_mv fv ON fv.card_id = r.card_id
-                ORDER BY r.computed_at DESC LIMIT 8
-                """
-            )
-            all_ids = list({r["card_id"] for r in [*buy_rows, *avoid_rows, *recent_rows]})
-            scores_map = await _scores_by_card(conn, all_ids)
-
-        buys = [_decode_rec_row(r) for r in buy_rows]
-        todays_opportunities = [_to_recommendation(d, scores_map.get(d["card_id"])) for d in buys]
-        high_confidence = [
-            _to_recommendation(d, scores_map.get(d["card_id"])) for d in buys if float(d.get("confidence") or 0) >= 70
-        ]
+        todays_opportunities = all_opportunities
+        high_confidence = all_high_confidence
         cards_to_avoid = [_to_recommendation(_decode_rec_row(r), scores_map.get(r["card_id"])) for r in avoid_rows]
         recent_predictions = [_to_recommendation(_decode_rec_row(r), scores_map.get(r["card_id"])) for r in recent_rows]
+    else:
+        # Free/Pro preview: a real BUY call, not a fabricated example, so
+        # the free tier can actually see the product work before paying
+        # for the full feed - see `locked.previewCount` below for what's
+        # still behind the paywall.
+        todays_opportunities = all_opportunities[:FREE_PREVIEW_COUNT]
+        preview_locked_count = max(0, len(all_opportunities) - FREE_PREVIEW_COUNT)
 
-        needs_card = [
-            str(r["card_id"]) for r in [*buy_rows, *avoid_rows, *recent_rows]
-            if r["generated_card_status"] != "ready" or r["generated_card_flagged"]
-        ]
-        if needs_card:
-            await ensure_cards_requested(player_pool, list(dict.fromkeys(needs_card)))
+    needs_card = [
+        str(r["card_id"]) for r in [*buy_rows, *avoid_rows, *recent_rows]
+        if r["generated_card_status"] != "ready" or r["generated_card_flagged"]
+    ]
+    if needs_card:
+        await ensure_cards_requested(player_pool, list(dict.fromkeys(needs_card)))
 
     # --- Biggest movers (ungated - same 3 slots dashboard.py's /stats already computes) ---
     async with player_pool.acquire() as conn:
@@ -409,12 +427,12 @@ async def get_dashboard(request: Request) -> Dict[str, Any]:
     if movers_needing_cards:
         await ensure_cards_requested(player_pool, list(dict.fromkeys(movers_needing_cards)))
 
-    # --- Watchlist alerts: real query against alerts_log. Its writer
-    # (app/services/watchlist_engine.py) is confirmed dead code (never
-    # invoked anywhere in this repo), so this is honestly almost always
-    # empty today - querying for real rather than hardcoding [] means it
-    # starts working the moment that engine is ever wired up, with zero
-    # further change here. ---
+    # --- Watchlist alerts: real query against alerts_log, populated by
+    # main.py's own live alert loop (_alerts_poll_loop/_eval_alerts_for_pair
+    # against the watchlist_alerts table) - NOT app/services/
+    # watchlist_engine.py, which is separate, unrelated dead code against
+    # a differently-named watchlist_items table that nothing ever writes
+    # to (see that module's own header comment). ---
     watchlist_alerts: List[Dict[str, Any]] = []
     uid = request.session.get("user_id")
     if uid:
@@ -484,5 +502,8 @@ async def get_dashboard(request: Request) -> Dict[str, Any]:
         "watchlistAlerts": watchlist_alerts,
         "latestMarketEvents": latest_market_events,
         "latestSbcImpact": latest_sbc_impact,
-        "locked": {"opportunityFeed": not opportunities_unlocked},
+        "locked": {
+            "opportunityFeed": not opportunities_unlocked,
+            "previewCount": preview_locked_count,
+        },
     }
