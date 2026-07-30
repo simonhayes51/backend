@@ -141,7 +141,19 @@ async def ensure_generated_player_card(
     force: bool = False,
     browser: Optional[Browser] = None,
     page: Optional[Page] = None,
+    already_claimed: bool = False,
 ) -> Dict[str, Any]:
+    """
+    already_claimed=True means the caller (app.services.player_card_ondemand's
+    atomic claim UPDATE) has already transitioned this row NULL/error/ready-stale
+    -> 'generating' immediately before invoking this function, specifically to
+    win the cross-process race for who renders this card. In that case the
+    generating/up-to-date short-circuit checks below must be skipped -- they'd
+    otherwise see the claim's own fresh 'generating' status and mistake it for
+    a concurrent render already in progress, silently no-op-ing every on-demand
+    call forever. Callers that do their own claiming (batch script, admin
+    route) don't pass this and get the original self-contained guard.
+    """
     async with _lock_for(str(card_id)):
         async with pool.acquire() as conn:
             player_row = await fetch_player_render_data(conn, card_id)
@@ -150,25 +162,26 @@ async def ensure_generated_player_card(
 
             current_hash = compute_card_render_hash(player_row)
 
-            is_generating = player_row.get("generated_card_status") == "generating"
-            generating_is_stale = True
-            if is_generating and player_row.get("generated_card_at"):
-                age = (datetime.now(timezone.utc) - player_row["generated_card_at"]).total_seconds()
-                generating_is_stale = age > _STALE_GENERATING_AFTER_SECONDS
+            if not already_claimed:
+                is_generating = player_row.get("generated_card_status") == "generating"
+                generating_is_stale = True
+                if is_generating and player_row.get("generated_card_at"):
+                    age = (datetime.now(timezone.utc) - player_row["generated_card_at"]).total_seconds()
+                    generating_is_stale = age > _STALE_GENERATING_AFTER_SECONDS
 
-            if not force and is_generating and not generating_is_stale:
-                return _public_result(player_row, generated=False)
+                if not force and is_generating and not generating_is_stale:
+                    return _public_result(player_row, generated=False)
 
-            up_to_date = (
-                not force
-                and player_row.get("generated_card_status") == "ready"
-                and player_row.get("generated_card_url")
-                and player_row.get("generated_card_hash") == current_hash
-            )
-            if up_to_date:
-                return _public_result(player_row, generated=False)
+                up_to_date = (
+                    not force
+                    and player_row.get("generated_card_status") == "ready"
+                    and player_row.get("generated_card_url")
+                    and player_row.get("generated_card_hash") == current_hash
+                )
+                if up_to_date:
+                    return _public_result(player_row, generated=False)
 
-            await _mark_status(conn, card_id, "generating")
+                await _mark_status(conn, card_id, "generating")
 
         try:
             effective_browser = browser
