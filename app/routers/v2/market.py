@@ -17,6 +17,7 @@ from app.auth.entitlements import compute_entitlements
 from app.db import get_core_pool
 from app.routers.fair_value import _teaser
 from app.services import fair_value as fv
+from app.services.player_card_ondemand import ensure_cards_requested
 
 router = APIRouter(tags=["v2-market"])
 
@@ -38,6 +39,10 @@ async def fair_value_batch(ids: str, request: Request) -> Dict[str, Any]:
     rows = await fv.get_card_fair_values_batch(pool, card_ids)
     ent = await compute_entitlements(request)
     unlocked = "fair_value" in ent["features"]
+
+    needs_card = [str(row["card_id"]) for row in rows if fv.needs_card_regeneration(row)]
+    if needs_card:
+        await ensure_cards_requested(pool, needs_card)
 
     items: List[Dict[str, Any]] = []
     for row in rows:

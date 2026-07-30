@@ -11,6 +11,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from app.auth.entitlements import require_feature
+from app.services.player_card_ondemand import ensure_cards_requested
 
 router = APIRouter(prefix="/api", tags=["trending"])
 
@@ -171,7 +172,8 @@ async def _enrich(req: Request, rows: List[dict], platform: str) -> List[dict]:
             async with pool.acquire() as conn:
                 db_rows = await conn.fetch(
                     """
-                    SELECT card_id, player_url, name, rating, position, club, nation, league, image_url
+                    SELECT card_id, player_url, name, rating, position, club, nation, league, image_url,
+                           generated_card_url, generated_card_status, generated_card_flagged
                     FROM fut_players
                     WHERE player_url = ANY($1::text[])
                     """,
@@ -183,6 +185,7 @@ async def _enrich(req: Request, rows: List[dict], platform: str) -> List[dict]:
 
     out: List[dict] = []
     seen: set[int] = set()
+    needs_card: List[str] = []
     for r in rows:
         m = meta_by_url.get(r["player_url"])
         if not m:
@@ -191,6 +194,8 @@ async def _enrich(req: Request, rows: List[dict], platform: str) -> List[dict]:
         if cid in seen:
             continue
         seen.add(cid)
+        if m.get("generated_card_status") != "ready" or m.get("generated_card_flagged"):
+            needs_card.append(str(cid))
         out.append(
             {
                 "card_id": cid,
@@ -203,12 +208,16 @@ async def _enrich(req: Request, rows: List[dict], platform: str) -> List[dict]:
                 "nation": m.get("nation"),
                 "league": m.get("league"),
                 "image": m.get("image_url"),
+                "generated_card_url": m.get("generated_card_url"),
+                "generated_card_status": m.get("generated_card_status"),
                 "percent": r["percent"],
                 "platform": platform,
                 "price_console": r["price"],
                 "prices": {"console": r["price"], "pc": None},
             }
         )
+    if needs_card and pool:
+        await ensure_cards_requested(pool, needs_card)
     return out
 
 

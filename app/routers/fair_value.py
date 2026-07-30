@@ -18,6 +18,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from app.auth.entitlements import compute_entitlements, require_feature
 from app.services import fair_value as fv
+from app.services.player_card_ondemand import ensure_cards_requested
 
 router = APIRouter(prefix="/api/market", tags=["fair-value"])
 
@@ -73,6 +74,9 @@ async def card_fair_value(card_id: int, request: Request):
     if not row:
         raise HTTPException(404, "No fair-value data for this card yet")
 
+    if fv.needs_card_regeneration(row):
+        await ensure_cards_requested(pool, [str(card_id)])
+
     if row.get("data_quality_suspect"):
         # Our own median is wildly inconsistent with the live BIN - a
         # resolved incident showed this happens when a scraper bug
@@ -119,6 +123,9 @@ async def undervalued_board(
         min_sales_24h=min_sales_24h,
         min_discount_pct=min_discount_pct,
     )
+    needs_card = [str(r["card_id"]) for r in items if fv.needs_card_regeneration(r)]
+    if needs_card:
+        await ensure_cards_requested(pool, needs_card)
     return {"items": items, "count": len(items)}
 
 
@@ -128,6 +135,9 @@ async def undervalued_teaser(request: Request):
     Enough to prove the edge is real; not enough to trade off."""
     pool = _player_pool(request)
     items = await fv.get_undervalued(pool, limit=3)
+    needs_card = [str(r["card_id"]) for r in items if fv.needs_card_regeneration(r)]
+    if needs_card:
+        await ensure_cards_requested(pool, needs_card)
     return {
         "items": [_teaser(r) for r in items],
         "locked": True,
@@ -146,4 +156,7 @@ async def anomaly_radar(
     items = await fv.get_anomalies(
         pool, limit=limit, zscore_threshold=zscore, min_sales_24h=min_sales_24h
     )
+    needs_card = [str(r["card_id"]) for r in items if fv.needs_card_regeneration(r)]
+    if needs_card:
+        await ensure_cards_requested(pool, needs_card)
     return {"items": items, "count": len(items)}

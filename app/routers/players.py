@@ -10,9 +10,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 # If you already have this service, it's safe to import (it doesn't import main)
 from app.services.price_history import get_price_history
-from app.db import get_player_db
+from app.db import get_player_db, get_player_pool
 from app.futbin_client import fetch_price_by_url
 from app.auth.entitlements import require_feature
+from app.services.player_card_ondemand import ensure_cards_requested
 
 router = APIRouter(prefix="/api/players", tags=["players"])
 
@@ -60,31 +61,37 @@ async def resolve_player_by_name(
         # Search for exact match first, then fuzzy match
         row = await conn.fetchrow(
             """
-            SELECT card_id, name, rating, version, image_url, club, league, nation, position, altposition, price_num, price
-            FROM fut_players 
+            SELECT card_id, name, rating, version, image_url, club, league, nation, position, altposition, price_num, price,
+                   generated_card_url, generated_card_status, generated_card_flagged
+            FROM fut_players
             WHERE LOWER(name) = LOWER($1)
             ORDER BY rating DESC
             LIMIT 1
             """,
             name.strip()
         )
-        
+
         if not row:
             # Try fuzzy matching
             row = await conn.fetchrow(
                 """
-                SELECT card_id, name, rating, version, image_url, club, league, nation, position, altposition, price_num, price
-                FROM fut_players 
+                SELECT card_id, name, rating, version, image_url, club, league, nation, position, altposition, price_num, price,
+                       generated_card_url, generated_card_status, generated_card_flagged
+                FROM fut_players
                 WHERE LOWER(name) ILIKE LOWER($1)
                 ORDER BY rating DESC
                 LIMIT 1
                 """,
                 f"%{name.strip()}%"
             )
-        
+
         if not row:
             raise HTTPException(status_code=404, detail="Player not found")
-        
+
+        if row["generated_card_status"] != "ready" or row["generated_card_flagged"]:
+            pool = await get_player_pool()
+            await ensure_cards_requested(pool, [str(row["card_id"])])
+
         return {
             "card_id": int(row["card_id"]),
             "name": row["name"],
@@ -98,8 +105,11 @@ async def resolve_player_by_name(
             "altposition": row["altposition"],
             "price": row["price"],
             "price_num": row["price_num"],
+            "generated_card_url": row["generated_card_url"],
+            "generated_card_status": row["generated_card_status"],
+            "generated_card_flagged": row["generated_card_flagged"],
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -147,7 +157,8 @@ async def search_players(
     sql = f"""
         SELECT
           card_id, name, rating, version, image_url, club, league, nation,
-          position, altposition, price, price_num
+          position, altposition, price, price_num,
+          generated_card_url, generated_card_status, generated_card_flagged
         FROM fut_players
         WHERE {base_where}
         ORDER BY
@@ -174,9 +185,20 @@ async def search_players(
             "altposition": r["altposition"],
             "price": r["price"],
             "price_num": r["price_num"],
+            "generated_card_url": r["generated_card_url"],
+            "generated_card_status": r["generated_card_status"],
+            "generated_card_flagged": r["generated_card_flagged"],
         }
         for r in rows
     ]
+
+    needs_card = [
+        str(r["card_id"]) for r in rows
+        if r["generated_card_status"] != "ready" or r["generated_card_flagged"]
+    ]
+    if needs_card:
+        pool = await get_player_pool()
+        await ensure_cards_requested(pool, needs_card)
 
     return {"players": players, "data": players}
 
@@ -221,7 +243,8 @@ async def players_autocomplete(
 
     base_where = " AND ".join(where) if where else "TRUE"
     sql = f"""
-        SELECT card_id, name, rating, version, image_url, position
+        SELECT card_id, name, rating, version, image_url, position,
+               generated_card_url, generated_card_status, generated_card_flagged
         FROM fut_players
         WHERE {base_where}
         ORDER BY rating DESC NULLS LAST, name ASC
@@ -230,6 +253,7 @@ async def players_autocomplete(
     rows = await conn.fetch(sql, *params)
 
     items: List[Dict[str, Any]] = []
+    needs_card: List[str] = []
     for r in rows:
         cid = int(r["card_id"])
         name = r["name"]
@@ -246,7 +270,15 @@ async def players_autocomplete(
             "version": ver,
             "image_url": r["image_url"],
             "position": pos_label,
+            "generated_card_url": r["generated_card_url"],
+            "generated_card_status": r["generated_card_status"],
         })
+        if r["generated_card_status"] != "ready" or r["generated_card_flagged"]:
+            needs_card.append(str(cid))
+
+    if needs_card:
+        pool = await get_player_pool()
+        await ensure_cards_requested(pool, needs_card)
 
     return {"items": items}
 
@@ -439,7 +471,7 @@ async def get_player(card_id: str, conn = Depends(get_player_db)):
                card_bg_image, card_cutout_image, card_cutout_type, card_name, player_url,
                pace, shooting, passing, dribbling, defending, physicality,
                nation_image, league_image, club_image,
-               generated_card_url, generated_card_at
+               generated_card_url, generated_card_at, generated_card_status, generated_card_flagged
         FROM fut_players
         WHERE card_id::text = $1
         """,
@@ -455,6 +487,11 @@ async def get_player(card_id: str, conn = Depends(get_player_db)):
         d["avg_goals_console"] = float(d["avg_goals_console"])
     if d["avg_goals_pc"] is not None:
         d["avg_goals_pc"] = float(d["avg_goals_pc"])
+
+    if d["generated_card_status"] != "ready" or d["generated_card_flagged"]:
+        pool = await get_player_pool()
+        await ensure_cards_requested(pool, [str(d["card_id"])])
+
     return d
 
 @router.get("/{card_id}/meta")

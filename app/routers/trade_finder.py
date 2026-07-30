@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 # we’ll use your existing services
 from app.services.price_history import get_price_history
 from app.auth.entitlements import require_feature
+from app.services.player_card_ondemand import ensure_cards_requested
 
 # entitlements.py lists "trade_finder": "pro", but no route ever enforced
 # it - confirmed via a repo-wide grep for require_feature(). Gating here
@@ -188,7 +189,8 @@ async def trade_finder(
             )""")
 
         sql = f"""
-            SELECT card_id, name, rating, version, image_url, club, league, nation, position, altposition, price_num
+            SELECT card_id, name, rating, version, image_url, club, league, nation, position, altposition, price_num,
+                   generated_card_url, generated_card_status, generated_card_flagged
             FROM fut_players
             WHERE {' AND '.join(where)}
             ORDER BY rating DESC NULLS LAST
@@ -285,6 +287,9 @@ async def trade_finder(
                 "position": m.get("position"),
                 "league": m.get("league"),
                 "image_url": m.get("image_url"),
+                "generated_card_url": m.get("generated_card_url"),
+                "generated_card_status": m.get("generated_card_status"),
+                "generated_card_flagged": m.get("generated_card_flagged"),
                 "current_price": cur,
                 "expected_sell": target,
                 "est_profit_after_tax": net,
@@ -299,6 +304,13 @@ async def trade_finder(
         # sort by best net profit, then margin
         items.sort(key=lambda x: (x["est_profit_after_tax"], x["margin_pct"]), reverse=True)
         items = items[:topn]
+
+        needs_card = [
+            str(it["card_id"]) for it in items
+            if it.get("generated_card_status") != "ready" or it.get("generated_card_flagged")
+        ]
+        if needs_card:
+            await ensure_cards_requested(player_pool, needs_card)
 
         return {
             "items": items,

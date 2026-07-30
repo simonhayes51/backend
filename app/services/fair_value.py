@@ -149,6 +149,7 @@ async def refresher_loop(pool: asyncpg.Pool, interval_seconds: int = 300) -> Non
 _ROW_COLS = """
     card_id, name, rating, version, position, image_url,
     card_bg_image, card_cutout_image, card_cutout_type, card_name,
+    generated_card_url, generated_card_status, generated_card_at, generated_card_flagged,
     fair_value_24h, fair_value_7d, sales_24h, sales_7d,
     sales_per_hour_24h, volatility_24h, last_sale_at,
     current_bin, bin_captured_at, discount_pct, bin_zscore_24h,
@@ -158,13 +159,17 @@ _ROW_COLS = """
 
 def _row_to_dict(r: asyncpg.Record) -> Dict[str, Any]:
     d = dict(r)
-    for k in ("last_sale_at", "bin_captured_at", "computed_at"):
+    for k in ("last_sale_at", "bin_captured_at", "computed_at", "generated_card_at"):
         if d.get(k) is not None:
             d[k] = d[k].isoformat()
     for k in ("sales_per_hour_24h", "discount_pct", "bin_zscore_24h"):
         if d.get(k) is not None:
             d[k] = float(d[k])
     return d
+
+
+def needs_card_regeneration(row: Dict[str, Any]) -> bool:
+    return row.get("generated_card_status") != "ready" or bool(row.get("generated_card_flagged"))
 
 
 async def get_card_fair_value(pool: asyncpg.Pool, card_id: int) -> Optional[Dict[str, Any]]:
