@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 import asyncpg
-from playwright.async_api import Browser, Page
+from playwright.async_api import Browser, Page, async_playwright
 
 from app.services.object_storage import upload_png
 from app.services.player_card_data import fetch_player_render_data
@@ -38,6 +38,45 @@ def _lock_for(card_id: str) -> asyncio.Lock:
         lock = asyncio.Lock()
         _locks[card_id] = lock
     return lock
+
+
+# Shared, lazily-launched Chromium instance for callers that don't pass their
+# own browser/page (the admin single-card route and, primarily, the new
+# on-demand path in app/services/player_card_ondemand.py). Cold-launching
+# Chromium per call was costing ~1-2s of pure browser-startup overhead on
+# every cache-miss render; this launches once per process and is reused for
+# every subsequent context/page. Same launch args as the batch script
+# (scripts/generate_player_cards.py) and the backfill worker
+# (player_card_backfill.py) so behavior is identical, just not re-launched.
+_shared_browser: Optional[Browser] = None
+_shared_browser_lock = asyncio.Lock()
+
+_LAUNCH_ARGS = ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+
+
+async def _get_shared_browser() -> Browser:
+    global _shared_browser
+    async with _shared_browser_lock:
+        if _shared_browser is not None and _shared_browser.is_connected():
+            return _shared_browser
+        if _shared_browser is not None:
+            logger.warning("shared player-card browser was disconnected; relaunching")
+        pw = await async_playwright().start()
+        _shared_browser = await pw.chromium.launch(headless=True, args=_LAUNCH_ARGS)
+        return _shared_browser
+
+
+async def close_shared_browser() -> None:
+    """Best-effort cleanup for app shutdown. Safe to call even if the shared
+    browser was never launched."""
+    global _shared_browser
+    async with _shared_browser_lock:
+        if _shared_browser is not None:
+            try:
+                await _shared_browser.close()
+            except Exception:
+                logger.exception("error closing shared player-card browser")
+            _shared_browser = None
 
 
 class PlayerCardNotFoundError(RuntimeError):
@@ -77,6 +116,8 @@ def _public_result(row: Dict[str, Any], generated: bool) -> Dict[str, Any]:
         "status": row.get("generated_card_status"),
         "error": row.get("generated_card_error"),
         "generatedAt": generated_at.isoformat() if generated_at else None,
+        "flagged": bool(row.get("generated_card_flagged")),
+        "flagReason": row.get("generated_card_flag_reason"),
     }
 
 
@@ -130,7 +171,14 @@ async def ensure_generated_player_card(
             await _mark_status(conn, card_id, "generating")
 
         try:
-            rendered = await render_player_card_png(card_id, browser=browser, page=page)
+            effective_browser = browser
+            if effective_browser is None and page is None:
+                # Callers that pass neither (the on-demand path, and the
+                # admin single-card generate route) reuse one shared,
+                # already-warm Chromium instance instead of paying a fresh
+                # launch on every cache miss.
+                effective_browser = await _get_shared_browser()
+            rendered = await render_player_card_png(card_id, browser=effective_browser, page=page)
         except PlayerCardRenderError as exc:
             logger.error("Card %s render failed: %s", card_id, exc)
             async with pool.acquire() as conn:
@@ -172,11 +220,14 @@ async def ensure_generated_player_card(
                            generated_card_height = $6,
                            generated_card_at = NOW(),
                            generated_card_status = 'ready',
-                           generated_card_error = NULL
+                           generated_card_error = NULL,
+                           generated_card_flagged = FALSE,
+                           generated_card_flag_reason = NULL
                      WHERE card_id::text = $1
                     RETURNING generated_card_url, generated_card_key, generated_card_hash,
                               generated_card_width, generated_card_height, generated_card_at,
-                              generated_card_status, generated_card_error
+                              generated_card_status, generated_card_error,
+                              generated_card_flagged, generated_card_flag_reason
                     """,
                     str(card_id), image_url, key, current_hash, rendered.width, rendered.height,
                 )
@@ -195,4 +246,5 @@ __all__ = [
     "PlayerCardNotFoundError",
     "EXPORT_WIDTH",
     "EXPORT_HEIGHT",
+    "close_shared_browser",
 ]
