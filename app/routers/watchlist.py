@@ -138,17 +138,20 @@ async def list_watch_items(
         if m.get("generated_card_status") != "ready" or m.get("generated_card_flagged")
     ]
     if needs_card:
-        player_pool = await get_player_pool()
-        await ensure_cards_requested(player_pool, needs_card)
-
-    # live prices (console by row platform)
-    tasks = [_fetch_price(int(it["card_id"]), _plat(it["platform"])) for it in items]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            player_pool = await get_player_pool()
+            await ensure_cards_requested(player_pool, needs_card)
+        except Exception:
+            # Card rendering is an enhancement. A queue/database problem must
+            # never stop users from opening their saved watchlist.
+            pass
 
     enriched = []
-    for it, live in zip(items, results):
-        live = live if isinstance(live, dict) else {}
-        live_price = live.get("price") if isinstance(live, dict) else None
+    for it in items:
+        # The list endpoint must be fast and dependable. Use the last stored
+        # price here; the explicit /refresh action is responsible for making
+        # the external live-price call and updating these fields.
+        live_price = it.get("last_price")
 
         change = change_pct = None
         if isinstance(live_price, (int, float)) and it.get("started_price"):
@@ -169,8 +172,8 @@ async def list_watch_items(
             "started_price": it["started_price"],
             "started_at": it["started_at"].isoformat() if it.get("started_at") else None,  # ← safe
             "current_price": int(live_price) if isinstance(live_price, (int, float)) else None,
-            "is_extinct": bool(live.get("isExtinct", False)),
-            "updated_at": live.get("updatedAt"),
+            "is_extinct": False,
+            "updated_at": it["last_checked"].isoformat() if it.get("last_checked") else None,
             "change": change,
             "change_pct": change_pct,
             "notes": it["notes"],
