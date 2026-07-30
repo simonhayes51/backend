@@ -139,6 +139,25 @@ class TestPercentiles:
         assert tm.percentile([], Decimal("0.5")) is None
 
 
+class TestHistoricalFractionAtOrAboveLikely:
+    # Retained only as a rule-calibration diagnostic per the function's
+    # own docstring - not a forward probability - but it's the one
+    # function in this module with no prior test coverage, so a bad edit
+    # here (e.g. flipping >= to >) would have shipped silently.
+    def test_no_sales_is_none(self):
+        assert tm.historical_fraction_at_or_above_likely([], Decimal("1000")) is None
+
+    def test_counts_values_at_or_above_threshold_inclusive(self):
+        sales = [900, 1000, 1000, 1100, 1200]
+        assert tm.historical_fraction_at_or_above_likely(sales, Decimal("1000")) == 4 / 5
+
+    def test_all_below_threshold_is_zero(self):
+        assert tm.historical_fraction_at_or_above_likely([100, 200], Decimal("1000")) == 0.0
+
+    def test_all_at_or_above_threshold_is_one(self):
+        assert tm.historical_fraction_at_or_above_likely([1000, 2000], Decimal("1000")) == 1.0
+
+
 class TestScenarioPrices:
     def _sales(self, n, base=1000, step=10):
         return [base + i * step for i in range(n)]

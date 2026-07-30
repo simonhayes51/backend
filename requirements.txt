@@ -9,7 +9,7 @@ itsdangerous
 matplotlib
 requests
 beautifulsoup4
-httpx
+httpx<0.28  # starlette 0.27.x's TestClient breaks on httpx>=0.28 (dropped the `app=` kwarg); unpinned, this silently installed an incompatible httpx and made TestClient-based tests impossible to run
 PyJWT==2.9.0
 stripe
 lightweight-charts
