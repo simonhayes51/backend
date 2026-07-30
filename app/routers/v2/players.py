@@ -34,7 +34,10 @@ router = APIRouter(tags=["v2-players"])
 # the critical path of every Player Page load - a slow or blocked
 # futbin.com response must not hang the whole endpoint. 3s is enough for
 # a normal page fetch and still fails fast if futbin.com is unreachable.
-_LIVE_CARD_LAYERS_TIMEOUT = 3.0
+_LIVE_CARD_LAYERS_TIMEOUT = 1.5
+_META_TIMEOUT = 2.5
+_CRITICAL_PANEL_TIMEOUT = 2.5
+_OPTIONAL_PANEL_TIMEOUT = 0.75
 
 
 async def _live_card_layers(meta: Dict[str, Any]) -> Any:
@@ -59,7 +62,7 @@ async def _live_card_layers(meta: Dict[str, Any]) -> Any:
     (parse_card_layers is called *outside* fetch_card_layers's own
     try/except) 500'd the entire summary endpoint rather than just
     skipping the card art enhancement."""
-    if meta.get("card_bg_image") or not meta.get("player_url"):
+    if meta.get("generated_card_url") or meta.get("card_bg_image") or not meta.get("player_url"):
         return None
     try:
         return await asyncio.wait_for(fetch_card_layers(meta["player_url"]), timeout=_LIVE_CARD_LAYERS_TIMEOUT)
@@ -67,12 +70,14 @@ async def _live_card_layers(meta: Dict[str, Any]) -> Any:
         return None
 
 
-async def _safe(coro) -> Any:
+async def _safe(coro, *, timeout: float = _CRITICAL_PANEL_TIMEOUT) -> Any:
     """One failing/gated panel must not 500 the whole summary response -
     the frontend renders each section independently and can show its own
     error/locked state for just that panel."""
     try:
-        return await coro
+        return await asyncio.wait_for(coro, timeout=timeout)
+    except asyncio.TimeoutError:
+        return {"error": "panel timed out", "status": 504}
     except HTTPException as e:
         return {"error": e.detail, "status": e.status_code}
     except Exception as e:
@@ -104,7 +109,13 @@ async def _deal_confidence(card_id: int, request: Request) -> Any:
 async def player_summary(card_id: int, request: Request) -> Dict[str, Any]:
     pool = await get_player_pool()
     async with pool.acquire() as conn:
-        meta = await get_player(str(card_id), conn)  # 404s naturally, propagates below
+        # Meta is the only hard dependency for rendering the page. Keep it
+        # bounded too: a saturated database must produce a fast error rather
+        # than leave the browser waiting for minutes.
+        meta = await asyncio.wait_for(
+            get_player(str(card_id), conn),
+            timeout=_META_TIMEOUT,
+        )  # 404s naturally, propagates below
 
     (
         market_metrics, fair_value, lazy_buyer_score, deal_confidence,
@@ -112,9 +123,12 @@ async def player_summary(card_id: int, request: Request) -> Dict[str, Any]:
     ) = await asyncio.gather(
         _safe(_market_metrics(card_id)),
         _safe(card_fair_value(card_id, request)),
-        _safe(_lazy_buyer_score(card_id)),
-        _safe(_deal_confidence(card_id, request)),
-        _safe(get_card_scores(card_id, request)),
+        # These panels are supplementary and the Lazy Buyer calculation can
+        # rank the entire tracked market on a cold worker. Never let either
+        # delay the core player answer.
+        _safe(_lazy_buyer_score(card_id), timeout=_OPTIONAL_PANEL_TIMEOUT),
+        _safe(_deal_confidence(card_id, request), timeout=_OPTIONAL_PANEL_TIMEOUT),
+        _safe(get_card_scores(card_id, request), timeout=_OPTIONAL_PANEL_TIMEOUT),
         _safe(get_player_recommendation(card_id, request)),
         compute_entitlements(request),
         _live_card_layers(meta),
