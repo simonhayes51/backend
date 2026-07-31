@@ -390,3 +390,32 @@ class TestValuation:
         score = tm.valuation_score(fair_value_24h=1000, entry_price=1, likely_price=1, bin_zscore_24h=-100)
         assert score is not None
         assert -1.0 <= score <= 1.0
+
+
+# =============================================================================
+# Popularity
+# =============================================================================
+
+class TestPopularity:
+    def test_missing_games_played_is_unavailable(self):
+        assert tm.popularity_score(games_played=None, avg_goals=0.5) is None
+
+    def test_zero_games_played_is_real_zero(self):
+        assert tm.popularity_score(games_played=0, avg_goals=None) == 0.0
+
+    def test_more_games_played_increases_score(self):
+        low = tm.popularity_score(games_played=100, avg_goals=0.5)
+        high = tm.popularity_score(games_played=10000, avg_goals=0.5)
+        assert low is not None and high is not None
+        assert high > low
+
+    def test_more_goals_increases_score(self):
+        low_goals = tm.popularity_score(games_played=1000, avg_goals=0.1)
+        high_goals = tm.popularity_score(games_played=1000, avg_goals=1.0)
+        assert low_goals is not None and high_goals is not None
+        assert high_goals > low_goals
+
+    def test_score_bounded_zero_to_one(self):
+        score = tm.popularity_score(games_played=1_000_000, avg_goals=10.0)
+        assert score is not None
+        assert 0.0 <= score <= 1.0

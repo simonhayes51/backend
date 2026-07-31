@@ -96,6 +96,11 @@ CONFIDENCE_MAX_ACCEPTABLE_STALENESS_MIN = 60
 CONFIDENCE_SAMPLE_WEIGHT = 0.40
 CONFIDENCE_FRESHNESS_WEIGHT = 0.35
 CONFIDENCE_CONSISTENCY_WEIGHT = 0.25
+
+POPULARITY_GAMES_SATURATION_POINT = 5000  # games_played at/above this saturates the usage component
+POPULARITY_GOALS_REFERENCE = 1.0  # avg_goals per game at/above this saturates the output component
+POPULARITY_GAMES_WEIGHT = 0.6
+POPULARITY_GOALS_WEIGHT = 0.4
 assert abs(
     CONFIDENCE_SAMPLE_WEIGHT + CONFIDENCE_FRESHNESS_WEIGHT + CONFIDENCE_CONSISTENCY_WEIGHT - 1.0
 ) < 1e-9, "confidence score weights must sum to 1"
@@ -520,6 +525,39 @@ def risk_score(
 
     return _clamp(
         RISK_VOLATILITY_WEIGHT * volatility_component + RISK_STALENESS_WEIGHT * staleness_component,
+        0.0,
+        1.0,
+    )
+
+
+# =============================================================================
+# Popularity score
+# =============================================================================
+
+def popularity_score(
+    games_played: Optional[int],
+    avg_goals: Optional[Number],
+) -> Optional[float]:
+    """In-game usage/output signal, from fut_players.games_played_console/
+    pc and avg_goals_console/pc (bin_sales_history_sync.py's own bio-text
+    parse - no assists/win-rate data is scraped, so this is the only
+    honest input available). None when games_played is missing - a card
+    nobody has usage data for is UNRANKED, not "unpopular" (0). A real 0
+    games_played is a genuine signal and is scored as 0."""
+
+    if games_played is None:
+        return None
+
+    if games_played <= 0:
+        return 0.0
+
+    usage_component = _clamp(
+        math.log(1 + games_played) / math.log(1 + POPULARITY_GAMES_SATURATION_POINT), 0.0, 1.0
+    )
+    output_component = _clamp(float(avg_goals or 0) / POPULARITY_GOALS_REFERENCE, 0.0, 1.0)
+
+    return _clamp(
+        POPULARITY_GAMES_WEIGHT * usage_component + POPULARITY_GOALS_WEIGHT * output_component,
         0.0,
         1.0,
     )
