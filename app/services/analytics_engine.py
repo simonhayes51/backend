@@ -34,6 +34,7 @@ from typing import Any, Dict, List, Optional
 
 import asyncpg
 
+from app.services import trading_math as tm
 from app.services.deal_confidence import compute_deal_confidence
 
 log = logging.getLogger("analytics_engine")
@@ -45,6 +46,7 @@ ENGINE_VERSION = "rule_v1"
 SCORE_TYPES = [
     "investment", "risk", "confidence", "recovery_probability", "crash_probability",
     "market_regime", "momentum", "supply_pressure", "demand_pressure", "opportunity",
+    "popularity",
 ]
 
 DAILY_SCORE_TYPES = {"recovery_probability", "crash_probability"}
@@ -126,6 +128,28 @@ async def compute_confidence_score(card_id: int) -> float:
     duplicated here."""
     result = await compute_deal_confidence(card_id)
     return float(result.get("score") or 0)
+
+
+async def compute_popularity_score(conn: asyncpg.Connection, card_id: int) -> Optional[float]:
+    """In-game usage/output signal - see trading_math.popularity_score's
+    docstring for exactly what data backs this (games_played + avg_goals,
+    console-or-PC, no assists/win-rate data exists to add). Returns None
+    (not written as a row) when fut_players never recorded a games_played
+    value for this card, same "unavailable, not zero" discipline as every
+    other score here."""
+    row = await conn.fetchrow(
+        """
+        SELECT
+            COALESCE(games_played_console, games_played_pc) AS games_played,
+            COALESCE(avg_goals_console, avg_goals_pc) AS avg_goals
+        FROM fut_players WHERE card_id = $1
+        """,
+        card_id,
+    )
+    if row is None:
+        return None
+    raw = tm.popularity_score(row["games_played"], row["avg_goals"])
+    return None if raw is None else raw * 100
 
 
 def compute_momentum(fv_row: Dict[str, Any]) -> float:
@@ -301,6 +325,10 @@ async def _score_one_card(
         scores["crash_probability"] = compute_crash_probability(fv_row)
 
     scores["opportunity"] = compute_opportunity_score(scores)
+
+    popularity = await compute_popularity_score(conn, card_id)
+    if popularity is not None:
+        scores["popularity"] = popularity
 
     now = datetime.now(timezone.utc)
     return [
