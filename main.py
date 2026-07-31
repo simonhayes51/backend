@@ -75,6 +75,7 @@ from app.services.recommendation_engine import refresher_loop as recommendation_
 from app.services.recommendation_engine_v2 import refresher_loop_v2 as recommendation_engine_v2_refresher_loop
 from app.services.ml_feature_pipeline import refresher_loop as ml_feature_pipeline_refresher_loop
 from app.services.ml_label_filler import refresher_loop as ml_label_filler_refresher_loop
+from app.services.held_position_refresher import refresher_loop as held_position_refresher_loop
 
 
 # ----------------- BOOTSTRAP -----------------
@@ -540,6 +541,16 @@ async def lifespan(app: FastAPI):
         ml_label_filler_refresher_loop(player_pool, ml_label_poll)
     )
     logging.info("✅ ML label filler started (poll every %ss)", ml_label_poll)
+
+    # Live verdict on every open (still-held) trade - wires
+    # recommendation_engine_v2.py's _evaluate_held_position to real data
+    # for the first time (migration 035). Independent pool bridge: trades
+    # live in `pool`, card market data lives in `player_pool`.
+    held_position_poll = int(os.getenv("HELD_POSITION_REFRESHER_POLL_SECONDS", "900"))
+    app.state.held_position_refresher_task = asyncio.create_task(
+        held_position_refresher_loop(pool, player_pool, held_position_poll)
+    )
+    logging.info("✅ Held-position refresher started (poll every %ss)", held_position_poll)
 
     # The "social trading features" users-table ALTER/index block that used
     # to run here is now part of migrations/015_consolidate_core_bootstrap.sql
