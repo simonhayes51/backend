@@ -403,6 +403,15 @@ async def batch_market_metrics(
                 ps_bin and median_24h is not None
                 and (median_24h < ps_bin * 0.1 or median_24h > ps_bin * 10)
             )
+
+            # A BIN-listing-price gap only, NOT a fair-value gap: sales_history
+            # is PS-only, so there's no PC-side completed-sale data to back a
+            # "worth" claim on that platform - this must never be labeled as
+            # fair value, only as what each platform's current listings show.
+            pc_bin = bins_by_card.get(cid, {}).get("pc")
+            ps_pc_bin_gap_pct = (
+                round((pc_bin - ps_bin) / ps_bin * 100, 2) if ps_bin and pc_bin else None
+            )
             if data_quality_suspect:
                 median_24h = None
                 median_7d = None
@@ -431,6 +440,7 @@ async def batch_market_metrics(
 
             items[str(cid)] = {
                 "currentBin": bins_by_card.get(cid, {}),
+                "psPcBinGapPct": ps_pc_bin_gap_pct,
                 "dataQualitySuspect": data_quality_suspect,
                 "realPrice": {
                     "medianSold24h": median_24h,
@@ -1219,6 +1229,15 @@ async def get_player_market_metrics_route(
         if ps_bin and median_24h is not None:
             divergence_pct_24h = round((median_24h - ps_bin) / ps_bin * 100, 2)
 
+        # A BIN-listing-price gap only, NOT a fair-value gap: sales_history
+        # is PS-only, so there's no PC-side completed-sale data to back a
+        # "worth" claim on that platform - this must never be labeled as
+        # fair value, only as what each platform's current listings show.
+        pc_bin = current_bin.get("pc")
+        ps_pc_bin_gap_pct = (
+            round((pc_bin - ps_bin) / ps_bin * 100, 2) if ps_bin and pc_bin else None
+        )
+
         cv_24h = round((stddev_24h or 0) / median_24h, 4) if median_24h else None
 
         snipe_index_24h = round(snipe_count_24h / n_24h, 3) if n_24h > 0 and not data_quality_suspect else None
@@ -1238,6 +1257,7 @@ async def get_player_market_metrics_route(
         return {
             "card_id": card_id,
             "currentBin": current_bin,
+            "psPcBinGapPct": ps_pc_bin_gap_pct,
             "dataQualitySuspect": data_quality_suspect,
             "realPrice": {
                 "medianSold24h": median_24h,
