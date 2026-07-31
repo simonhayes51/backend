@@ -61,6 +61,9 @@ Feature = Literal[
     "advanced_api_v2",
     "trade_journal",
     "opportunity_feed",
+    # Real per-message LLM cost (unlike ai_copilot's free keyword matcher),
+    # so this is gated Pro+ from day one rather than free.
+    "ai_chat",
 ]
 
 Tier = Literal["free", "pro", "elite"]
@@ -114,6 +117,7 @@ FEATURE_MIN_TIER: Dict[Feature, Tier] = {
     "portfolio_performance": "pro",
     "daily_ai_briefing": "pro",
     "trade_journal": "pro",
+    "ai_chat": "pro",
     # v2 - Elite (the edge)
     "opportunity_feed": "elite",
     "advanced_backtesting": "elite",

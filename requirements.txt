@@ -19,3 +19,4 @@ pytest>=8.0
 boto3>=1.34
 botocore>=1.34
 playwright==1.49.0
+openai==1.54.0  # pinned conservatively; requires httpx<1,>=0.23.0, compatible with the httpx<0.28 pin above
