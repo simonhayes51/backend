@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -103,10 +104,30 @@ async def compute_event_impact(player_pool: asyncpg.Pool) -> int:
     written = 0
     async with player_pool.acquire() as conn:
         events = await conn.fetch(
-            "SELECT id, kind, starts_at FROM market_events WHERE kind = 'sbc'"
+            "SELECT id, kind, starts_at, payload FROM market_events WHERE kind IN ('sbc', 'promo')"
         )
         for ev in events:
             event_id, starts_at = ev["id"], ev["starts_at"]
+
+            if ev["kind"] == "promo":
+                # A promo event has no single reward/target card the way an
+                # SBC does - auto_sync/promo_event_detector.py's own cluster
+                # of newly-discovered cards ARE the affected set. There's no
+                # meaningful "before" BIN for a card that didn't exist
+                # before this event (before-lookup correctly returns None,
+                # not a fabricated value), but price/volume trend since
+                # release is still a real, useful signal.
+                payload = ev["payload"]
+                if isinstance(payload, str):
+                    payload = json.loads(payload)
+                for card_id in (payload or {}).get("card_ids", []):
+                    card_id = int(card_id)
+                    pb, pa, mb, ma = await _bin_before_after(conn, card_id, starts_at)
+                    vb = await _sales_volume_24h(conn, card_id, starts_at)
+                    va = await _sales_volume_24h(conn, card_id, datetime.now(timezone.utc))
+                    await _upsert_impact(conn, event_id, card_id, "promo_card", pb, pa, mb, ma, vb, va)
+                    written += 1
+                continue
 
             # reward_supply: structural - the SBC's own reward card, if any.
             # A new supply of that exact card enters the market on
