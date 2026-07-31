@@ -161,13 +161,16 @@ async def compute_event_impact(player_pool: asyncpg.Pool) -> int:
                     await _upsert_impact(conn, event_id, card_id, "requirement_target", pb, pa, mb, ma, vb, va)
                     written += 1
 
-            # fodder_demand / meta_shift: heuristic-only, not exhaustive.
-            # A real fodder-demand model needs the SBC's actual rating/
-            # league/nation requirement bands, which sbc_challenges.requirements
-            # already carries per-challenge but this first pass doesn't yet
-            # cross-reference - flagged here rather than presented as
-            # equivalent in rigor to the two structural relations above.
-            # Intentionally not computed in this version.
+            # fodder_demand / meta_shift: this per-event, per-card impact
+            # relation is still not computed here - a real per-card fodder-
+            # demand row would need to know every card genuinely eligible
+            # for an SBC's rating/chemistry bands, not just its nation/
+            # league. The aggregate nation/league version of this signal
+            # (how many currently-live SBCs name a given nation/league) IS
+            # computed now, in app/services/sbc_demand.py, and wired into
+            # dashboard.py's BUY reasoning directly - that's a coarser but
+            # honest version of this same gap, closed without pretending to
+            # the per-card rigor the two structural relations above have.
 
     return written
 

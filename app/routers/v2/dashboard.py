@@ -26,6 +26,7 @@ from fastapi import APIRouter, Request
 from app.auth.entitlements import compute_entitlements
 from app.db import get_core_pool, get_player_pool, get_watchlist_db
 from app.services.player_card_ondemand import ensure_cards_requested
+from app.services.sbc_demand import compute_sbc_demand
 
 router = APIRouter(tags=["v2-dashboard"])
 
@@ -100,6 +101,29 @@ def _reasoning_text(status: Optional[str], qualified_strategies: List[str], fail
     return ""
 
 
+def _sbc_demand_note(
+    status: Optional[str],
+    nation: Optional[str],
+    league: Optional[str],
+    sbc_demand: Optional[Dict[str, Dict[str, int]]],
+) -> str:
+    """Only ever added to a BUY reasoning string - a card's nation/league
+    being in current SBC demand is a real, cite-able driver, never
+    surfaced for any other status (AVOID/WAIT etc. already have their own
+    honest reasoning and this isn't a reason to override it)."""
+    if status != "BUY" or not sbc_demand:
+        return ""
+    nation_count = sbc_demand.get("nation", {}).get(nation or "", 0)
+    league_count = sbc_demand.get("league", {}).get(league or "", 0)
+    if nation_count and league_count:
+        return f" {nation}/{league} cards are in demand across {nation_count + league_count} currently-live SBCs."
+    if nation_count:
+        return f" {nation} cards are in demand across {nation_count} currently-live SBC{'s' if nation_count != 1 else ''}."
+    if league_count:
+        return f" {league} cards are in demand across {league_count} currently-live SBC{'s' if league_count != 1 else ''}."
+    return ""
+
+
 def _drivers_to_strings(drivers: List[Dict[str, Any]]) -> List[str]:
     out = []
     for d in drivers or []:
@@ -126,7 +150,11 @@ def _regime_summary(state: str, indicators: Dict[str, Any]) -> str:
     return "Prices and sales are behaving normally across tracked cards right now."
 
 
-def _to_recommendation(d: Dict[str, Any], scores: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
+def _to_recommendation(
+    d: Dict[str, Any],
+    scores: Optional[Dict[str, float]] = None,
+    sbc_demand: Optional[Dict[str, Dict[str, int]]] = None,
+) -> Dict[str, Any]:
     """Reshapes a recommendations_latest row (+ optional card_scores) into
     the frontend's Recommendation contract. current_bin/fair_value_24h/
     sales_24h/sales_7d aren't columns on recommendations/
@@ -215,7 +243,10 @@ def _to_recommendation(d: Dict[str, Any], scores: Optional[Dict[str, float]] = N
         "sales7d": d.get("sales_7d"),
         "dataQuality": "SUSPECT" if d.get("data_quality_suspect") else ("GOOD" if d.get("sales_24h") else "LIMITED"),
         "updatedAt": computed_at.isoformat() if hasattr(computed_at, "isoformat") else computed_at,
-        "reasoning": _reasoning_text(status, qualified_strategies, failed_gate_reasons, held_decision_reasons) if has_evaluation else "",
+        "reasoning": (
+            _reasoning_text(status, qualified_strategies, failed_gate_reasons, held_decision_reasons)
+            + _sbc_demand_note(status, d.get("nation"), d.get("league"), sbc_demand)
+        ) if has_evaluation else "",
         "marketDrivers": _drivers_to_strings(d.get("market_drivers") or []),
         "historicalSimilarEvents": d.get("similar_events") or [],
         "isHeld": bool(d.get("is_held")),
@@ -309,7 +340,7 @@ async def get_dashboard(request: Request) -> Dict[str, Any]:
                    p.card_bg_image, p.card_cutout_image, p.card_cutout_type, p.card_name,
                    p.generated_card_url, p.generated_card_status, p.generated_card_flagged,
                    p.pace, p.shooting, p.passing, p.dribbling, p.defending, p.physicality,
-                   p.nation_image, p.league_image, p.club_image,
+                   p.nation_image, p.league_image, p.club_image, p.nation, p.league,
                    fv.current_bin, fv.fair_value_24h, fv.sales_24h, fv.sales_7d, fv.data_quality_suspect
             FROM recommendations_latest r
             LEFT JOIN fut_players p ON p.card_id = r.card_id
@@ -350,10 +381,17 @@ async def get_dashboard(request: Request) -> Dict[str, Any]:
         all_ids = list({r["card_id"] for r in [*buy_rows, *avoid_rows, *recent_rows]})
         scores_map = await _scores_by_card(conn, all_ids)
 
+    # Aggregate SBC nation/league demand - a new BUY driver, never a hard
+    # dependency: a failure here must never break the whole dashboard.
+    try:
+        sbc_demand = await compute_sbc_demand(player_pool)
+    except Exception:
+        sbc_demand = None
+
     buys = [_decode_rec_row(r) for r in buy_rows]
-    all_opportunities = [_to_recommendation(d, scores_map.get(d["card_id"])) for d in buys]
+    all_opportunities = [_to_recommendation(d, scores_map.get(d["card_id"]), sbc_demand) for d in buys]
     all_high_confidence = [
-        _to_recommendation(d, scores_map.get(d["card_id"])) for d in buys if float(d.get("confidence") or 0) >= 70
+        _to_recommendation(d, scores_map.get(d["card_id"]), sbc_demand) for d in buys if float(d.get("confidence") or 0) >= 70
     ]
 
     if opportunities_unlocked:
