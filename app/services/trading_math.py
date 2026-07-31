@@ -92,7 +92,14 @@ LIQUIDITY_MIN_RATE_FLOOR = 0.01
 LIQUIDITY_ACCEL_REFERENCE = 2.0
 
 CONFIDENCE_SAMPLE_SATURATION_POINT = 20
-CONFIDENCE_MAX_ACCEPTABLE_STALENESS_MIN = 60
+# Must stay equal to strategy_config.py's MAX_ACCEPTABLE_STALENESS_MINUTES
+# (raised from 60 to 90 there - see that constant's comment for why) -
+# letting these drift apart is what turned one stale-price condition into
+# two compounding failure reasons (STALE_PRICE from the hard gate, plus
+# this freshness_component hitting exactly 0 at the old 60-min cutoff,
+# zeroing the whole geometric-blend confidence score into LOW_CONFIDENCE)
+# rather than the same root cause reported once.
+CONFIDENCE_MAX_ACCEPTABLE_STALENESS_MIN = 90
 CONFIDENCE_SAMPLE_WEIGHT = 0.40
 CONFIDENCE_FRESHNESS_WEIGHT = 0.35
 CONFIDENCE_CONSISTENCY_WEIGHT = 0.25
