@@ -20,10 +20,16 @@ from app.services.fair_value import get_freshness
 
 router = APIRouter(prefix="/api/ops", tags=["ops"])
 
-# Max acceptable staleness per signal, in minutes.
+# Max acceptable staleness per signal, in minutes. last_sale_at/last_bin_at
+# must match strategy_config.py's MAX_ACCEPTABLE_STALENESS_MINUTES (raised
+# from 60 to 90 - see that constant's comment): auto_sync/
+# bin_sales_history_sync.py's Tier A candidate pool has grown enough that a
+# full sweep can now take well over an hour even without the overlap-guard
+# bug that used to make it worse, so 60 was alerting on every normal cycle,
+# not just real outages.
 THRESHOLDS_MIN = {
-    "last_sale_at": 60,            # sales sync runs every ~10 min
-    "last_bin_at": 60,
+    "last_sale_at": 90,
+    "last_bin_at": 90,
     "last_catalog_price_at": 60 * 30,  # daily catalog crawl
     "fair_value_computed_at": 30,
 }

@@ -83,7 +83,19 @@ LAZY_BUYER_MIN_NET_ROI = Decimal("0.03")  # "must clear the configured lazy-buye
 # have an opinion".
 MIN_DECISION_CONFIDENCE = 0.35
 
-MAX_ACCEPTABLE_STALENESS_MINUTES = 60
+# Raised from 60: auto_sync/bin_sales_history_sync.py's Tier A candidate
+# pool has grown ~1.7x since the ~37-47min/2500-candidate baseline the
+# original 60-minute figure assumed (now ~4,268 candidates, realistically
+# ~63-80min/sweep even with the overlap-guard fix in that repo) - 60
+# minutes was failing STALE_PRICE for the vast majority of tracked cards
+# regardless of scrape health. Must stay equal to trading_math.py's
+# CONFIDENCE_MAX_ACCEPTABLE_STALENESS_MIN (letting them drift apart is
+# what turned one stale-price condition into two compounding failure
+# reasons - STALE_PRICE and LOW_CONFIDENCE - being logged as if
+# independent). Confirm/adjust from real post-fix sweep timing rather
+# than treating 90 as final - see app/routers/ops.py's THRESHOLDS_MIN
+# for the matching operational freshness threshold.
+MAX_ACCEPTABLE_STALENESS_MINUTES = 90
 
 
 def validate_policies() -> None:
