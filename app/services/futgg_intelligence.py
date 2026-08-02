@@ -244,6 +244,17 @@ def evaluate_card(snapshot: Dict[str, Any], *, as_of: Optional[datetime] = None)
         reasons.append(f"Recent sales dispersion ratio {dispersion_ratio:.2f} is extreme (>= {EXTREME_DISPERSION_RATIO}) - the price is too volatile to anchor a fair value on right now.")
     if current_bin is None:
         reasons.append("No live BIN listing found.")
+    sales_estimate = sales_trimmed_mean if sales_trimmed_mean is not None else sales_median
+    if sales_estimate is None:
+        # Should be unreachable when sales_count >= MIN_SALES_FOR_SIGNAL,
+        # since sales_count/sales_median/sales_trimmed_mean all come from
+        # the same grouped query in futgg_market_snapshot - but this was
+        # previously an `assert`, which is a real 500 (or, worse, a
+        # silent no-op under `python -O`) if that invariant is ever
+        # violated by a snapshot row this function didn't anticipate.
+        # Degrade to the same "insufficient_data" outcome as every other
+        # gate here instead of trusting an assumption about upstream SQL.
+        reasons.append("No recent-sales price estimate available for this card.")
 
     insufficient = bool(reasons)
 
@@ -258,8 +269,6 @@ def evaluate_card(snapshot: Dict[str, Any], *, as_of: Optional[datetime] = None)
         )
 
     # ---- Fair value: confidence-weighted blend of sales evidence + BIN ----
-    sales_estimate = sales_trimmed_mean if sales_trimmed_mean is not None else sales_median
-    assert sales_estimate is not None  # guaranteed by the sales_count gate above
 
     sales_weight = Decimal(str(FAIR_VALUE_SALES_WEIGHT))
     bin_weight = Decimal(str(FAIR_VALUE_BIN_WEIGHT))
