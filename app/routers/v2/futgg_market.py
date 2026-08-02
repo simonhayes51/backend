@@ -96,6 +96,11 @@ def _serialize_player(row: Dict[str, Any]) -> Dict[str, Any]:
         int((datetime.now(timezone.utc) - bin_captured_at).total_seconds())
         if bin_captured_at is not None else None
     )
+    # image_url alias: the frontend's card-image rendering (Players/
+    # Opportunities/Trade Finder result rows) reads a generic `image_url`
+    # field regardless of source - player_image_url is the FUT.GG-specific
+    # column name (see futgg_players schema).
+    out["image_url"] = out.get("player_image_url")
     for key in ("price_updated_at", "next_price_due_at", "bin_captured_at",
                 "latest_sale_at", "sales_window_earliest_at",
                 "sales_window_latest_at", "snapshot_computed_at"):
