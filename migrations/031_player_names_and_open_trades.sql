@@ -1,3 +1,4 @@
+-- target: player
 -- Run this migration against PLAYER_DATABASE_URL only.
 BEGIN;
 
