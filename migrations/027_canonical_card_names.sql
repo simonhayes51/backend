@@ -1,3 +1,4 @@
+-- target: player
 -- Make the short in-game card name the canonical display name everywhere.
 -- Existing rows often have the correct public name in `nickname` while `name`
 -- contains the player's full legal name. APIs already expose `card_name`, so
