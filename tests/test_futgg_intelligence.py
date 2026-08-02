@@ -144,6 +144,40 @@ class TestSignalDecision:
         assert any(char.isdigit() for char in joined)
 
 
+class TestDecimalFromAsyncpg:
+    """Regression test for a live 500: asyncpg returns Postgres numeric
+    columns as Decimal, not float. futgg_market_snapshot's
+    sales_window_span_minutes/sales_dispersion_ratio columns hit this in
+    production (`TypeError: unsupported operand type(s) for /: 'decimal.Decimal'
+    and 'float'` inside _compute_liquidity_score's `span_minutes / 60.0`) even
+    though every test fixture here had only ever used plain floats/ints,
+    which is exactly why it wasn't caught earlier."""
+
+    def test_decimal_span_minutes_does_not_raise(self):
+        ci = evaluate_card(
+            _snapshot(sales_window_span_minutes=Decimal("853.0"), sales_count=40),
+            as_of=AS_OF,
+        )
+        assert ci.liquidity_score is not None
+
+    def test_decimal_span_minutes_over_an_hour_formats_in_reasons(self):
+        # Exercises the second Decimal/float division site (the
+        # "occurred over the last N hours" reason string), which a
+        # short-span fixture never reaches.
+        ci = evaluate_card(
+            _snapshot(sales_window_span_minutes=Decimal("125.0"), sales_count=40),
+            as_of=AS_OF,
+        )
+        assert any("hour" in reason for reason in ci.signal_reasons)
+
+    def test_decimal_dispersion_ratio_does_not_raise(self):
+        ci = evaluate_card(
+            _snapshot(sales_dispersion_ratio=Decimal("0.0180")),
+            as_of=AS_OF,
+        )
+        assert ci.confidence_score is not None
+
+
 class TestApproximateTimeNeverClaimedExact:
     def test_intelligence_output_has_no_exact_timestamp_claim(self):
         ci = evaluate_card(_snapshot(), as_of=AS_OF)
