@@ -24,6 +24,7 @@ on top of this router rather than inside the provider/intelligence layers.
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -86,12 +87,40 @@ def _serialize_intelligence(ci: CardIntelligence) -> Dict[str, Any]:
 
 def _serialize_player(row: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(row)
+    bin_captured_at = out.get("bin_captured_at")
+    # Frontend-facing aliases (current_bin_captured_at / price_age_seconds)
+    # alongside the raw column names - computed here, not duplicated in SQL,
+    # since "now" has to be evaluated at serialization time either way.
+    out["current_bin_captured_at"] = bin_captured_at.isoformat() if bin_captured_at else None
+    out["price_age_seconds"] = (
+        int((datetime.now(timezone.utc) - bin_captured_at).total_seconds())
+        if bin_captured_at is not None else None
+    )
     for key in ("price_updated_at", "next_price_due_at", "bin_captured_at",
                 "latest_sale_at", "sales_window_earliest_at",
                 "sales_window_latest_at", "snapshot_computed_at"):
         if out.get(key) is not None:
             out[key] = out[key].isoformat()
     return out
+
+
+def _item_with_intelligence(row: Dict[str, Any], ci: CardIntelligence) -> Dict[str, Any]:
+    """Flattens the CardIntelligence fields onto the player dict (what the
+    frontend reads directly, e.g. item.recommended_buy_max) while also
+    keeping them nested under "intelligence" for any consumer that prefers
+    the grouped shape."""
+    intelligence = _serialize_intelligence(ci)
+    return {**_serialize_player(row), **intelligence, "intelligence": intelligence}
+
+
+def _resolve_rating_bounds(
+    rating: Optional[int], rating_min: Optional[int], rating_max: Optional[int],
+) -> tuple[Optional[int], Optional[int]]:
+    """`rating` is a single-value convenience alias (exact match) some
+    callers use instead of the rating_min/rating_max pair."""
+    if rating is not None:
+        return rating, rating
+    return rating_min, rating_max
 
 
 def _filters_from_query(
@@ -112,6 +141,7 @@ def _filters_from_query(
 @router.get("/players")
 async def list_players(
     search: Optional[str] = Query(None, description="Diacritic-insensitive name search"),
+    rating: Optional[int] = Query(None, ge=0, le=99, description="Single-value exact-rating alias for rating_min=rating_max"),
     rating_min: Optional[int] = Query(None, ge=0, le=99),
     rating_max: Optional[int] = Query(None, ge=0, le=99),
     position: Optional[str] = None,
@@ -122,8 +152,10 @@ async def list_players(
     max_price: Optional[int] = Query(None, ge=0, description="Affordability filter: current BIN <= this"),
     min_price: Optional[int] = Query(None, ge=0),
     max_price_age_minutes: Optional[int] = Query(None, ge=0, description="Freshness filter"),
+    max_price_age: Optional[int] = Query(None, ge=0, description="Alias for max_price_age_minutes"),
     risk: Optional[str] = Query(None, description="low|medium|high|avoid - computed, applied post-fetch"),
     min_expected_profit: Optional[float] = Query(None),
+    min_profit: Optional[float] = Query(None, description="Alias for min_expected_profit"),
     min_roi: Optional[float] = Query(None, description="Minimum expected net ROI, e.g. 0.05 for 5%"),
     min_confidence: Optional[float] = Query(None, ge=0, le=1),
     min_liquidity: Optional[float] = Query(None, ge=0, le=1),
@@ -131,6 +163,9 @@ async def list_players(
     page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
     provider: FutggMarketDataProvider = ProviderDep,
 ) -> Dict[str, Any]:
+    rating_min, rating_max = _resolve_rating_bounds(rating, rating_min, rating_max)
+    max_price_age_minutes = max_price_age_minutes if max_price_age_minutes is not None else max_price_age
+    min_expected_profit = min_expected_profit if min_expected_profit is not None else min_profit
     filters = _filters_from_query(
         search, rating_min, rating_max, position, rarity, club, league, nation,
         max_price, min_price, max_price_age_minutes,
@@ -158,7 +193,7 @@ async def list_players(
     )
     total = len(scored)
     window = scored[(page - 1) * page_size: page * page_size]
-    items = [{**_serialize_player(row), "intelligence": _serialize_intelligence(ci)} for row, ci in window]
+    items = [_item_with_intelligence(row, ci) for row, ci in window]
     return {"items": items, "page": page, "page_size": page_size, "total": total}
 
 
@@ -198,8 +233,12 @@ async def get_player_detail(
         raise HTTPException(404, "Card not found in the FUT.GG-backed market layer")
 
     ci = evaluate_card(row)
+    # Flattened onto the top level (frontend reads e.g. data.current_bin
+    # directly) as well as under "player"/"intelligence" for consumers
+    # that prefer the grouped shape.
     return {
         "source": "futgg",
+        **_item_with_intelligence(row, ci),
         "player": _serialize_player(row),
         "intelligence": _serialize_intelligence(ci),
     }
@@ -258,6 +297,7 @@ async def get_player_sales(
 
 @router.get("/opportunities")
 async def list_opportunities(
+    rating: Optional[int] = Query(None, ge=0, le=99),
     rating_min: Optional[int] = Query(None, ge=0, le=99),
     rating_max: Optional[int] = Query(None, ge=0, le=99),
     position: Optional[str] = None,
@@ -268,6 +308,8 @@ async def list_opportunities(
     max_price: Optional[int] = Query(None, ge=0),
     min_price: Optional[int] = Query(None, ge=0),
     max_price_age_minutes: Optional[int] = Query(None, ge=0),
+    max_price_age: Optional[int] = Query(None, ge=0, description="Alias for max_price_age_minutes"),
+    risk: Optional[str] = Query(None, description="low|medium|high|avoid - exact match"),
     min_profit: Optional[float] = Query(None),
     min_roi: Optional[float] = Query(None),
     min_confidence: Optional[float] = Query(None, ge=0, le=1),
@@ -276,13 +318,15 @@ async def list_opportunities(
     page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
     provider: FutggMarketDataProvider = ProviderDep,
 ) -> Dict[str, Any]:
+    rating_min, rating_max = _resolve_rating_bounds(rating, rating_min, rating_max)
+    max_price_age_minutes = max_price_age_minutes if max_price_age_minutes is not None else max_price_age
     filters = _filters_from_query(
         None, rating_min, rating_max, position, rarity, club, league, nation,
         max_price, min_price, max_price_age_minutes,
     )
     rows = await provider.search_players(filters, limit=CANDIDATE_SCAN_LIMIT, offset=0)
     scored = _score_and_filter(
-        rows, min_expected_profit=min_profit, min_roi=min_roi,
+        rows, risk=risk, min_expected_profit=min_profit, min_roi=min_roi,
         min_confidence=min_confidence, min_liquidity=min_liquidity,
         signals={"buy", "strong_buy"},
     )
@@ -295,9 +339,11 @@ async def list_opportunities(
     )
     total = len(scored)
     window = scored[(page - 1) * page_size: page * page_size]
-    items = [{**_serialize_player(row), "intelligence": _serialize_intelligence(ci)} for row, ci in window]
+    items = [_item_with_intelligence(row, ci) for row, ci in window]
     return {"items": items, "page": page, "page_size": page_size, "total": total}
 
+
+_SORT_ALIASES = {"best": "best_opportunity"}
 
 _TRADE_FINDER_SORTS = {
     "best_opportunity": lambda row_ci: (
@@ -319,20 +365,29 @@ async def trade_finder(
     min_profit: Optional[float] = Query(None),
     min_roi: Optional[float] = Query(None),
     risk_tolerance: Optional[str] = Query(None, description="low|medium|high - includes that risk level and better"),
+    risk: Optional[str] = Query(None, description="Alias for risk_tolerance"),
     min_confidence: Optional[float] = Query(None, ge=0, le=1),
     position: Optional[str] = None,
     rarity: Optional[str] = None,
+    rating: Optional[int] = Query(None, ge=0, le=99),
     rating_min: Optional[int] = Query(None, ge=0, le=99),
     rating_max: Optional[int] = Query(None, ge=0, le=99),
     min_liquidity: Optional[float] = Query(None, ge=0, le=1),
     max_price_age_minutes: Optional[int] = Query(None, ge=0),
+    max_price_age: Optional[int] = Query(None, ge=0, description="Alias for max_price_age_minutes"),
     sort_by: str = Query("best_opportunity", description="best_opportunity|profit|roi|confidence|liquidity|newest|freshest"),
+    sort: Optional[str] = Query(None, description="Alias for sort_by; also accepts 'best' for 'best_opportunity'"),
     page: int = Query(1, ge=1),
     page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
     provider: FutggMarketDataProvider = ProviderDep,
 ) -> Dict[str, Any]:
+    if sort is not None:
+        sort_by = _SORT_ALIASES.get(sort, sort)
     if sort_by not in _TRADE_FINDER_SORTS:
         raise HTTPException(400, f"sort_by must be one of {sorted(_TRADE_FINDER_SORTS)}")
+    risk_tolerance = risk_tolerance if risk_tolerance is not None else risk
+    rating_min, rating_max = _resolve_rating_bounds(rating, rating_min, rating_max)
+    max_price_age_minutes = max_price_age_minutes if max_price_age_minutes is not None else max_price_age
 
     filters = _filters_from_query(
         None, rating_min, rating_max, position, rarity, None, None, None,
@@ -358,7 +413,7 @@ async def trade_finder(
 
     total = len(scored)
     window = scored[(page - 1) * page_size: page * page_size]
-    items = [{**_serialize_player(row), "intelligence": _serialize_intelligence(ci)} for row, ci in window]
+    items = [_item_with_intelligence(row, ci) for row, ci in window]
     return {"items": items, "page": page, "page_size": page_size, "total": total, "sort_by": sort_by}
 
 
