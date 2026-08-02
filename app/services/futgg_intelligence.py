@@ -217,6 +217,12 @@ def evaluate_card(snapshot: Dict[str, Any], *, as_of: Optional[datetime] = None)
     sales_median = snapshot.get("sales_median")
     sales_trimmed_mean = snapshot.get("sales_trimmed_mean")
     span_minutes = snapshot.get("sales_window_span_minutes")
+    # Postgres numeric columns (EXTRACT(...)/60.0 in the snapshot view)
+    # come back from asyncpg as Decimal, not float - mixing that with a
+    # plain float literal (e.g. `span_minutes / 60.0`) raises TypeError.
+    # Normalize once here, same as dispersion_ratio below, rather than
+    # at each arithmetic site.
+    span_minutes = float(span_minutes) if span_minutes is not None else None
     dispersion_ratio = snapshot.get("sales_dispersion_ratio")
     dispersion_ratio = float(dispersion_ratio) if dispersion_ratio is not None else None
 
