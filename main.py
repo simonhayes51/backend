@@ -76,6 +76,7 @@ from app.services.recommendation_engine_v2 import refresher_loop_v2 as recommend
 from app.services.ml_feature_pipeline import refresher_loop as ml_feature_pipeline_refresher_loop
 from app.services.ml_label_filler import refresher_loop as ml_label_filler_refresher_loop
 from app.services.held_position_refresher import refresher_loop as held_position_refresher_loop
+from app.services.market_data_provider import refresher_loop as futgg_market_snapshot_refresher_loop
 
 
 # ----------------- BOOTSTRAP -----------------
@@ -552,6 +553,19 @@ async def lifespan(app: FastAPI):
     )
     logging.info("✅ Held-position refresher started (poll every %ss)", held_position_poll)
 
+    # FUT.GG market-intelligence snapshot (migrations/038): periodic
+    # REFRESH MATERIALIZED VIEW CONCURRENTLY of futgg_market_snapshot on
+    # the CORE db (auto_sync's futgg_players/futgg_bin_history/
+    # futgg_sales_history tables live there, not on player_pool) -
+    # watermark-gated same as the other refreshers above, and tolerates
+    # the underlying tables not existing yet if this backend boots before
+    # auto_sync has ever run (see that loop's own try/except).
+    futgg_snapshot_poll = int(os.getenv("FUTGG_MARKET_SNAPSHOT_REFRESH_SECONDS", "120"))
+    app.state.futgg_market_snapshot_task = asyncio.create_task(
+        futgg_market_snapshot_refresher_loop(pool, futgg_snapshot_poll)
+    )
+    logging.info("✅ FUT.GG market snapshot refresher started (poll every %ss)", futgg_snapshot_poll)
+
     # The "social trading features" users-table ALTER/index block that used
     # to run here is now part of migrations/015_consolidate_core_bootstrap.sql
     # (same columns/indexes, applied once via run_on_boot() above).
@@ -571,6 +585,7 @@ async def lifespan(app: FastAPI):
         for task_attr in (
             "event_impact_task", "analytics_engine_task", "recommendation_engine_task",
             "ml_feature_pipeline_task", "ml_label_filler_task",
+            "held_position_refresher_task", "futgg_market_snapshot_task",
         ):
             task = getattr(app.state, task_attr, None)
             if task:
