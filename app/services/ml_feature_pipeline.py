@@ -182,10 +182,35 @@ async def run_snapshot_pass(player_pool: asyncpg.Pool) -> int:
             await conn.execute("SELECT pg_advisory_unlock($1)", SNAPSHOT_LOCK_KEY)
 
 
+
+def _legacy_futbin_enabled() -> bool:
+    """The FUTBIN chain is retired - see main.py's lifespan comment.
+
+    fair_value_mv is broken on the current player database and its output
+    was not merely absent but actively wrong: a card priced 11,250 on
+    FUT.GG was served to the player page as 337,000 with an AVOID
+    verdict. Every user-visible surface now reads the FUT.GG layer, so
+    this loop would burn CPU and connections producing numbers nothing
+    should consume.
+
+    Disabled by default rather than deleted, so restoring it for FC27 is
+    a config change.
+    """
+    import os
+    return os.getenv("ENABLE_LEGACY_FUTBIN", "0").strip().lower() in {"1", "true", "yes", "on"}
+
 async def refresher_loop(player_pool: asyncpg.Pool, poll_seconds: int = 3600) -> None:
     """Genuinely time-based (not watermark-reactive like the
     recommendation engine's own loop) - "hourly feature snapshots" means
     hourly regardless of whether the underlying market data changed."""
+    if not _legacy_futbin_enabled():
+        log_name = __name__
+        import logging as _logging
+        _logging.getLogger(log_name).info(
+            "legacy FUTBIN loop disabled (ENABLE_LEGACY_FUTBIN unset)"
+        )
+        return
+
     await asyncio.sleep(20)
     while True:
         try:
