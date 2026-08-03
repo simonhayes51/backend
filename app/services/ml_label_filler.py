@@ -198,7 +198,32 @@ async def fill_due_labels(player_pool: asyncpg.Pool, *, batch_size: int = LABEL_
     return closed
 
 
+
+def _legacy_futbin_enabled() -> bool:
+    """The FUTBIN chain is retired - see main.py's lifespan comment.
+
+    fair_value_mv is broken on the current player database and its output
+    was not merely absent but actively wrong: a card priced 11,250 on
+    FUT.GG was served to the player page as 337,000 with an AVOID
+    verdict. Every user-visible surface now reads the FUT.GG layer, so
+    this loop would burn CPU and connections producing numbers nothing
+    should consume.
+
+    Disabled by default rather than deleted, so restoring it for FC27 is
+    a config change.
+    """
+    import os
+    return os.getenv("ENABLE_LEGACY_FUTBIN", "0").strip().lower() in {"1", "true", "yes", "on"}
+
 async def refresher_loop(player_pool: asyncpg.Pool, poll_seconds: int = 3600) -> None:
+    if not _legacy_futbin_enabled():
+        log_name = __name__
+        import logging as _logging
+        _logging.getLogger(log_name).info(
+            "legacy FUTBIN loop disabled (ENABLE_LEGACY_FUTBIN unset)"
+        )
+        return
+
     await asyncio.sleep(40)
     while True:
         try:
