@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from typing import Any, Dict, Optional, AsyncGenerator
 
@@ -25,9 +26,18 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from app.auth.entitlements import compute_entitlements
-from app.db import get_watchlist_db, get_player_db, get_player_pool
+from app.db import get_core_pool, get_watchlist_db, get_player_db, get_player_pool
 from app.futbin_client import fetch_price_by_card_id
+from app.services.market_data_provider import FutggMarketDataProvider
 from app.services.player_card_ondemand import ensure_cards_requested
+
+log = logging.getLogger("watchlist")
+
+VALID_SOURCES = {"futbin", "futgg"}
+
+
+async def _futgg_provider() -> FutggMarketDataProvider:
+    return FutggMarketDataProvider(await get_core_pool())
 
 router = APIRouter(prefix="/api/watchlist", tags=["watchlist"])
 
@@ -87,6 +97,13 @@ class WatchlistCreate(BaseModel):
     version: Optional[str] = None
     platform: str  # ps|xbox|pc
     notes: Optional[str] = None
+    # "futbin" (default, existing behavior) or "futgg" - which catalogue
+    # card_id belongs to, so add/list/refresh all know which lookup/price
+    # path to use for this row. Not validated against a live lookup here
+    # (the caller already knows which card they're adding); an
+    # unrecognized value falls back to "futbin" rather than erroring, so
+    # older frontend builds that never send this field keep working.
+    source: Optional[str] = "futbin"
 
 # ------------ Endpoints --------------------------------------------------------
 @router.get("")
@@ -104,8 +121,13 @@ async def list_watch_items(
     if not items:
         return {"ok": True, "items": []}
 
-    # Batch meta lookup (card_id is BIGINT)
-    card_ids = [int(it["card_id"]) for it in items if it.get("card_id") is not None]
+    # Batch meta lookup (card_id is BIGINT), split by source - a FUT.GG
+    # source_card_id will never match a row in the legacy fut_players
+    # table (different id space entirely), so querying it unconditionally
+    # for every row silently returned nothing for FUT.GG entries.
+    futbin_ids = [int(it["card_id"]) for it in items if it.get("card_id") is not None and it.get("source") != "futgg"]
+    futgg_ids = [int(it["card_id"]) for it in items if it.get("card_id") is not None and it.get("source") == "futgg"]
+
     meta_rows = await pdb.fetch(
         """
         SELECT card_id, name, rating, club, nation, version, image_url,
@@ -114,7 +136,7 @@ async def list_watch_items(
         FROM fut_players
         WHERE card_id = ANY($1::bigint[])
         """,
-        card_ids,
+        futbin_ids,
     )
     meta_map = {
         int(m["card_id"]): {
@@ -135,6 +157,9 @@ async def list_watch_items(
         for m in meta_rows
     }
 
+    futgg_provider = await _futgg_provider()
+    futgg_rows = await futgg_provider.get_players_by_ids(futgg_ids)
+
     needs_card = [
         str(cid) for cid, m in meta_map.items()
         if m.get("generated_card_status") != "ready" or m.get("generated_card_flagged")
@@ -150,10 +175,36 @@ async def list_watch_items(
 
     enriched = []
     for it in items:
-        # The list endpoint must be fast and dependable. Use the last stored
-        # price here; the explicit /refresh action is responsible for making
-        # the external live-price call and updating these fields.
-        live_price = it.get("last_price")
+        card_id = int(it["card_id"]) if it.get("card_id") is not None else None
+        is_futgg = it.get("source") == "futgg"
+
+        if is_futgg:
+            fg = futgg_rows.get(card_id)
+            # FUT.GG's price already lives on its own tiered refresh
+            # schedule (futgg_price_sync.py) - read the live current_bin
+            # straight from the snapshot rather than the row's own
+            # (possibly older) last_price column, no extra request needed.
+            live_price = fg.get("current_bin") if fg else None
+            is_extinct = fg is None or fg.get("is_tradeable") is False
+            m = {
+                "name": fg.get("name") if fg else it["player_name"],
+                "rating": fg.get("rating") if fg else None,
+                "club": fg.get("club") if fg else None,
+                "nation": fg.get("nation") if fg else None,
+                "version": fg.get("rarity") if fg else it.get("version"),
+                "image_url": fg.get("player_image_url") if fg else None,
+                "card_bg_image": None, "card_cutout_image": None, "card_cutout_type": None,
+                "card_name": fg.get("name") if fg else None,
+                "generated_card_url": None, "generated_card_status": None, "generated_card_flagged": None,
+            }
+        else:
+            # The list endpoint must be fast and dependable. Use the last
+            # stored price here; the explicit /refresh action is
+            # responsible for making the external live-price call and
+            # updating these fields.
+            live_price = it.get("last_price")
+            is_extinct = False
+            m = meta_map.get(card_id, {}) if card_id is not None else {}
 
         change = change_pct = None
         if isinstance(live_price, (int, float)) and it.get("started_price"):
@@ -164,17 +215,17 @@ async def list_watch_items(
             except Exception:
                 pass
 
-        m = meta_map.get(int(it["card_id"]), {}) if it.get("card_id") is not None else {}
         enriched.append({
             "id": it["id"],
             "card_id": it["card_id"],
+            "source": it.get("source", "futbin"),
             "player_name": it["player_name"],
             "version": it["version"],
             "platform": it["platform"],
             "started_price": it["started_price"],
             "started_at": it["started_at"].isoformat() if it.get("started_at") else None,  # ← safe
             "current_price": int(live_price) if isinstance(live_price, (int, float)) else None,
-            "is_extinct": False,
+            "is_extinct": is_extinct,
             "updated_at": it["last_checked"].isoformat() if it.get("last_checked") else None,
             "change": change,
             "change_pct": change_pct,
@@ -231,25 +282,41 @@ async def add_watch_item(payload: WatchlistCreate, request: Request, wdb = Depen
             },
         )
 
+    source = payload.source if payload.source in VALID_SOURCES else "futbin"
     plat = _plat(payload.platform)
-    live = await _fetch_price(int(payload.card_id), plat)
-    val = live.get("price")
-    live_price = int(val) if isinstance(val, (int, float)) else None
+
+    is_extinct = False
+    if source == "futgg":
+        # FUT.GG is console/PC-agnostic (no platform split) - live is
+        # whatever futgg_price_sync.py last captured, not a fresh fetch
+        # (that already happens on its own tiered schedule). A card
+        # discovered but not yet priced is still a valid watch target;
+        # start_price/live_price just start out None until it is.
+        provider = await _futgg_provider()
+        row_data = await provider.get_player(int(payload.card_id))
+        live_price = row_data.get("current_bin") if row_data else None
+        is_extinct = row_data is None or row_data.get("is_tradeable") is False
+    else:
+        live = await _fetch_price(int(payload.card_id), plat)
+        val = live.get("price")
+        live_price = int(val) if isinstance(val, (int, float)) else None
+        is_extinct = bool(live.get("isExtinct", False))
     start_price = live_price if isinstance(live_price, (int, float)) else 0
 
     row = await wdb.fetchrow(
         f"""
         INSERT INTO watchlist (
             user_id, card_id, player_name, version, platform,
-            started_price, last_price, last_checked, notes
+            started_price, last_price, last_checked, notes, source
         )
-        VALUES ($1,$2,$3,$4,$5,$6,$7,NOW(),$8)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,NOW(),$8,$9)
         ON CONFLICT (user_id, card_id, platform) DO UPDATE
           SET player_name = EXCLUDED.player_name,
               version     = EXCLUDED.version,
               notes       = EXCLUDED.notes,
               last_price  = EXCLUDED.last_price,
-              last_checked= NOW()
+              last_checked= NOW(),
+              source      = EXCLUDED.source
         RETURNING id
         """,
         uid,
@@ -260,13 +327,14 @@ async def add_watch_item(payload: WatchlistCreate, request: Request, wdb = Depen
         start_price,
         live_price,
         payload.notes,
+        source,
     )
 
     return {
         "ok": True,
         "id": row["id"],
         "start_price": start_price,
-        "is_extinct": bool(live.get("isExtinct", False)),
+        "is_extinct": is_extinct,
     }
 
 @router.delete("/{watch_id}")
@@ -297,10 +365,45 @@ async def refresh_watch_item(
     if not w:
         raise HTTPException(404, "Watch item not found")
 
-    plat = _plat(w["platform"])
-    live = await _fetch_price(int(w["card_id"]), plat)
-    val = live.get("price")
-    live_price = int(val) if isinstance(val, (int, float)) else None
+    is_futgg = w.get("source") == "futgg"
+
+    if is_futgg:
+        # A user hitting refresh is a high-intent "I care about this card
+        # right now" signal - same rationale as the player-detail page's
+        # refresh-on-view bump, so pull the FUT.GG scraper's next pass for
+        # this card forward instead of only reading whatever it last had.
+        provider = await _futgg_provider()
+        try:
+            await provider.bump_price_priority(int(w["card_id"]))
+        except Exception:
+            log.warning("bump_price_priority failed for card_id=%s", w["card_id"], exc_info=True)
+        row_data = await provider.get_player(int(w["card_id"]))
+        live_price = row_data.get("current_bin") if row_data else None
+        is_extinct = row_data is None or row_data.get("is_tradeable") is False
+        meta_dict = {
+            "name": row_data.get("name") if row_data else None,
+            "rating": row_data.get("rating") if row_data else None,
+            "club": row_data.get("club") if row_data else None,
+            "nation": row_data.get("nation") if row_data else None,
+        }
+        updated_at = None
+    else:
+        plat = _plat(w["platform"])
+        live = await _fetch_price(int(w["card_id"]), plat)
+        val = live.get("price")
+        live_price = int(val) if isinstance(val, (int, float)) else None
+        is_extinct = bool(live.get("isExtinct", False))
+        updated_at = live.get("updatedAt")
+
+        meta = await pdb.fetchrow(
+            """
+            SELECT card_id, name, rating, club, nation
+            FROM fut_players
+            WHERE card_id::text = $1
+            """,
+            str(w["card_id"]),
+        )
+        meta_dict = dict(meta) if meta else {}
 
     await wdb.execute(
         "UPDATE watchlist SET last_price=$1, last_checked=NOW() WHERE id=$2",
@@ -313,29 +416,20 @@ async def refresh_watch_item(
         change = int(live_price) - int(w["started_price"])
         change_pct = round((change / int(w["started_price"])) * 100, 2)
 
-    meta = await pdb.fetchrow(
-        """
-        SELECT card_id, name, rating, club, nation
-        FROM fut_players
-        WHERE card_id::text = $1
-        """,
-        str(w["card_id"]),
-    )
-    meta_dict = dict(meta) if meta else {}
-
     return {
         "ok": True,
         "item": {
             "id": w["id"],
             "card_id": w["card_id"],
+            "source": w.get("source", "futbin"),
             "player_name": w["player_name"],
             "version": w["version"],
             "platform": w["platform"],
             "started_price": w["started_price"],
             "started_at": w["started_at"].isoformat() if w["started_at"] else None,  # ← safe
             "current_price": live_price,
-            "is_extinct": bool(live.get("isExtinct", False)),
-            "updated_at": live.get("updatedAt"),
+            "is_extinct": is_extinct,
+            "updated_at": updated_at,
             "change": change,
             "change_pct": change_pct,
             "notes": w["notes"],

@@ -190,6 +190,20 @@ class FutggMarketDataProvider(MarketDataProvider):
             )
         return dict(row) if row else None
 
+    async def get_players_by_ids(self, card_ids: List[int]) -> Dict[int, Dict[str, Any]]:
+        """Batch lookup keyed by source_card_id - for callers rendering a
+        list of already-known ids (e.g. a watchlist) that would otherwise
+        N+1 get_player() per row. Empty input returns an empty dict
+        without a query."""
+        if not card_ids:
+            return {}
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                f"SELECT {_SNAPSHOT_COLUMNS} FROM futgg_market_snapshot WHERE source_card_id = ANY($1::bigint[])",
+                list(card_ids),
+            )
+        return {int(row["source_card_id"]): dict(row) for row in rows}
+
     async def bump_price_priority(self, card_id: int) -> None:
         """Moves a card to the front of futgg_price_sync.py's due queue -
         called when a user actually opens a card whose price the caller
