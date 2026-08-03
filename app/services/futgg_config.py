@@ -115,6 +115,22 @@ class EngineConfig:
     # ---- Dispersion ---------------------------------------------------
     extreme_dispersion_ratio: float = 0.45
 
+    # ---- Sales freshness ----------------------------------------------
+    # Fair value is 70% sales-derived, so the age of the NEWEST sale is as
+    # material as the age of the BIN - and until now only the BIN was
+    # checked. A card can therefore show a 2-minute-old price beside a
+    # fair value anchored to sales days old, and present the resulting
+    # verdict with high confidence. Observed live: a card quoting a
+    # 337,000 BIN was marked AVOID against a ~286,000 target derived from
+    # sales whose newest print was four days earlier, while the chart
+    # beside it showed a 396,000 sale.
+    #
+    # Beyond this age the sales sample stops describing the current
+    # market and confidence decays toward zero.
+    max_sales_age_minutes: int = 720          # 12h - full confidence below this
+    # Past this, the sample is not evidence about today's market at all.
+    reject_sales_older_than_minutes: int = 4320   # 72h
+
     # ---- Confidence gates ---------------------------------------------
     min_confidence_for_buy_signal: float = 0.45
     min_confidence_for_any_signal: float = 0.20

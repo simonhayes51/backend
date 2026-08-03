@@ -457,3 +457,49 @@ class TestStructuredReasons:
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+class TestSalesStaleness:
+    """A fresh BIN beside a days-old sales sample produced a confident
+    verdict about a market that had already moved. Observed live: a card
+    at 337,000 marked AVOID against a ~286,000 target derived from sales
+    whose newest print was four days earlier, while the chart beside it
+    showed a 396,000 sale."""
+
+    def _snap(self, sale_age_hours, **kw):
+        base = dict(
+            current_bin=337000, sales_median=290000, sales_trimmed_mean=286000,
+            sales_low=250000, sales_high=450000, sales_stddev=20000,
+            sales_count=30, sales_dispersion_ratio=0.07,
+            latest_sale_at=AS_OF - timedelta(hours=sale_age_hours),
+        )
+        base.update(kw)
+        return _snapshot(**base)
+
+    def test_four_day_old_sales_block_a_verdict(self):
+        ci = evaluate_card(self._snap(96), as_of=AS_OF)
+        assert ci.status == "insufficient_data"
+        assert reasons_pkg.STALE_SALES in ci.reason_codes
+        # No profit figure is offered from a sample this old.
+        assert ci.expected_profit_after_tax is None
+
+    def test_fresh_sales_still_produce_a_verdict(self):
+        ci = evaluate_card(self._snap(1), as_of=AS_OF)
+        assert reasons_pkg.STALE_SALES not in ci.reason_codes
+        assert ci.fair_value is not None
+
+    def test_confidence_decays_with_sales_age(self):
+        fresh = evaluate_card(self._snap(1), as_of=AS_OF)
+        older = evaluate_card(self._snap(36), as_of=AS_OF)
+        assert older.confidence_score < fresh.confidence_score
+
+    def test_sales_age_is_surfaced_to_the_user(self):
+        ci = evaluate_card(self._snap(30), as_of=AS_OF)
+        assert any("most recent completed sale" in m.lower() for m in ci.signal_reasons)
+
+    def test_missing_latest_sale_at_is_neutral_not_punished(self):
+        # Plenty of thin cards legitimately have no recent print; that is
+        # not the same as a known-stale sample.
+        ci = evaluate_card(self._snap(1, latest_sale_at=None), as_of=AS_OF)
+        assert reasons_pkg.STALE_SALES not in ci.reason_codes
+        assert ci.confidence_score > 0

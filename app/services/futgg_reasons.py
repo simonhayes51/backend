@@ -32,6 +32,7 @@ from typing import Dict, List, Optional
 # ---- Blocking codes (no actionable buy signal) ------------------------------
 INSUFFICIENT_SALES = "insufficient_sales"
 STALE_MARKET = "stale_market"
+STALE_SALES = "stale_sales"
 NO_LIVE_PRICE = "no_live_price"
 UNTRADEABLE = "untradeable"
 UNRESOLVED_DOWNTREND = "unresolved_downtrend"
@@ -150,6 +151,7 @@ class ReasonList:
 CODE_LABELS: Dict[str, str] = {
     INSUFFICIENT_SALES: "Not enough recent sales",
     STALE_MARKET: "Price data too old",
+    STALE_SALES: "Recent sales too old",
     NO_LIVE_PRICE: "No live listing price",
     UNTRADEABLE: "Card is untradeable",
     UNRESOLVED_DOWNTREND: "Still falling",
