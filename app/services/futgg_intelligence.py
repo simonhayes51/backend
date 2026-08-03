@@ -289,13 +289,35 @@ def evaluate_card(snapshot: Dict[str, Any], *, as_of: Optional[datetime] = None)
     # still built entirely from tm.EA_TAX rather than a hand-rolled
     # constant, and rounded down (a ceiling should never round up past
     # what actually clears the bar).
-    recommended_buy_max = tm.round_to_ea_increment(
-        fair_value * (Decimal("1") - tm.EA_TAX) / (Decimal("1") + MIN_NET_ROI_FOR_BUY),
-        direction="down",
-    )
+    #
+    # Clamped to the live current_bin: this formula alone is derived
+    # purely from fair_value and knows nothing about today's actual
+    # listing price, so on a card where the market has already dropped
+    # below the formula's ceiling, it would tell a user they can pay UP
+    # TO a price well above what the card is genuinely listed for right
+    # now - bad advice (inviting an overpay), and - worse - inconsistent
+    # with expected_profit_after_tax/expected_roi below, which must be
+    # computed from this same final entry price rather than a second,
+    # never-displayed number. A live bug on a real card: current_bin was
+    # ~176,000 while the pre-clamp ceiling was 205,000 - the UI showed
+    # "Buy below 205,000" alongside a profit figure that only made sense
+    # against the 176,000 nobody ever saw.
+    if current_bin is not None:
+        recommended_buy_max = min(
+            tm.round_to_ea_increment(
+                fair_value * (Decimal("1") - tm.EA_TAX) / (Decimal("1") + MIN_NET_ROI_FOR_BUY),
+                direction="down",
+            ),
+            tm.round_to_ea_increment(current_bin, direction="down"),
+        )
+    else:
+        recommended_buy_max = tm.round_to_ea_increment(
+            fair_value * (Decimal("1") - tm.EA_TAX) / (Decimal("1") + MIN_NET_ROI_FOR_BUY),
+            direction="down",
+        )
 
-    expected_profit_after_tax = tm.net_profit(recommended_sell_target, current_bin)
-    expected_roi = tm.net_roi(recommended_sell_target, current_bin)
+    expected_profit_after_tax = tm.net_profit(recommended_sell_target, recommended_buy_max)
+    expected_roi = tm.net_roi(recommended_sell_target, recommended_buy_max)
 
     reasons = []
     bin_vs_median_pct = None

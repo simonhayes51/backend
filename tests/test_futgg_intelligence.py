@@ -102,20 +102,62 @@ class TestConfidenceGradient:
 
 
 class TestTaxDelegatesToTradingMath:
+    # expected_profit_after_tax/expected_roi are computed against
+    # recommended_buy_max (the entry price actually shown to the user as
+    # "Buy below"), not the raw current_bin - see evaluate_card()'s own
+    # comment on the live bug this fixed (UI showed a "Buy below" ceiling
+    # a card's real listing price never supported, alongside a profit
+    # figure secretly computed from a cheaper, never-displayed number).
     def test_expected_profit_matches_trading_math_net_profit(self):
         ci = evaluate_card(_snapshot(), as_of=AS_OF)
         assert ci.recommended_sell_target is not None
-        expected = tm.net_profit(ci.recommended_sell_target, 10000)
+        assert ci.recommended_buy_max is not None
+        expected = tm.net_profit(ci.recommended_sell_target, ci.recommended_buy_max)
         assert ci.expected_profit_after_tax == expected
 
     def test_expected_roi_matches_trading_math_net_roi(self):
         ci = evaluate_card(_snapshot(), as_of=AS_OF)
-        expected = tm.net_roi(ci.recommended_sell_target, 10000)
+        expected = tm.net_roi(ci.recommended_sell_target, ci.recommended_buy_max)
         assert ci.expected_roi == expected
 
     def test_sell_target_is_a_valid_ea_increment(self):
         ci = evaluate_card(_snapshot(), as_of=AS_OF)
         assert ci.recommended_sell_target == tm.round_to_ea_increment(ci.recommended_sell_target)
+
+
+class TestBuyMaxNeverExceedsLivePrice:
+    """Regression test for a live bug: on a card whose sales evidence
+    pushed fair_value well above the live BIN, the "Buy below" ceiling
+    (derived purely from fair_value) came out higher than the actual
+    current listing price - a real card showed "Buy below 205,000"
+    while current_bin was ~176,000, alongside an "Expected profit"
+    silently computed against the never-displayed 176,000. Advising a
+    buy ceiling above what the card is actually listed for is bad advice
+    on its own, and the two displayed numbers didn't reconcile."""
+
+    def test_buy_max_clamped_to_current_bin_when_formula_ceiling_is_higher(self):
+        # Sales evidence far above current_bin pushes the raw formula
+        # ceiling (~118,000) above current_bin (100,000).
+        ci = evaluate_card(
+            _snapshot(
+                current_bin=100000, sales_median=140000, sales_trimmed_mean=140000,
+                sales_low=130000, sales_high=150000, sales_stddev=4000,
+                sales_dispersion_ratio=0.03,
+            ),
+            as_of=AS_OF,
+        )
+        assert ci.recommended_buy_max is not None
+        assert ci.recommended_buy_max <= 100000
+        # The displayed profit must reconcile with the displayed buy/sell
+        # numbers - simple arithmetic a user can verify themselves.
+        expected_profit = tm.net_profit(ci.recommended_sell_target, ci.recommended_buy_max)
+        assert ci.expected_profit_after_tax == expected_profit
+
+    def test_buy_max_uses_formula_ceiling_when_it_is_the_lower_bound(self):
+        # Default fixture: formula ceiling (9800) is already below
+        # current_bin (10000) - clamping must be a true no-op here.
+        ci = evaluate_card(_snapshot(), as_of=AS_OF)
+        assert ci.recommended_buy_max == 9800
 
 
 class TestSignalDecision:
