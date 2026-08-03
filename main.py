@@ -77,6 +77,8 @@ from app.services.ml_feature_pipeline import refresher_loop as ml_feature_pipeli
 from app.services.ml_label_filler import refresher_loop as ml_label_filler_refresher_loop
 from app.services.held_position_refresher import refresher_loop as held_position_refresher_loop
 from app.services.market_data_provider import refresher_loop as futgg_market_snapshot_refresher_loop
+from app.services.futgg_scanner import refresher_loop as futgg_scanner_refresher_loop
+from app.services.futgg_outcome_grader import refresher_loop as futgg_outcome_grader_refresher_loop
 
 
 # ----------------- BOOTSTRAP -----------------
@@ -566,6 +568,26 @@ async def lifespan(app: FastAPI):
     )
     logging.info("✅ FUT.GG market snapshot refresher started (poll every %ss)", futgg_snapshot_poll)
 
+    # FUT.GG evaluation pass (migrations/040). Scores cards across all
+    # liquidity segments and freezes every actionable call as a
+    # recommendation snapshot. Without this nothing is ever recorded, so
+    # the outcome grader below has nothing to grade and the track record
+    # stays empty forever.
+    futgg_scan_poll = int(os.getenv("FUTGG_SCAN_INTERVAL_SECONDS", "600"))
+    app.state.futgg_scanner_task = asyncio.create_task(
+        futgg_scanner_refresher_loop(pool, futgg_scan_poll)
+    )
+    logging.info("✅ FUT.GG evaluation scanner started (poll every %ss)", futgg_scan_poll)
+
+    # Grades those recommendations against what the market actually did,
+    # chronologically and without hindsight. Slow cadence: a horizon
+    # closes once, so re-scanning open rows more often buys nothing.
+    futgg_grader_poll = int(os.getenv("FUTGG_GRADER_INTERVAL_SECONDS", "1800"))
+    app.state.futgg_outcome_grader_task = asyncio.create_task(
+        futgg_outcome_grader_refresher_loop(pool, futgg_grader_poll)
+    )
+    logging.info("✅ FUT.GG outcome grader started (poll every %ss)", futgg_grader_poll)
+
     # The "social trading features" users-table ALTER/index block that used
     # to run here is now part of migrations/015_consolidate_core_bootstrap.sql
     # (same columns/indexes, applied once via run_on_boot() above).
@@ -585,6 +607,7 @@ async def lifespan(app: FastAPI):
         for task_attr in (
             "event_impact_task", "analytics_engine_task", "recommendation_engine_task",
             "ml_feature_pipeline_task", "ml_label_filler_task",
+            "futgg_scanner_task", "futgg_outcome_grader_task",
             "held_position_refresher_task", "futgg_market_snapshot_task",
         ):
             task = getattr(app.state, task_attr, None)

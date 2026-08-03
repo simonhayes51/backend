@@ -297,6 +297,74 @@ class FutggMarketDataProvider(MarketDataProvider):
                 )
         return [dict(r) for r in rows]
 
+    async def get_sales_by_ids(
+        self, card_ids: List[int], limit_per_card: int = MAX_RECENT_SALES,
+    ) -> Dict[int, List[Dict[str, Any]]]:
+        """Batch raw sales series, keyed by card id - for the trend layer,
+        which needs per-sale rows (the snapshot's aggregates cannot
+        express a slope) across many cards at once.
+
+        Without this the segmented scanner would issue one query per
+        candidate: a 1,500-card pass would mean 1,500 round trips. The
+        LATERAL keeps it to a single query while still bounding rows per
+        card, which a plain `WHERE source_card_id = ANY(...)` cannot do.
+        """
+        if not card_ids:
+            return {}
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT s.source_card_id, s.sold_price, s.approximate_sold_at
+                FROM unnest($1::bigint[]) AS ids(card_id)
+                CROSS JOIN LATERAL (
+                    SELECT source_card_id, sold_price, approximate_sold_at
+                    FROM futgg_sales_history
+                    WHERE source_card_id = ids.card_id
+                    ORDER BY approximate_sold_at DESC
+                    LIMIT $2
+                ) s
+                """,
+                list(card_ids), max(1, min(limit_per_card, MAX_RECENT_SALES)),
+            )
+        out: Dict[int, List[Dict[str, Any]]] = {}
+        for row in rows:
+            out.setdefault(int(row["source_card_id"]), []).append(
+                {
+                    "sold_price": row["sold_price"],
+                    "approximate_sold_at": row["approximate_sold_at"],
+                }
+            )
+        return out
+
+    async def select_candidates_by_segment(self) -> Dict[str, List[Dict[str, Any]]]:
+        """Run the segmented candidate scan.
+
+        Returns {segment_name: [snapshot rows]}. Segments overlap by
+        design; the caller de-duplicates. This replaces the single
+        `ORDER BY sales_count DESC LIMIT 500` query, which structurally
+        confined the entire engine to the 500 most-traded cards - the most
+        efficiently priced markets in the game - and never looked at the
+        long tail where mispricing actually persists.
+        """
+        from app.services.futgg_candidate_segments import SEGMENTS
+
+        out: Dict[str, List[Dict[str, Any]]] = {}
+        async with self._pool.acquire() as conn:
+            for segment in SEGMENTS:
+                # segment.where/order_by are static strings from a
+                # module-level whitelist - never user input.
+                sql = f"""
+                    SELECT {_SNAPSHOT_COLUMNS}
+                    FROM futgg_market_snapshot
+                    WHERE is_tradeable IS DISTINCT FROM FALSE
+                      AND ({segment.where})
+                    ORDER BY {segment.order_by}
+                    LIMIT $1
+                """
+                rows = await conn.fetch(sql, segment.limit)
+                out[segment.name] = [dict(r) for r in rows]
+        return out
+
     # -------------------------------------------------------------------
     # List / search surface (backs /players, /opportunities, /trade-finder)
     # -------------------------------------------------------------------
