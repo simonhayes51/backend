@@ -24,13 +24,19 @@ on top of this router rather than inside the provider/intelligence layers.
 """
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.db import get_core_pool
-from app.services.futgg_intelligence import CardIntelligence, evaluate_card
+from app.services.futgg_intelligence import (
+    DEFAULT_MAX_ACCEPTABLE_PRICE_AGE_MINUTES,
+    MAX_ACCEPTABLE_PRICE_AGE_MINUTES_BY_TIER,
+    CardIntelligence,
+    evaluate_card,
+)
 from app.services.market_data_provider import (
     MAX_RECENT_SALES,
     FutggMarketDataProvider,
@@ -38,9 +44,17 @@ from app.services.market_data_provider import (
 )
 
 router = APIRouter(tags=["v2-futgg-market"])
+log = logging.getLogger("futgg_market")
 
 DEFAULT_PAGE_SIZE = 25
 MAX_PAGE_SIZE = 100
+
+
+def _is_stale_for_tier(price_age_minutes: Optional[int], price_tier: Optional[str]) -> bool:
+    if price_age_minutes is None:
+        return True
+    threshold = MAX_ACCEPTABLE_PRICE_AGE_MINUTES_BY_TIER.get(price_tier, DEFAULT_MAX_ACCEPTABLE_PRICE_AGE_MINUTES)
+    return price_age_minutes > threshold
 
 # Bound on how many snapshot rows /opportunities and /trade-finder ever
 # pull from Postgres before scoring in Python - the intelligence layer
@@ -249,6 +263,17 @@ async def get_player_detail(
         raise HTTPException(404, "Card not found in the FUT.GG-backed market layer")
 
     ci = evaluate_card(row)
+    if _is_stale_for_tier(ci.price_age_minutes, row.get("price_tier")):
+        # A user actually opening this card is the strongest "someone
+        # might act on this" signal short of it already being a surfaced
+        # opportunity - re-queue it for the price worker's next pass
+        # instead of leaving it to wait out its tier's normal interval.
+        # Best-effort: a transient DB hiccup here must never break the
+        # page load itself.
+        try:
+            await provider.bump_price_priority(card_id)
+        except Exception:
+            log.warning("bump_price_priority failed for card_id=%s", card_id, exc_info=True)
     # Flattened onto the top level (frontend reads e.g. data.current_bin
     # directly) as well as under "player"/"intelligence" for consumers
     # that prefer the grouped shape.

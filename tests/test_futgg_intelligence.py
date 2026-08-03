@@ -10,7 +10,7 @@ import pytest
 
 from app.services import trading_math as tm
 from app.services.futgg_intelligence import (
-    MAX_ACCEPTABLE_PRICE_AGE_MINUTES,
+    DEFAULT_MAX_ACCEPTABLE_PRICE_AGE_MINUTES,
     MIN_SALES_FOR_SIGNAL,
     evaluate_card,
 )
@@ -60,7 +60,7 @@ class TestInsufficientData:
         assert ci.price_age_minutes is None
 
     def test_stale_price_is_insufficient_data(self):
-        stale_at = AS_OF - timedelta(minutes=MAX_ACCEPTABLE_PRICE_AGE_MINUTES + 1)
+        stale_at = AS_OF - timedelta(minutes=DEFAULT_MAX_ACCEPTABLE_PRICE_AGE_MINUTES + 1)
         ci = evaluate_card(_snapshot(bin_captured_at=stale_at), as_of=AS_OF)
         assert ci.signal == "insufficient_data"
         assert any("minutes old" in r for r in ci.signal_reasons)
@@ -90,7 +90,7 @@ class TestConfidenceGradient:
     def test_stale_but_still_acceptable_price_lowers_confidence(self):
         fresh = evaluate_card(_snapshot(bin_captured_at=AS_OF - timedelta(minutes=2)), as_of=AS_OF)
         older = evaluate_card(
-            _snapshot(bin_captured_at=AS_OF - timedelta(minutes=MAX_ACCEPTABLE_PRICE_AGE_MINUTES - 5)),
+            _snapshot(bin_captured_at=AS_OF - timedelta(minutes=DEFAULT_MAX_ACCEPTABLE_PRICE_AGE_MINUTES - 5)),
             as_of=AS_OF,
         )
         assert fresh.confidence_score > older.confidence_score
@@ -218,6 +218,54 @@ class TestDecimalFromAsyncpg:
             as_of=AS_OF,
         )
         assert ci.confidence_score is not None
+
+
+class TestTierAwareStaleness:
+    """A flat 120-minute freshness cutoff applied to every card equally
+    was itself a product bug: a "buy now" tip on a fast-moving special
+    card could sit confidently presented as fresh right up to the edge
+    of its own hour-long refresh interval, by which point the discount
+    that made it a tip may already be gone. Each price_tier now has its
+    own, much tighter, threshold."""
+
+    def test_special_tier_flags_stale_well_before_default_threshold(self):
+        # 30 minutes old: well within the old flat 120-minute cutoff, but
+        # beyond special's own 20-minute threshold.
+        ci = evaluate_card(
+            _snapshot(price_tier="special", bin_captured_at=AS_OF - timedelta(minutes=30)),
+            as_of=AS_OF,
+        )
+        assert ci.signal == "insufficient_data"
+        assert any("special-tier" in r for r in ci.signal_reasons)
+
+    def test_bronze_tier_tolerates_an_age_that_would_flag_special(self):
+        # Same 30-minute age a special-tier card was flagged stale at -
+        # bronze's much longer market cadence tolerates this fine.
+        ci = evaluate_card(
+            _snapshot(price_tier="bronze", bin_captured_at=AS_OF - timedelta(minutes=30)),
+            as_of=AS_OF,
+        )
+        assert ci.signal != "insufficient_data"
+
+    def test_unknown_tier_falls_back_to_default_threshold(self):
+        stale_at = AS_OF - timedelta(minutes=DEFAULT_MAX_ACCEPTABLE_PRICE_AGE_MINUTES - 5)
+        ci = evaluate_card(
+            _snapshot(price_tier=None, bin_captured_at=stale_at),
+            as_of=AS_OF,
+        )
+        assert ci.signal != "insufficient_data"
+        too_stale = AS_OF - timedelta(minutes=DEFAULT_MAX_ACCEPTABLE_PRICE_AGE_MINUTES + 5)
+        ci2 = evaluate_card(
+            _snapshot(price_tier=None, bin_captured_at=too_stale),
+            as_of=AS_OF,
+        )
+        assert ci2.signal == "insufficient_data"
+
+    def test_special_tier_confidence_degrades_faster_than_bronze_at_same_age(self):
+        age = AS_OF - timedelta(minutes=15)
+        special = evaluate_card(_snapshot(price_tier="special", bin_captured_at=age), as_of=AS_OF)
+        bronze = evaluate_card(_snapshot(price_tier="bronze", bin_captured_at=age), as_of=AS_OF)
+        assert special.confidence_score < bronze.confidence_score
 
 
 class TestApproximateTimeNeverClaimedExact:

@@ -54,6 +54,7 @@ class FakeProvider:
         # made with, so tests can assert on candidate-scan ordering
         # without needing a real Postgres EXPLAIN.
         self.search_calls: List[Dict[str, Any]] = []
+        self.bumped_card_ids: List[int] = []
 
     async def get_player(self, card_id: int):
         for r in self.rows:
@@ -95,6 +96,9 @@ class FakeProvider:
     async def count_players(self, filters: PlayerFilters) -> int:
         return len(self.rows)
 
+    async def bump_price_priority(self, card_id: int) -> None:
+        self.bumped_card_ids.append(card_id)
+
     async def get_freshness_summary(self):
         return {
             "heartbeats": [
@@ -132,6 +136,28 @@ def test_get_player_detail_shape():
     assert body["intelligence"]["signal"] in (
         "strong_buy", "buy", "watch", "hold", "sell", "avoid", "insufficient_data",
     )
+
+
+def test_get_player_detail_bumps_price_priority_when_stale_for_tier():
+    # gold_rare's threshold is 45 minutes - 60 minutes old is stale for
+    # this tier even though it's well within the old flat 120-minute cutoff.
+    provider = FakeProvider([_row(price_tier="gold_rare", bin_captured_at=AS_OF - timedelta(minutes=60))])
+    app = FastAPI()
+    app.include_router(futgg_router, prefix="/api/v2")
+    app.dependency_overrides[get_provider] = lambda: provider
+    resp = TestClient(app).get("/api/v2/players/1")
+    assert resp.status_code == 200
+    assert provider.bumped_card_ids == [1]
+
+
+def test_get_player_detail_does_not_bump_when_fresh_for_tier():
+    provider = FakeProvider([_row(price_tier="gold_rare", bin_captured_at=AS_OF - timedelta(minutes=4))])
+    app = FastAPI()
+    app.include_router(futgg_router, prefix="/api/v2")
+    app.dependency_overrides[get_provider] = lambda: provider
+    resp = TestClient(app).get("/api/v2/players/1")
+    assert resp.status_code == 200
+    assert provider.bumped_card_ids == []
 
 
 def test_get_player_detail_404_for_unknown_card():

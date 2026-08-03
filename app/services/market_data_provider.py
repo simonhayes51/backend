@@ -190,6 +190,35 @@ class FutggMarketDataProvider(MarketDataProvider):
             )
         return dict(row) if row else None
 
+    async def bump_price_priority(self, card_id: int) -> None:
+        """Moves a card to the front of futgg_price_sync.py's due queue -
+        called when a user actually opens a card whose price the caller
+        has judged stale (see evaluate_card()'s tier-aware freshness
+        gate). Viewing a specific card is the clearest "someone might act
+        on this" signal the app gets outside of it already being a
+        surfaced opportunity, so it's worth re-pricing sooner than its
+        tier's normal interval would otherwise allow - the same idea as
+        futgg_price_sync.py's own hot-opportunity fast-track, triggered
+        by demand instead of by discount.
+
+        Only ever pulls next_price_due_at EARLIER (via LEAST), never
+        pushes it later, and only for cards still eligible for regular
+        pricing at all (is_active, not confirmed untradeable) - a no-op
+        if the card is already due sooner than "now", so calling this on
+        every detail-page view is always safe, never fights the price
+        worker's own scheduling."""
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE futgg_players
+                SET next_price_due_at = LEAST(COALESCE(next_price_due_at, NOW()), NOW())
+                WHERE source_card_id = $1
+                  AND is_active
+                  AND is_tradeable IS DISTINCT FROM FALSE
+                """,
+                card_id,
+            )
+
     async def get_current_price(self, card_id: int, platform: Optional[str] = None) -> Optional[Dict[str, Any]]:
         # `platform` accepted for interface parity with a future
         # multi-platform provider - FUT.GG's scraper is console/PC
