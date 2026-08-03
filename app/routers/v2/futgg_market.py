@@ -24,13 +24,19 @@ on top of this router rather than inside the provider/intelligence layers.
 """
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.db import get_core_pool
-from app.services.futgg_intelligence import CardIntelligence, evaluate_card
+from app.services.futgg_intelligence import (
+    DEFAULT_MAX_ACCEPTABLE_PRICE_AGE_MINUTES,
+    MAX_ACCEPTABLE_PRICE_AGE_MINUTES_BY_TIER,
+    CardIntelligence,
+    evaluate_card,
+)
 from app.services.market_data_provider import (
     MAX_RECENT_SALES,
     FutggMarketDataProvider,
@@ -38,9 +44,17 @@ from app.services.market_data_provider import (
 )
 
 router = APIRouter(tags=["v2-futgg-market"])
+log = logging.getLogger("futgg_market")
 
 DEFAULT_PAGE_SIZE = 25
 MAX_PAGE_SIZE = 100
+
+
+def _is_stale_for_tier(price_age_minutes: Optional[int], price_tier: Optional[str]) -> bool:
+    if price_age_minutes is None:
+        return True
+    threshold = MAX_ACCEPTABLE_PRICE_AGE_MINUTES_BY_TIER.get(price_tier, DEFAULT_MAX_ACCEPTABLE_PRICE_AGE_MINUTES)
+    return price_age_minutes > threshold
 
 # Bound on how many snapshot rows /opportunities and /trade-finder ever
 # pull from Postgres before scoring in Python - the intelligence layer
@@ -52,6 +66,17 @@ MAX_PAGE_SIZE = 100
 # the top CANDIDATE_SCAN_LIMIT rows (by sales_count, as a liquidity-first
 # proxy for "cards worth scoring at all") per request.
 CANDIDATE_SCAN_LIMIT = 500
+
+# The candidate-scan calls below must pass this explicitly: search_players's
+# own default order_by ("rating DESC NULLS LAST") is a different ordering
+# entirely, and silently falling back to it here would candidate-limit
+# /players (intelligence-filtered), /opportunities, and /trade-finder to
+# the top-rated 500 cards rather than the top-500-most-liquid cards the
+# comment above documents - systematically hiding genuinely liquid,
+# profitable mid/low-rated opportunities behind a wall of high-rated but
+# possibly illiquid/rarely-traded cards, with no error or symptom other
+# than "why does this card never show up as an opportunity".
+CANDIDATE_SCAN_ORDER_BY = "sales_count DESC NULLS LAST"
 
 
 async def get_provider() -> FutggMarketDataProvider:
@@ -191,7 +216,7 @@ async def list_players(
     # Any intelligence-derived filter requires scoring candidates in
     # Python first (see CANDIDATE_SCAN_LIMIT), so pagination happens
     # after scoring+filtering rather than pushing LIMIT/OFFSET into SQL.
-    rows = await provider.search_players(filters, limit=CANDIDATE_SCAN_LIMIT, offset=0)
+    rows = await provider.search_players(filters, limit=CANDIDATE_SCAN_LIMIT, offset=0, order_by=CANDIDATE_SCAN_ORDER_BY)
     scored = _score_and_filter(
         rows, risk=risk, min_expected_profit=min_expected_profit,
         min_roi=min_roi, min_confidence=min_confidence, min_liquidity=min_liquidity,
@@ -238,6 +263,17 @@ async def get_player_detail(
         raise HTTPException(404, "Card not found in the FUT.GG-backed market layer")
 
     ci = evaluate_card(row)
+    if _is_stale_for_tier(ci.price_age_minutes, row.get("price_tier")):
+        # A user actually opening this card is the strongest "someone
+        # might act on this" signal short of it already being a surfaced
+        # opportunity - re-queue it for the price worker's next pass
+        # instead of leaving it to wait out its tier's normal interval.
+        # Best-effort: a transient DB hiccup here must never break the
+        # page load itself.
+        try:
+            await provider.bump_price_priority(card_id)
+        except Exception:
+            log.warning("bump_price_priority failed for card_id=%s", card_id, exc_info=True)
     # Flattened onto the top level (frontend reads e.g. data.current_bin
     # directly) as well as under "player"/"intelligence" for consumers
     # that prefer the grouped shape.
@@ -329,7 +365,7 @@ async def list_opportunities(
         None, rating_min, rating_max, position, rarity, club, league, nation,
         max_price, min_price, max_price_age_minutes,
     )
-    rows = await provider.search_players(filters, limit=CANDIDATE_SCAN_LIMIT, offset=0)
+    rows = await provider.search_players(filters, limit=CANDIDATE_SCAN_LIMIT, offset=0, order_by=CANDIDATE_SCAN_ORDER_BY)
     scored = _score_and_filter(
         rows, risk=risk, min_expected_profit=min_profit, min_roi=min_roi,
         min_confidence=min_confidence, min_liquidity=min_liquidity,
@@ -398,7 +434,7 @@ async def trade_finder(
         None, rating_min, rating_max, position, rarity, None, None, None,
         budget, None, max_price_age_minutes,
     )
-    rows = await provider.search_players(filters, limit=CANDIDATE_SCAN_LIMIT, offset=0)
+    rows = await provider.search_players(filters, limit=CANDIDATE_SCAN_LIMIT, offset=0, order_by=CANDIDATE_SCAN_ORDER_BY)
 
     risk_order = {"low": 0, "medium": 1, "high": 2, "avoid": 3}
     max_risk_rank = risk_order.get(risk_tolerance, 2) if risk_tolerance else None
@@ -412,7 +448,20 @@ async def trade_finder(
         scored = [(row, ci) for row, ci in scored if risk_order.get(ci.risk_level, 3) <= max_risk_rank]
 
     if sort_by == "newest":
-        scored.sort(key=lambda pair: pair[0].get("price_updated_at") or "", reverse=True)
+        # price_updated_at is nullable (a card can be discovered before its
+        # first price sync completes) - `or ""` as the None-fallback used
+        # to crash the whole request with a 500 the moment any row in the
+        # candidate scan had a real datetime AND any other row had None
+        # (`TypeError: '<' not supported between instances of 'str' and
+        # 'datetime.datetime'`), since Python won't compare a str sentinel
+        # against a datetime. datetime.min (tz-aware, to compare against
+        # the tz-aware column) sorts a missing timestamp to the oldest
+        # position instead, which is also the semantically correct
+        # "least new" ordering for reverse=True.
+        scored.sort(
+            key=lambda pair: pair[0].get("price_updated_at") or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True,
+        )
     else:
         scored.sort(key=_TRADE_FINDER_SORTS[sort_by])
 

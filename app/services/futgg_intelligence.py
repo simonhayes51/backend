@@ -54,11 +54,29 @@ from app.services import trading_math as tm
 # there is weaker evidence than the same count in a tight 24h window).
 MIN_SALES_FOR_SIGNAL = 5
 
-# A price observation older than this is not acted on - mirrors trading_
-# math's CONFIDENCE_MAX_ACCEPTABLE_STALENESS_MIN (90) but slightly wider
-# since FUT.GG's own next_price_due_at cadence is tier-dependent and can
-# legitimately be longer than the legacy FUTBIN poller's.
-MAX_ACCEPTABLE_PRICE_AGE_MINUTES = 120
+# A price observation older than this is not acted on. Tier-aware rather
+# than a single flat number: futgg_price_sync.py re-prices each tier on a
+# very different cadence (60min/180min/720min/48h/72h for special through
+# bronze), and a stale price matters far more, in both financial and
+# market-speed terms, on a fast-moving 95-rated special card than on a
+# bronze fodder card. A flat 120-minute cutoff let a special-tier "buy
+# now" tip sit confidently presented as fresh right up to the edge of
+# its own hour-long refresh interval - by the time a user could act on
+# it, the discount that made it a tip may well be gone. Each tier's
+# threshold is roughly a third of that tier's own refresh interval, so
+# "acceptable" is always meaningfully tighter than the worst realistic
+# gap between scrapes, not just under it.
+MAX_ACCEPTABLE_PRICE_AGE_MINUTES_BY_TIER = {
+    "special": 20,
+    "gold_rare": 45,
+    "gold_common": 180,
+    "silver": 480,
+    "bronze": 720,
+}
+# Fallback for a missing/unrecognized price_tier - mirrors trading_math's
+# CONFIDENCE_MAX_ACCEPTABLE_STALENESS_MIN (90) order of magnitude, same
+# reasoning as the previous flat constant this replaces.
+DEFAULT_MAX_ACCEPTABLE_PRICE_AGE_MINUTES = 120
 
 # sales_dispersion_ratio (stddev / median) at or above this is treated as
 # extreme - the recent-sales sample is too volatile for its median to be
@@ -133,12 +151,17 @@ def _compute_liquidity_score(sales_count: int, span_minutes: Optional[float]) ->
     return tm.liquidity_score(sales_per_hour, sales_count, sales_count * 7)
 
 
+def _max_acceptable_price_age_minutes(price_tier: Optional[str]) -> int:
+    return MAX_ACCEPTABLE_PRICE_AGE_MINUTES_BY_TIER.get(price_tier, DEFAULT_MAX_ACCEPTABLE_PRICE_AGE_MINUTES)
+
+
 def _compute_confidence(
     *,
     sales_count: int,
     price_age_minutes: Optional[int],
     dispersion_ratio: Optional[float],
     is_tradeable: Optional[bool],
+    max_acceptable_price_age_minutes: int,
 ) -> float:
     """Geometric-blend confidence in [0, 1], same "one bad component
     tanks the whole score" philosophy as trading_math.confidence_score,
@@ -153,7 +176,7 @@ def _compute_confidence(
     if price_age_minutes is None:
         freshness_component = 0.0
     else:
-        freshness_component = 1.0 - _clamp(price_age_minutes / MAX_ACCEPTABLE_PRICE_AGE_MINUTES, 0.0, 1.0)
+        freshness_component = 1.0 - _clamp(price_age_minutes / max_acceptable_price_age_minutes, 0.0, 1.0)
 
     if dispersion_ratio is None:
         dispersion_component = 0.5  # unknown dispersion - neutral, not penalized or rewarded
@@ -178,10 +201,11 @@ def _compute_risk_level(
     price_age_minutes: Optional[int],
     sales_count: int,
     is_tradeable: Optional[bool],
+    max_acceptable_price_age_minutes: int,
 ) -> str:
     if is_tradeable is False:
         return "avoid"
-    if sales_count < MIN_SALES_FOR_SIGNAL or price_age_minutes is None or price_age_minutes > MAX_ACCEPTABLE_PRICE_AGE_MINUTES:
+    if sales_count < MIN_SALES_FOR_SIGNAL or price_age_minutes is None or price_age_minutes > max_acceptable_price_age_minutes:
         return "high"
     if dispersion_ratio is not None and dispersion_ratio >= EXTREME_DISPERSION_RATIO:
         return "high"
@@ -227,15 +251,19 @@ def evaluate_card(snapshot: Dict[str, Any], *, as_of: Optional[datetime] = None)
     dispersion_ratio = float(dispersion_ratio) if dispersion_ratio is not None else None
 
     price_age_minutes = _price_age_minutes(bin_captured_at, as_of)
+    price_tier = snapshot.get("price_tier")
+    max_acceptable_price_age_minutes = _max_acceptable_price_age_minutes(price_tier)
 
     confidence = _compute_confidence(
         sales_count=sales_count, price_age_minutes=price_age_minutes,
         dispersion_ratio=dispersion_ratio, is_tradeable=is_tradeable,
+        max_acceptable_price_age_minutes=max_acceptable_price_age_minutes,
     )
     risk_level = _compute_risk_level(
         confidence=confidence, dispersion_ratio=dispersion_ratio,
         price_age_minutes=price_age_minutes, sales_count=sales_count,
         is_tradeable=is_tradeable,
+        max_acceptable_price_age_minutes=max_acceptable_price_age_minutes,
     )
     liquidity = _compute_liquidity_score(sales_count, span_minutes)
 
@@ -244,8 +272,11 @@ def evaluate_card(snapshot: Dict[str, Any], *, as_of: Optional[datetime] = None)
         reasons.append(f"Only {sales_count} recent sale(s) recorded - need at least {MIN_SALES_FOR_SIGNAL} to trust a price.")
     if price_age_minutes is None:
         reasons.append("No BIN price observation recorded for this card.")
-    elif price_age_minutes > MAX_ACCEPTABLE_PRICE_AGE_MINUTES:
-        reasons.append(f"Current price observation is {price_age_minutes} minutes old - beyond the {MAX_ACCEPTABLE_PRICE_AGE_MINUTES}-minute freshness limit.")
+    elif price_age_minutes > max_acceptable_price_age_minutes:
+        reasons.append(
+            f"Current price observation is {price_age_minutes} minutes old - beyond the "
+            f"{max_acceptable_price_age_minutes}-minute freshness limit for a {price_tier or 'unknown'}-tier card."
+        )
     if dispersion_ratio is not None and dispersion_ratio >= EXTREME_DISPERSION_RATIO:
         reasons.append(f"Recent sales dispersion ratio {dispersion_ratio:.2f} is extreme (>= {EXTREME_DISPERSION_RATIO}) - the price is too volatile to anchor a fair value on right now.")
     if current_bin is None:

@@ -1,0 +1,15 @@
+-- Migration 039: watchlist.source, for FUT.GG-aware watchlist entries
+-- target: watchlist
+--
+-- The watchlist table (migrations/016) has always been implicitly
+-- FUTBIN-only: card_id is looked up against fut_players and priced by
+-- hitting futbin.com directly (app/routers/watchlist.py). A FUT.GG card
+-- added today (its card_id is a source_card_id from the unrelated FUT.GG
+-- id space) resolves to nothing in either place - blank name/image,
+-- price that never updates.
+--
+-- This column lets a row declare which catalogue its card_id belongs to,
+-- so app/routers/watchlist.py can branch to the right lookup/price path
+-- per row instead of guessing. Existing rows all predate FUT.GG support
+-- and are genuinely FUTBIN entries, hence the default.
+ALTER TABLE watchlist ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'futbin';

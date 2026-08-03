@@ -50,6 +50,11 @@ def _row(**overrides) -> Dict[str, Any]:
 class FakeProvider:
     def __init__(self, rows: Optional[List[Dict[str, Any]]] = None):
         self.rows = rows if rows is not None else [_row()]
+        # Records the order_by every search_players() call was actually
+        # made with, so tests can assert on candidate-scan ordering
+        # without needing a real Postgres EXPLAIN.
+        self.search_calls: List[Dict[str, Any]] = []
+        self.bumped_card_ids: List[int] = []
 
     async def get_player(self, card_id: int):
         for r in self.rows:
@@ -85,10 +90,14 @@ class FakeProvider:
         ]
 
     async def search_players(self, filters: PlayerFilters, *, limit=25, offset=0, order_by="rating DESC NULLS LAST"):
+        self.search_calls.append({"limit": limit, "offset": offset, "order_by": order_by})
         return self.rows[offset: offset + limit]
 
     async def count_players(self, filters: PlayerFilters) -> int:
         return len(self.rows)
+
+    async def bump_price_priority(self, card_id: int) -> None:
+        self.bumped_card_ids.append(card_id)
 
     async def get_freshness_summary(self):
         return {
@@ -127,6 +136,28 @@ def test_get_player_detail_shape():
     assert body["intelligence"]["signal"] in (
         "strong_buy", "buy", "watch", "hold", "sell", "avoid", "insufficient_data",
     )
+
+
+def test_get_player_detail_bumps_price_priority_when_stale_for_tier():
+    # gold_rare's threshold is 45 minutes - 60 minutes old is stale for
+    # this tier even though it's well within the old flat 120-minute cutoff.
+    provider = FakeProvider([_row(price_tier="gold_rare", bin_captured_at=AS_OF - timedelta(minutes=60))])
+    app = FastAPI()
+    app.include_router(futgg_router, prefix="/api/v2")
+    app.dependency_overrides[get_provider] = lambda: provider
+    resp = TestClient(app).get("/api/v2/players/1")
+    assert resp.status_code == 200
+    assert provider.bumped_card_ids == [1]
+
+
+def test_get_player_detail_does_not_bump_when_fresh_for_tier():
+    provider = FakeProvider([_row(price_tier="gold_rare", bin_captured_at=AS_OF - timedelta(minutes=4))])
+    app = FastAPI()
+    app.include_router(futgg_router, prefix="/api/v2")
+    app.dependency_overrides[get_provider] = lambda: provider
+    resp = TestClient(app).get("/api/v2/players/1")
+    assert resp.status_code == 200
+    assert provider.bumped_card_ids == []
 
 
 def test_get_player_detail_404_for_unknown_card():
@@ -179,6 +210,87 @@ def test_trade_finder_shape():
     assert resp.status_code == 200
     body = resp.json()
     assert body["sort_by"] == "roi"
+
+
+class TestCandidateScanOrderedBySalesCount:
+    """Regression test: CANDIDATE_SCAN_LIMIT's own module comment says the
+    500-row candidate scan behind /players (intelligence-filtered),
+    /opportunities, and /trade-finder considers "the top CANDIDATE_SCAN_LIMIT
+    rows (by sales_count, as a liquidity-first proxy)" - but the three
+    search_players() call sites never actually passed order_by, so they
+    silently used search_players's own default ("rating DESC NULLS LAST")
+    instead. On a database with more than 500 tradeable cards, that meant
+    the candidate pool was the top-500 *highest-rated* cards, not the
+    top-500 *most-liquid* ones - a genuinely liquid, profitable mid/low-rated
+    opportunity could never appear on /opportunities or /trade-finder at
+    all, silently, with no error to notice."""
+
+    def test_players_with_intelligence_filter_scans_by_sales_count(self):
+        client = _client([_row()])
+        resp = client.get("/api/v2/players?min_roi=0.01")
+        assert resp.status_code == 200
+
+    def test_opportunities_scans_candidates_by_sales_count(self):
+        app = FastAPI()
+        app.include_router(futgg_router, prefix="/api/v2")
+        provider = FakeProvider([_row()])
+        app.dependency_overrides[get_provider] = lambda: provider
+        client = TestClient(app)
+        resp = client.get("/api/v2/opportunities")
+        assert resp.status_code == 200
+        assert provider.search_calls, "search_players was never called"
+        assert provider.search_calls[-1]["order_by"] == "sales_count DESC NULLS LAST"
+
+    def test_trade_finder_scans_candidates_by_sales_count(self):
+        app = FastAPI()
+        app.include_router(futgg_router, prefix="/api/v2")
+        provider = FakeProvider([_row()])
+        app.dependency_overrides[get_provider] = lambda: provider
+        client = TestClient(app)
+        resp = client.get("/api/v2/trade-finder")
+        assert resp.status_code == 200
+        assert provider.search_calls[-1]["order_by"] == "sales_count DESC NULLS LAST"
+
+    def test_players_list_with_intelligence_filter_scans_by_sales_count(self):
+        app = FastAPI()
+        app.include_router(futgg_router, prefix="/api/v2")
+        provider = FakeProvider([_row()])
+        app.dependency_overrides[get_provider] = lambda: provider
+        client = TestClient(app)
+        # Any intelligence-derived filter (min_roi/min_confidence/etc.)
+        # routes /players through the same candidate-scan path.
+        resp = client.get("/api/v2/players?min_roi=0.01")
+        assert resp.status_code == 200
+        assert provider.search_calls[-1]["order_by"] == "sales_count DESC NULLS LAST"
+
+
+class TestTradeFinderNewestSortDoesNotCrash:
+    """Regression test for a live 500: sort_by=newest sorted on
+    `row.get("price_updated_at") or ""` - the moment the candidate set had
+    both a row with a real datetime and a row with price_updated_at=None
+    (a card discovered but not yet priced), Python's sort raised
+    `TypeError: '<' not supported between instances of 'str' and
+    'datetime.datetime'` comparing the "" placeholder against a real
+    datetime, crashing the whole request."""
+
+    def test_newest_sort_with_mixed_null_and_real_timestamps(self):
+        priced_row = _row(source_card_id=2, price_updated_at=AS_OF)
+        unpriced_row = _row(source_card_id=3, price_updated_at=None, current_bin=40000,
+                             sales_median=55000, sales_trimmed_mean=55000, sales_count=40)
+        resp = _client([priced_row, unpriced_row]).get("/api/v2/trade-finder?sort_by=newest")
+        assert resp.status_code == 200
+
+    def test_newest_sort_puts_real_timestamp_before_null(self):
+        older = _row(source_card_id=2, price_updated_at=AS_OF - timedelta(days=1),
+                     current_bin=40000, sales_median=55000, sales_trimmed_mean=55000, sales_count=40)
+        unpriced = _row(source_card_id=3, price_updated_at=None, current_bin=40000,
+                        sales_median=55000, sales_trimmed_mean=55000, sales_count=40)
+        resp = _client([older, unpriced]).get("/api/v2/trade-finder?sort_by=newest")
+        assert resp.status_code == 200
+        ids = [item["source_card_id"] for item in resp.json()["items"]]
+        # A card with an actual price timestamp is "newer" than one that
+        # was never priced at all - it must never sort behind the null.
+        assert ids.index(2) < ids.index(3)
 
 
 if __name__ == "__main__":
