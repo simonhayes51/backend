@@ -195,6 +195,20 @@ def _price_age_minutes(bin_captured_at: Optional[datetime], as_of: datetime) -> 
     return max(0, int((as_of - bin_captured_at).total_seconds() // 60))
 
 
+def _sales_age_minutes(latest_sale_at: Optional[datetime], as_of: datetime) -> Optional[int]:
+    """Age of the NEWEST completed sale.
+
+    Distinct from price age and just as important: fair value is 70%
+    sales-derived, so a fresh BIN sitting beside a days-old sales sample
+    produces a confident verdict about a market that has already moved.
+    """
+    if latest_sale_at is None:
+        return None
+    if latest_sale_at.tzinfo is None:
+        latest_sale_at = latest_sale_at.replace(tzinfo=timezone.utc)
+    return max(0, int((as_of - latest_sale_at).total_seconds() // 60))
+
+
 def _compute_liquidity_score(sales_count: int, span_minutes: Optional[float]) -> Optional[float]:
     """None only when the window itself is meaningless. A real 0 sales
     count IS scored as 0.0 - a genuinely illiquid card, not "unknown"."""
@@ -210,6 +224,7 @@ def _compute_confidence(
     *, sales_count: int, price_age_minutes: Optional[int],
     dispersion_ratio: Optional[float], is_tradeable: Optional[bool],
     max_acceptable_price_age_minutes: int, config: EngineConfig,
+    sales_age_minutes: Optional[int] = None,
 ) -> float:
     """Geometric-blend confidence in [0, 1] - "one bad component tanks the
     whole score", same philosophy as trading_math.confidence_score,
@@ -229,10 +244,22 @@ def _compute_confidence(
     else:
         dispersion_component = 1.0 - _clamp(dispersion_ratio / config.extreme_dispersion_ratio, 0.0, 1.0)
 
+    # Sales freshness. Unknown (no latest_sale_at) is neutral rather than
+    # punished - plenty of legitimately thin cards simply have no recent
+    # print - but a KNOWN-old sample decays toward zero, because a median
+    # from days ago is not evidence about today's price.
+    if sales_age_minutes is None:
+        sales_freshness_component = 0.6
+    else:
+        sales_freshness_component = 1.0 - _clamp(
+            sales_age_minutes / max(config.reject_sales_older_than_minutes, 1), 0.0, 1.0
+        )
+
     components = (
-        (max(sample_component, 0.0), 0.40),
-        (max(freshness_component, 0.0), 0.35),
-        (max(dispersion_component, 0.0), 0.25),
+        (max(sample_component, 0.0), 0.30),
+        (max(freshness_component, 0.0), 0.28),
+        (max(dispersion_component, 0.0), 0.20),
+        (max(sales_freshness_component, 0.0), 0.22),
     )
     if any(base == 0.0 for base, _ in components):
         return 0.0
@@ -378,6 +405,7 @@ def evaluate_card(
     dispersion_ratio = float(dispersion_ratio) if dispersion_ratio is not None else None
 
     price_age_minutes = _price_age_minutes(bin_captured_at, as_of)
+    sales_age_minutes = _sales_age_minutes(snapshot.get("latest_sale_at"), as_of)
     price_tier = snapshot.get("price_tier")
     max_age = cfg.max_price_age_for_tier(price_tier)
 
@@ -387,6 +415,7 @@ def evaluate_card(
         sales_count=sales_count, price_age_minutes=price_age_minutes,
         dispersion_ratio=dispersion_ratio, is_tradeable=is_tradeable,
         max_acceptable_price_age_minutes=max_age, config=cfg,
+        sales_age_minutes=sales_age_minutes,
     )
     risk_level = _compute_risk_level(
         confidence=confidence, dispersion_ratio=dispersion_ratio,
@@ -420,6 +449,20 @@ def evaluate_card(
         )
     if current_bin is None:
         reasons.add(rc.NO_LIVE_PRICE, "No live BIN listing found.")
+    if (
+        sales_age_minutes is not None
+        and sales_age_minutes > cfg.reject_sales_older_than_minutes
+    ):
+        # Blocking, not merely a confidence haircut. Fair value is 70%
+        # sales-derived, so past this age the number being compared
+        # against the live BIN describes a market that no longer exists -
+        # and presenting that comparison as a verdict is worse than
+        # admitting we cannot say.
+        reasons.add(
+            rc.STALE_SALES,
+            f"The most recent completed sale is {sales_age_minutes / 60:.0f} hours old - "
+            "too old to value this card against today's price.",
+        )
 
     sales_estimate = sales_trimmed_mean if sales_trimmed_mean is not None else sales_median
     if sales_estimate is None:
@@ -499,6 +542,17 @@ def evaluate_card(
             reasons.add(rc.INFO_SALES_WINDOW, f"{sales_count} sales occurred over the last {span_minutes / 60.0:.1f} hours.")
     if price_age_minutes is not None:
         reasons.add(rc.INFO_PRICE_AGE, f"Current price observation is {price_age_minutes} minute(s) old.")
+    if sales_age_minutes is not None:
+        if sales_age_minutes >= 120:
+            reasons.add(
+                rc.INFO_SALES_WINDOW,
+                f"Most recent completed sale is {sales_age_minutes / 60:.1f} hours old.",
+            )
+        else:
+            reasons.add(
+                rc.INFO_SALES_WINDOW,
+                f"Most recent completed sale is {sales_age_minutes} minute(s) old.",
+            )
     if dispersion_ratio is not None:
         reasons.add(rc.INFO_DISPERSION, f"Recent sales dispersion ratio is {dispersion_ratio:.2f}.")
     reasons.add(rc.INFO_TREND_STATE, trend.description)
