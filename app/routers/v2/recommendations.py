@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from app.auth.entitlements import require_feature
+from app.db import get_core_pool
 from app.services.player_card_ondemand import ensure_cards_requested
 
 router = APIRouter(tags=["v2-recommendations"])
@@ -83,11 +84,60 @@ _TRACK_RECORD_MIN_SAMPLE = 20
 
 @router.get("/track-record")
 async def track_record(request: Request) -> Dict[str, Any]:
-    """Aggregated, honest hit-rate per strategy from ml_labels - real
-    closed-window outcomes, not a claim invented for marketing copy.
-    Deliberately ungated (no require_feature call): this is a trust
-    signal, and a trust signal only free/prospective users have to take
-    on faith is not doing its job."""
+    """Aggregated, honest hit-rate - real closed-window outcomes, not a
+    claim invented for marketing copy. Deliberately ungated (no
+    require_feature call): this is a trust signal, and a trust signal
+    only free/prospective users have to take on faith is not doing its
+    job.
+
+    REPOINTED to the FUT.GG outcome pipeline (migration 040 +
+    app/services/futgg_outcome_grader.py). The legacy implementation
+    below reads ml_labels, which app/services/ml_feature_pipeline.py
+    populates exclusively from fair_value_mv - the broken FUTBIN
+    materialized view that no longer drives any user-visible
+    recommendation. It was therefore reporting the track record of a
+    pipeline nobody uses, while the engine that actually produces every
+    live recommendation had no outcome feedback whatsoever.
+
+    The legacy path is kept as a fallback purely for the transition
+    window: migration 040's tables start empty and only fill once the
+    scanner has run and a horizon has fully elapsed, so until then this
+    returns the legacy shape rather than an empty page. Once FUT.GG
+    outcomes are flowing this branch stops being reachable and the
+    ml_labels query below can be deleted outright.
+    """
+    from app.services.futgg_recommendation_store import track_record as futgg_track_record
+
+    try:
+        core_pool = await get_core_pool()
+        futgg = await futgg_track_record(core_pool, horizon="24h", window_days=90)
+        if int(futgg.get("headline", {}).get("total_recommendations") or 0) > 0:
+            head = futgg["headline"]
+            return {
+                "source": "futgg",
+                "engine": "futgg-outcome-grader",
+                "strategies": [
+                    {
+                        "strategy": "mispricing",
+                        "label": "Mispricing calls",
+                        "horizon": futgg["horizon"],
+                        "sampleSize": head["total_recommendations"],
+                        "hasEnoughData": futgg["has_enough_data"],
+                        "hitRatePct": head.get("target_hit_rate_pct"),
+                        "avgRealizedReturnPct": head.get("avg_roi_pct"),
+                        "entryRatePct": head.get("entry_rate_pct"),
+                        "profitableRatePct": head.get("profitable_rate_pct"),
+                        "windowStart": None,
+                        "windowEnd": None,
+                    }
+                ],
+                "breakdowns": futgg.get("breakdowns", {}),
+                "methodology": futgg["methodology"],
+            }
+    except Exception:
+        # Migration 040 may not have run yet on this database.
+        pass
+
     pool = _player_pool(request)
     async with pool.acquire() as conn:
         rows = await conn.fetch(

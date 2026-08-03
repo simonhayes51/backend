@@ -37,6 +37,7 @@ from app.services.futgg_intelligence import (
     CardIntelligence,
     evaluate_card,
 )
+from app.services.futgg_snipe_filter import build_snipe_filter
 from app.services.market_data_provider import (
     MAX_RECENT_SALES,
     FutggMarketDataProvider,
@@ -92,21 +93,50 @@ async def get_provider() -> FutggMarketDataProvider:
 ProviderDep = Depends(get_provider)
 
 
+def _int_or_none(value) -> Optional[int]:
+    return int(value) if value is not None else None
+
+
+def _float_or_none(value) -> Optional[float]:
+    return float(value) if value is not None else None
+
+
 def _serialize_intelligence(ci: CardIntelligence) -> Dict[str, Any]:
     return {
-        "fair_value": int(ci.fair_value) if ci.fair_value is not None else None,
-        "recommended_buy_max": int(ci.recommended_buy_max) if ci.recommended_buy_max is not None else None,
-        "recommended_sell_target": int(ci.recommended_sell_target) if ci.recommended_sell_target is not None else None,
-        "expected_profit_after_tax": float(ci.expected_profit_after_tax) if ci.expected_profit_after_tax is not None else None,
-        "expected_roi": float(ci.expected_roi) if ci.expected_roi is not None else None,
+        "fair_value": _int_or_none(ci.fair_value),
+        # The four distinct prices (engine v2, item 10). recommended_buy_max
+        # is no longer clamped to the live ask, so these can and do differ -
+        # the frontend must render them as separate numbers rather than
+        # assuming any two are interchangeable.
+        "theoretical_max_buy": _int_or_none(ci.theoretical_max_buy),
+        "recommended_buy_max": _int_or_none(ci.recommended_buy_max),
+        "current_executable_buy": _int_or_none(ci.current_executable_buy),
+        "break_even_price": _int_or_none(ci.break_even_price),
+        "recommended_sell_target": _int_or_none(ci.recommended_sell_target),
+        "buy_below": _int_or_none(ci.buy_below),
+        "expected_profit_after_tax": _float_or_none(ci.expected_profit_after_tax),
+        "expected_roi": _float_or_none(ci.expected_roi),
         "liquidity_score": ci.liquidity_score,
         "confidence_score": ci.confidence_score,
         "risk_level": ci.risk_level,
         "signal": ci.signal,
+        "status": ci.status,
         "signal_reasons": ci.signal_reasons,
+        "reason_codes": ci.reason_codes,
+        "reasons": ci.reasons,
+        "blocking_codes": ci.blocking_codes,
         "price_age_minutes": ci.price_age_minutes,
         "sales_sample_size": ci.sales_sample_size,
         "sales_window_span_minutes": ci.sales_window_span_minutes,
+        "trend_state": ci.trend_state,
+        "trend_description": ci.trend_description,
+        "trend_features": ci.trend_features,
+        "engine_version": ci.engine_version,
+        "trend_version": ci.trend_version,
+        "expires_at": ci.expires_at.isoformat() if ci.expires_at else None,
+        "expiry_minutes": ci.expiry_minutes,
+        "evaluated_at": ci.evaluated_at.isoformat() if ci.evaluated_at else None,
+        "evaluated_bin": ci.evaluated_bin,
     }
 
 
@@ -138,9 +168,20 @@ def _item_with_intelligence(row: Dict[str, Any], ci: CardIntelligence) -> Dict[s
     """Flattens the CardIntelligence fields onto the player dict (what the
     frontend reads directly, e.g. item.recommended_buy_max) while also
     keeping them nested under "intelligence" for any consumer that prefers
-    the grouped shape."""
+    the grouped shape.
+
+    The snipe filter rides along on every actionable item: a tip the user
+    cannot execute before it goes stale is the product's core failure, and
+    an executable search instruction is the cheapest fix for it that does
+    not depend on scraping faster."""
     intelligence = _serialize_intelligence(ci)
-    return {**_serialize_player(row), **intelligence, "intelligence": intelligence}
+    snipe = build_snipe_filter(row, ci)
+    return {
+        **_serialize_player(row),
+        **intelligence,
+        "intelligence": intelligence,
+        "snipe_filter": snipe.as_dict() if snipe else None,
+    }
 
 
 def _resolve_rating_bounds(
@@ -227,15 +268,34 @@ async def list_players(
     return {"items": items, "page": page, "page_size": page_size, "total": total}
 
 
+async def _sales_for_rows(provider, rows: List[Dict[str, Any]]) -> Dict[int, List[Dict[str, Any]]]:
+    """Batch-fetch the raw sales series backing the trend layer.
+
+    Without this every list endpoint would either issue one sales query
+    per candidate (500+ round trips) or skip the trend layer entirely -
+    and skipping it is what allowed falling knives to be ranked as the
+    best opportunities in the first place. Best-effort: if the batch
+    fetch fails, evaluation continues with no trend data, which caps
+    signals rather than silently restoring the old behaviour.
+    """
+    try:
+        return await provider.get_sales_by_ids([int(r["source_card_id"]) for r in rows])
+    except Exception:
+        log.warning("batch sales fetch failed; evaluating without trend data", exc_info=True)
+        return {}
+
+
 def _score_and_filter(
     rows: List[Dict[str, Any]], *, risk: Optional[str] = None,
     min_expected_profit: Optional[float] = None, min_roi: Optional[float] = None,
     min_confidence: Optional[float] = None, min_liquidity: Optional[float] = None,
     signals: Optional[set] = None,
+    sales_by_card: Optional[Dict[int, List[Dict[str, Any]]]] = None,
 ) -> List[Any]:
     out = []
+    sales_by_card = sales_by_card or {}
     for row in rows:
-        ci = evaluate_card(row)
+        ci = evaluate_card(row, sales=sales_by_card.get(int(row["source_card_id"]), []))
         if signals is not None and ci.signal not in signals:
             continue
         if risk is not None and ci.risk_level != risk:
@@ -262,7 +322,17 @@ async def get_player_detail(
     if row is None:
         raise HTTPException(404, "Card not found in the FUT.GG-backed market layer")
 
-    ci = evaluate_card(row)
+    # The detail view is the one place we can always afford the extra
+    # query for raw sales, so the trend layer runs with real data here
+    # rather than degrading to "trend unknown". List endpoints fetch
+    # sales in batch (see _score_and_filter's caller).
+    try:
+        sales = await provider.get_recent_sales(card_id)
+    except Exception:
+        log.warning("get_recent_sales failed for card_id=%s", card_id, exc_info=True)
+        sales = []
+
+    ci = evaluate_card(row, sales=sales)
     if _is_stale_for_tier(ci.price_age_minutes, row.get("price_tier")):
         # A user actually opening this card is the strongest "someone
         # might act on this" signal short of it already being a surfaced
@@ -370,6 +440,7 @@ async def list_opportunities(
         rows, risk=risk, min_expected_profit=min_profit, min_roi=min_roi,
         min_confidence=min_confidence, min_liquidity=min_liquidity,
         signals={"buy", "strong_buy"},
+        sales_by_card=await _sales_for_rows(provider, rows),
     )
     # Sort by opportunity strength: strong_buy first, then by expected ROI.
     scored.sort(
@@ -443,6 +514,7 @@ async def trade_finder(
         rows, min_expected_profit=min_profit, min_roi=min_roi,
         min_confidence=min_confidence, min_liquidity=min_liquidity,
         signals={"buy", "strong_buy"},
+        sales_by_card=await _sales_for_rows(provider, rows),
     )
     if max_risk_rank is not None:
         scored = [(row, ci) for row, ci in scored if risk_order.get(ci.risk_level, 3) <= max_risk_rank]
@@ -494,3 +566,75 @@ async def market_freshness(
         "stale_by_price_tier": summary["stale_by_price_tier"],
         "latest_source_errors": summary["latest_source_errors"],
     }
+
+
+# =============================================================================
+# Track record + evaluation coverage
+# =============================================================================
+#
+# These replace the legacy /api/v2/recommendations/track-record, which
+# grades ml_labels rows produced from fair_value_mv - the broken FUTBIN
+# view that no longer drives a single user-visible recommendation. That
+# endpoint was therefore reporting on a pipeline nobody uses, while the
+# FUT.GG engine that drives everything had no outcome feedback at all.
+#
+# Deliberately ungated, for the same reason the legacy one was: a trust
+# signal that only paying users can see is not doing its job.
+
+
+@router.get("/market/track-record")
+async def market_track_record(
+    horizon: str = Query("24h", description="24h|48h|7d"),
+    window_days: int = Query(90, ge=1, le=365),
+    provider: FutggMarketDataProvider = ProviderDep,
+) -> Dict[str, Any]:
+    """Outcome-graded performance of the FUT.GG engine's own calls.
+
+    Every number here comes from recommendations frozen at the moment
+    they were made and graded later in chronological order - entry before
+    exit, no best-price-in-hindsight. Percentages are withheld entirely
+    below the minimum sample size rather than shown with a caveat.
+    """
+    from app.services.futgg_outcome_grader import HORIZONS
+    from app.services.futgg_recommendation_store import track_record
+
+    if horizon not in HORIZONS:
+        raise HTTPException(400, f"horizon must be one of {sorted(HORIZONS)}")
+    try:
+        return await track_record(provider._pool, horizon=horizon, window_days=window_days)
+    except Exception:
+        # The tables land with migration 040 and stay empty until the
+        # scanner has been running long enough for a horizon to elapse.
+        # An honest empty state beats a 500 on a public trust page.
+        log.warning("track_record query failed", exc_info=True)
+        return {
+            "horizon": horizon,
+            "window_days": window_days,
+            "has_enough_data": False,
+            "headline": {"total_recommendations": 0},
+            "breakdowns": {},
+            "methodology": (
+                "No graded outcomes yet - recommendations are graded only after their "
+                "full horizon has elapsed."
+            ),
+        }
+
+
+@router.get("/market/evaluation-coverage")
+async def market_evaluation_coverage(
+    provider: FutggMarketDataProvider = ProviderDep,
+) -> Dict[str, Any]:
+    """How much of the card pool the engine is actually evaluating.
+
+    Exists because the previous single `ORDER BY sales_count DESC LIMIT
+    500` scan silently confined the engine to the most-traded 500 cards
+    with no symptom other than "why does this card never appear". Coverage
+    is now a number you can look at.
+    """
+    from app.services.futgg_scanner import coverage_report
+
+    try:
+        return await coverage_report(provider._pool)
+    except Exception:
+        log.warning("coverage_report failed", exc_info=True)
+        return {"player_pool": 0, "cards_evaluated_24h": 0, "pool_coverage_24h_pct": None}
