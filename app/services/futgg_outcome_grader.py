@@ -325,3 +325,24 @@ async def grade_all_horizons(pool, *, batch_size: int = 200) -> Dict[str, int]:
             log.warning("grading failed for horizon=%s", horizon, exc_info=True)
             out[horizon] = 0
     return out
+
+
+async def refresher_loop(pool, poll_seconds: int = 1800) -> None:
+    """Periodically grade recommendations whose horizon has fully elapsed.
+
+    Runs on a slow cadence by design: a horizon only closes once, so
+    grading more often just re-scans rows that are still open. Each pass
+    is bounded by batch_size so a large backlog drains gradually rather
+    than in one long transaction.
+    """
+    import asyncio as _asyncio
+
+    await _asyncio.sleep(120)
+    while True:
+        try:
+            graded = await grade_all_horizons(pool)
+            if any(graded.values()):
+                log.info("outcome grading: %s", graded)
+        except Exception:
+            log.warning("outcome grading pass failed", exc_info=True)
+        await _asyncio.sleep(poll_seconds)

@@ -20,6 +20,7 @@ production, not an assumption in a docstring.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass, field, asdict
@@ -211,3 +212,35 @@ async def coverage_report(pool) -> Dict[str, Any]:
         ],
         "segment_config": segment_summary(),
     }
+
+
+async def refresher_loop(pool, poll_seconds: int = 600) -> None:
+    """Periodic evaluation pass.
+
+    Without this loop the whole outcome pipeline is inert: nothing calls
+    evaluate_card() outside a user request, so no recommendation snapshot
+    is ever frozen and the grader has nothing to grade. The engine would
+    keep producing correct answers that nobody ever checks - which is the
+    exact failure the outcome loop exists to end.
+
+    Deliberately tolerant of a database where migration 040 has not run
+    yet: the backend boots and serves fine without these tables, it just
+    records nothing until they exist.
+    """
+    from app.services.market_data_provider import FutggMarketDataProvider
+
+    await asyncio.sleep(45)  # let migrations and the snapshot refresh land first
+    provider = FutggMarketDataProvider(pool)
+    while True:
+        try:
+            metrics = await run_scan(provider, pool)
+            log.info(
+                "futgg scan: evaluated=%d coverage=%s%% recommendations=%d in %.1fs",
+                metrics.unique_cards_evaluated,
+                metrics.pool_coverage_pct,
+                metrics.recommendations_written,
+                metrics.duration_seconds,
+            )
+        except Exception:
+            log.warning("futgg scan pass failed", exc_info=True)
+        await asyncio.sleep(poll_seconds)
