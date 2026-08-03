@@ -2,105 +2,117 @@
 """
 Fair value / recommendation logic for the FUT.GG-backed market layer.
 
-Adapted from the same *shape* of output as recommendation_engine_v2.py
-(signal / reasons / confidence / risk), but the inputs are FUT.GG's data
-semantics, which differ from the legacy FUTBIN-backed fair_value_mv path
-in two structural ways this module has to account for:
+WHAT THIS ENGINE IS
+-------------------
+A mispricing detector, not a forecaster. It asks one question - "is the
+lowest current BIN below what this card has recently been selling for,
+by enough to clear EA's 5% tax with margin to spare" - and surrounds that
+question with the evidence needed to decide whether the answer can be
+trusted. It does not predict where a price is going, and no user-facing
+label should imply that it does.
+
+WHAT CHANGED IN ENGINE v2 (see futgg_config.ENGINE_VERSION)
+-----------------------------------------------------------
+Three structural corrections, each of which changes real recommendations:
+
+  1. TREND GATING. The engine previously had no trend term whatsoever.
+     Because a falling card's sales median goes stale high, the further a
+     card had fallen the *larger* its apparent discount - so unresolved
+     downtrends were systematically surfaced as the strongest buys. The
+     trend layer (futgg_trend.py, separately versioned) now gates buy
+     signals: a card in a falling-knife or downtrend state cannot be a
+     buy on the strength of a discount to a stale median alone.
+
+  2. SEPARATED BUY PRICES. `recommended_buy_max` used to be clamped to
+     `current_bin`, which made the recommendation circular: the "maximum
+     you should pay" became "whatever it currently costs", so a card was
+     described as a valid buy purely because its own asking price had
+     been substituted into the calculation. There are now four distinct,
+     independently meaningful prices - theoretical maximum, recommended
+     (conservative) maximum, currently executable entry, and break-even -
+     and when the live BIN sits above the recommended maximum the result
+     is a WATCH with an explicit trigger price, not a buy.
+
+  3. STRUCTURED REASONS + VERSIONING. Every rejection or downgrade now
+     carries a stable machine-readable code (futgg_reasons.py) alongside
+     its English, and every result is stamped with the engine and trend
+     versions - so the outcome grader can attribute a result to a
+     specific configuration rather than "whatever the code said at the
+     time".
+
+DATA SEMANTICS
+--------------
+Inputs are FUT.GG's, which differ from the legacy FUTBIN fair_value_mv
+path in two structural ways:
 
   1. There is no separate "24h vs 7d" sales split - futgg_sales_history
-     only gives a bounded recent window (<=50 rows / 14 days, see
-     migrations/038). So confidence/sample-size scoring here works off a
-     single window's count + the actual time span it covers (a card with
-     50 sales in the last 20 minutes is a very different liquidity signal
-     than 50 sales spread over 14 days, even though both are "n=50").
+     gives a bounded recent window (<=50 rows / 14 days, see migration
+     038). Confidence/sample-size scoring therefore works off a single
+     window's count plus the actual time span it covers (50 sales in 20
+     minutes is a very different liquidity signal from 50 sales over 14
+     days, though both are "n=50").
 
-  2. approximate_sold_at is, structurally, never exact (see
-     futgg_sales_history's own column comment) - this module already
-     only ever consumes the pre-aggregated snapshot view's derived
-     stats, never raw per-row timestamps, so this mostly matters for the
-     router layer (which must label sales rows as approximate) rather
-     than here - but it's still why "latest sale age" is treated as an
-     approximate freshness signal, not an exact one, in the confidence
-     calc below.
+  2. approximate_sold_at is structurally never exact (see
+     futgg_sales_history's column comment), so sale timing is treated as
+     an approximate freshness/ordering signal, never an exact timestamp.
 
-All tax/ROI/EA-increment math is delegated to app.services.trading_math
-- nothing here hand-rolls `* 0.95` or a break-even formula.
+All tax/ROI/EA-increment math is delegated to app.services.trading_math -
+nothing here hand-rolls `* 0.95` or a break-even formula.
 
 evaluate_card() is pure (dict in, dataclass out) and fully unit-testable
 with constructed snapshot dicts - no I/O. The I/O (reading
-futgg_market_snapshot) lives in market_data_provider.py; the router
-layer wires the two together.
+futgg_market_snapshot and futgg_sales_history) lives in
+market_data_provider.py; the router layer wires the two together.
 """
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from app.services import trading_math as tm
+from app.services import futgg_reasons as rc
+from app.services.futgg_config import ENGINE_CONFIG, EngineConfig, TREND_CONFIG
+from app.services.futgg_reasons import ReasonList
+from app.services.futgg_trend import (
+    INSUFFICIENT_TREND_DATA, TrendAssessment, evaluate_trend,
+)
 
 # =============================================================================
-# Thresholds - documented starting points (no closed-outcome history to
-# tune against yet for FUT.GG specifically, same caveat trading_math.py
-# and strategy_config.py both carry for the legacy engine's constants).
+# Backwards-compatible constant surface
 # =============================================================================
-
-# Below this many sales in the bounded recent window, the sample is too
-# thin to trust a median/trimmed-mean over - matches recommendation_
-# engine_v2's MIN_SALES_24H_FLOOR=3 order of magnitude, nudged up
-# slightly because FUT.GG's window can span up to 14 days (a thin sample
-# there is weaker evidence than the same count in a tight 24h window).
-MIN_SALES_FOR_SIGNAL = 5
-
-# A price observation older than this is not acted on. Tier-aware rather
-# than a single flat number: futgg_price_sync.py re-prices each tier on a
-# very different cadence (60min/180min/720min/48h/72h for special through
-# bronze), and a stale price matters far more, in both financial and
-# market-speed terms, on a fast-moving 95-rated special card than on a
-# bronze fodder card. A flat 120-minute cutoff let a special-tier "buy
-# now" tip sit confidently presented as fresh right up to the edge of
-# its own hour-long refresh interval - by the time a user could act on
-# it, the discount that made it a tip may well be gone. Each tier's
-# threshold is roughly a third of that tier's own refresh interval, so
-# "acceptable" is always meaningfully tighter than the worst realistic
-# gap between scrapes, not just under it.
-MAX_ACCEPTABLE_PRICE_AGE_MINUTES_BY_TIER = {
-    "special": 20,
-    "gold_rare": 45,
-    "gold_common": 180,
-    "silver": 480,
-    "bronze": 720,
-}
-# Fallback for a missing/unrecognized price_tier - mirrors trading_math's
-# CONFIDENCE_MAX_ACCEPTABLE_STALENESS_MIN (90) order of magnitude, same
-# reasoning as the previous flat constant this replaces.
-DEFAULT_MAX_ACCEPTABLE_PRICE_AGE_MINUTES = 120
-
-# sales_dispersion_ratio (stddev / median) at or above this is treated as
-# extreme - the recent-sales sample is too volatile for its median to be
-# a trustworthy fair-value anchor on its own.
-EXTREME_DISPERSION_RATIO = 0.45
-
-MIN_CONFIDENCE_FOR_BUY_SIGNAL = 0.45
-MIN_CONFIDENCE_FOR_ANY_SIGNAL = 0.20
-
-# Minimum net ROI (after EA tax, via trading_math) the *conservative* side
-# of fair value needs to clear before a buy-side signal is issued -
-# mirrors strategy_config.py's quick_flip floor.
-MIN_NET_ROI_FOR_BUY = Decimal("0.03")
-MIN_NET_ROI_FOR_STRONG_BUY = Decimal("0.08")
-
-# Weights for the fair-value blend between the recent-sales estimate and
-# the live BIN cross-check. Sales evidence dominates by design (BIN is a
-# single current ask, not a cleared price), but a live BIN with none/thin
-# sales is still useful corroboration once confidence-weighted below.
-FAIR_VALUE_SALES_WEIGHT = 0.7
-FAIR_VALUE_BIN_WEIGHT = 0.3
+# These names are imported by app/routers/v2/futgg_market.py and the
+# existing test-suite. They now read through to the versioned config
+# rather than being independent literals, so a threshold is defined in
+# exactly one place - but the names stay put so this refactor doesn't
+# ripple into unrelated call sites.
+MAX_ACCEPTABLE_PRICE_AGE_MINUTES_BY_TIER = dict(ENGINE_CONFIG.max_price_age_minutes_by_tier)
+DEFAULT_MAX_ACCEPTABLE_PRICE_AGE_MINUTES = ENGINE_CONFIG.default_max_price_age_minutes
+MIN_SALES_FOR_SIGNAL = ENGINE_CONFIG.min_sales_for_signal
+EXTREME_DISPERSION_RATIO = ENGINE_CONFIG.extreme_dispersion_ratio
+MIN_CONFIDENCE_FOR_BUY_SIGNAL = ENGINE_CONFIG.min_confidence_for_buy_signal
+MIN_CONFIDENCE_FOR_ANY_SIGNAL = ENGINE_CONFIG.min_confidence_for_any_signal
+MIN_NET_ROI_FOR_BUY = ENGINE_CONFIG.min_net_roi_for_buy
+MIN_NET_ROI_FOR_STRONG_BUY = ENGINE_CONFIG.min_net_roi_for_strong_buy
+FAIR_VALUE_SALES_WEIGHT = ENGINE_CONFIG.fair_value_sales_weight
+FAIR_VALUE_BIN_WEIGHT = ENGINE_CONFIG.fair_value_bin_weight
 
 RISK_LEVELS = ("low", "medium", "high", "avoid")
 SIGNALS = ("strong_buy", "buy", "watch", "hold", "sell", "avoid", "insufficient_data")
+
+# Lifecycle status, distinct from `signal`. `signal` is what the engine
+# concluded; `status` is whether that conclusion is still usable. Only
+# ACTIVE/WATCH/INSUFFICIENT_DATA are reachable at evaluation time -
+# EXPIRED and INVALIDATED are assigned later by re-checking a persisted
+# recommendation against the live market (recommendation_lifecycle.py).
+STATUS_ACTIVE = "active"
+STATUS_WATCH = "watch"
+STATUS_EXPIRED = "expired"
+STATUS_INVALIDATED = "invalidated"
+STATUS_INSUFFICIENT_DATA = "insufficient_data"
+STATUSES = (STATUS_ACTIVE, STATUS_WATCH, STATUS_EXPIRED, STATUS_INVALIDATED, STATUS_INSUFFICIENT_DATA)
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -110,19 +122,69 @@ def _clamp(value: float, low: float, high: float) -> float:
 @dataclass
 class CardIntelligence:
     card_id: int
-    fair_value: Optional[Decimal]
-    recommended_buy_max: Optional[Decimal]
-    recommended_sell_target: Optional[Decimal]
-    expected_profit_after_tax: Optional[Decimal]
-    expected_roi: Optional[Decimal]
-    liquidity_score: Optional[float]
-    confidence_score: Optional[float]
-    risk_level: str
-    signal: str
+
+    # ---- Valuation ----------------------------------------------------
+    fair_value: Optional[Decimal] = None
+
+    # ---- The four distinct prices (see module docstring, point 2) -----
+    # The highest entry that could theoretically still clear the minimum
+    # ROI bar. Derived purely from fair value - it knows nothing about
+    # today's ask, and is NOT a price we advise paying.
+    theoretical_max_buy: Optional[Decimal] = None
+    # What we actually advise as a ceiling: the theoretical maximum with a
+    # margin removed so the trade still works if fair value was a little
+    # optimistic. This is the number a user should act on.
+    recommended_buy_max: Optional[Decimal] = None
+    # The live ask, but only when it is at or below recommended_buy_max.
+    # None means "not currently buyable at a sensible price" - precisely
+    # the watch case, and why this is a separate field rather than being
+    # clamped into recommended_buy_max.
+    current_executable_buy: Optional[Decimal] = None
+    # Minimum sale price needed to recover the entry after EA's tax.
+    break_even_price: Optional[Decimal] = None
+    recommended_sell_target: Optional[Decimal] = None
+
+    # Populated on a WATCH: the price the card must fall to before this
+    # becomes an actionable buy.
+    buy_below: Optional[Decimal] = None
+
+    # ---- Expected outcome (always computed against the price a user
+    # would actually pay, never against an unshown intermediate) --------
+    expected_profit_after_tax: Optional[Decimal] = None
+    expected_roi: Optional[Decimal] = None
+
+    # ---- Evidence -----------------------------------------------------
+    liquidity_score: Optional[float] = None
+    confidence_score: Optional[float] = None
+    risk_level: str = "high"
+    signal: str = "insufficient_data"
+    status: str = STATUS_INSUFFICIENT_DATA
     signal_reasons: List[str] = field(default_factory=list)
+    reason_codes: List[str] = field(default_factory=list)
+    reasons: List[Dict[str, str]] = field(default_factory=list)
+    blocking_codes: List[str] = field(default_factory=list)
+
     price_age_minutes: Optional[int] = None
     sales_sample_size: int = 0
     sales_window_span_minutes: Optional[float] = None
+
+    # ---- Trend --------------------------------------------------------
+    trend_state: str = INSUFFICIENT_TREND_DATA
+    trend_description: str = ""
+    trend_features: Dict[str, Any] = field(default_factory=dict)
+
+    # ---- Provenance / lifecycle ---------------------------------------
+    engine_version: str = ENGINE_CONFIG.version
+    trend_version: str = TREND_CONFIG.version
+    evaluated_at: Optional[datetime] = None
+    expires_at: Optional[datetime] = None
+    expiry_minutes: Optional[int] = None
+
+    # The BIN this recommendation was computed against. Persisted so a
+    # later lifecycle check can detect that the market has moved away from
+    # the state that produced the call and invalidate it, rather than keep
+    # showing a profit figure derived from a price that no longer exists.
+    evaluated_bin: Optional[int] = None
 
 
 def _price_age_minutes(bin_captured_at: Optional[datetime], as_of: datetime) -> Optional[int]:
@@ -130,58 +192,42 @@ def _price_age_minutes(bin_captured_at: Optional[datetime], as_of: datetime) -> 
         return None
     if bin_captured_at.tzinfo is None:
         bin_captured_at = bin_captured_at.replace(tzinfo=timezone.utc)
-    delta = as_of - bin_captured_at
-    return max(0, int(delta.total_seconds() // 60))
+    return max(0, int((as_of - bin_captured_at).total_seconds() // 60))
 
 
 def _compute_liquidity_score(sales_count: int, span_minutes: Optional[float]) -> Optional[float]:
-    """None only when the window itself is meaningless (no span despite
-    sales existing shouldn't happen, but guards div-by-zero). A real 0
-    sales count IS scored as 0.0 - a genuinely illiquid card, not
-    "unknown"."""
+    """None only when the window itself is meaningless. A real 0 sales
+    count IS scored as 0.0 - a genuinely illiquid card, not "unknown"."""
     if sales_count == 0:
         return 0.0
     if not span_minutes or span_minutes <= 0:
-        # A single sale (or all sales at the same approximate timestamp)
-        # - can't derive a rate, but the raw count still carries some
-        # signal via trading_math's own reference-rate curve at a
-        # nominal 1-hour span.
         span_minutes = 60.0
     sales_per_hour = sales_count / (span_minutes / 60.0)
     return tm.liquidity_score(sales_per_hour, sales_count, sales_count * 7)
 
 
-def _max_acceptable_price_age_minutes(price_tier: Optional[str]) -> int:
-    return MAX_ACCEPTABLE_PRICE_AGE_MINUTES_BY_TIER.get(price_tier, DEFAULT_MAX_ACCEPTABLE_PRICE_AGE_MINUTES)
-
-
 def _compute_confidence(
-    *,
-    sales_count: int,
-    price_age_minutes: Optional[int],
-    dispersion_ratio: Optional[float],
-    is_tradeable: Optional[bool],
-    max_acceptable_price_age_minutes: int,
+    *, sales_count: int, price_age_minutes: Optional[int],
+    dispersion_ratio: Optional[float], is_tradeable: Optional[bool],
+    max_acceptable_price_age_minutes: int, config: EngineConfig,
 ) -> float:
-    """Geometric-blend confidence in [0, 1], same "one bad component
-    tanks the whole score" philosophy as trading_math.confidence_score,
-    reimplemented here (not called directly) because FUT.GG's inputs
-    don't map onto that function's exact parameter set (no 24h/7d split,
-    dispersion ratio instead of a BIN z-score)."""
+    """Geometric-blend confidence in [0, 1] - "one bad component tanks the
+    whole score", same philosophy as trading_math.confidence_score,
+    reimplemented here because FUT.GG's inputs don't map onto that
+    function's parameter set (no 24h/7d split, dispersion ratio rather
+    than a BIN z-score)."""
     if is_tradeable is False:
         return 0.0
 
     sample_component = min(sales_count, 20) / 20.0
-
     if price_age_minutes is None:
         freshness_component = 0.0
     else:
         freshness_component = 1.0 - _clamp(price_age_minutes / max_acceptable_price_age_minutes, 0.0, 1.0)
-
     if dispersion_ratio is None:
-        dispersion_component = 0.5  # unknown dispersion - neutral, not penalized or rewarded
+        dispersion_component = 0.5  # unknown - neutral, neither rewarded nor punished
     else:
-        dispersion_component = 1.0 - _clamp(dispersion_ratio / EXTREME_DISPERSION_RATIO, 0.0, 1.0)
+        dispersion_component = 1.0 - _clamp(dispersion_ratio / config.extreme_dispersion_ratio, 0.0, 1.0)
 
     components = (
         (max(sample_component, 0.0), 0.40),
@@ -190,49 +236,131 @@ def _compute_confidence(
     )
     if any(base == 0.0 for base, _ in components):
         return 0.0
-    log_sum = sum(weight * math.log(base) for base, weight in components)
-    return _clamp(math.exp(log_sum), 0.0, 1.0)
+    return _clamp(math.exp(sum(w * math.log(b) for b, w in components)), 0.0, 1.0)
 
 
 def _compute_risk_level(
-    *,
-    confidence: float,
-    dispersion_ratio: Optional[float],
-    price_age_minutes: Optional[int],
-    sales_count: int,
-    is_tradeable: Optional[bool],
-    max_acceptable_price_age_minutes: int,
+    *, confidence: float, dispersion_ratio: Optional[float],
+    price_age_minutes: Optional[int], sales_count: int,
+    is_tradeable: Optional[bool], max_acceptable_price_age_minutes: int,
+    trend_state: str, config: EngineConfig,
 ) -> str:
     if is_tradeable is False:
         return "avoid"
-    if sales_count < MIN_SALES_FOR_SIGNAL or price_age_minutes is None or price_age_minutes > max_acceptable_price_age_minutes:
+    if (
+        sales_count < config.min_sales_for_signal
+        or price_age_minutes is None
+        or price_age_minutes > max_acceptable_price_age_minutes
+    ):
         return "high"
-    if dispersion_ratio is not None and dispersion_ratio >= EXTREME_DISPERSION_RATIO:
+    if dispersion_ratio is not None and dispersion_ratio >= config.extreme_dispersion_ratio:
+        return "high"
+    # A card still in an unresolved decline is high risk regardless of how
+    # tidy its other statistics look - those statistics are describing a
+    # price level the market has already left.
+    if trend_state in config.trend_states_blocking_buy:
         return "high"
     if confidence >= 0.65 and (dispersion_ratio is None or dispersion_ratio < 0.20):
         return "low"
     return "medium"
 
 
-def evaluate_card(snapshot: Dict[str, Any], *, as_of: Optional[datetime] = None) -> CardIntelligence:
-    """Pure function: snapshot dict (one row of futgg_market_snapshot,
-    or an equivalent constructed dict in tests) -> CardIntelligence.
-    Never raises on missing/None fields - every optional input degrades
-    to a documented "insufficient data" outcome instead."""
+def _compute_expiry_minutes(
+    *, confidence: float, liquidity: Optional[float],
+    dispersion_ratio: Optional[float], price_age_minutes: Optional[int],
+    max_acceptable_price_age_minutes: int, distance_from_threshold: Optional[float],
+    config: EngineConfig,
+) -> int:
+    """How long this recommendation stays credible.
+
+    A recommendation cannot be valid indefinitely - the market state it
+    describes decays. Shelf life shortens with volatility, trading
+    velocity and an already-old price observation, and lengthens with
+    confidence and a comfortable margin over the buy threshold (a call
+    that only just clears the bar stops being true after a small move;
+    one clearing it by a mile survives a larger one).
+    """
+    minutes = float(config.base_expiry_minutes)
+
+    if dispersion_ratio is not None:
+        minutes *= _clamp(1.0 - (dispersion_ratio / config.extreme_dispersion_ratio) * 0.6, 0.3, 1.0)
+    if liquidity is not None:
+        # A fast-trading card re-prices sooner than a slow one.
+        minutes *= _clamp(1.15 - liquidity * 0.5, 0.5, 1.15)
+    minutes *= _clamp(0.7 + confidence * 0.6, 0.7, 1.3)
+    if distance_from_threshold is not None:
+        # A wafer-thin edge dies on the first tick.
+        minutes *= _clamp(0.6 + distance_from_threshold * 4.0, 0.6, 1.4)
+
+    # Whatever freshness budget the price observation has already spent is
+    # gone - a 40-minute-old price on a 45-minute tier has ~5 minutes of
+    # credibility left, not a fresh 45.
+    if price_age_minutes is not None:
+        remaining = max_acceptable_price_age_minutes - price_age_minutes
+        minutes = min(minutes, float(remaining)) if remaining > 0 else float(config.min_expiry_minutes)
+
+    return int(_clamp(minutes, config.min_expiry_minutes, config.max_expiry_minutes))
+
+
+def _insufficient(
+    card_id: int, reasons: ReasonList, *, as_of: datetime, config: EngineConfig,
+    confidence: float = 0.0, liquidity: Optional[float] = None,
+    risk_level: str = "high", price_age_minutes: Optional[int] = None,
+    sales_count: int = 0, span_minutes: Optional[float] = None,
+    trend: Optional[TrendAssessment] = None,
+    signal: str = "insufficient_data", current_bin: Optional[int] = None,
+) -> CardIntelligence:
+    return CardIntelligence(
+        card_id=card_id, fair_value=None, confidence_score=confidence,
+        liquidity_score=liquidity, risk_level=risk_level, signal=signal,
+        status=STATUS_INSUFFICIENT_DATA,
+        signal_reasons=reasons.messages, reason_codes=reasons.codes,
+        reasons=reasons.as_dicts(), blocking_codes=reasons.blocking_codes,
+        price_age_minutes=price_age_minutes, sales_sample_size=sales_count,
+        sales_window_span_minutes=span_minutes,
+        trend_state=trend.state if trend else INSUFFICIENT_TREND_DATA,
+        trend_description=trend.description if trend else "",
+        trend_features=trend.features.as_dict() if trend else {},
+        engine_version=config.version,
+        trend_version=trend.version if trend else TREND_CONFIG.version,
+        evaluated_at=as_of,
+        evaluated_bin=int(current_bin) if current_bin is not None else None,
+    )
+
+
+def evaluate_card(
+    snapshot: Dict[str, Any], *,
+    as_of: Optional[datetime] = None,
+    sales: Optional[Sequence[Any]] = None,
+    config: Optional[EngineConfig] = None,
+) -> CardIntelligence:
+    """Pure function: one futgg_market_snapshot row (or an equivalent
+    constructed dict) -> CardIntelligence.
+
+    `sales` is the optional raw sales series (futgg_sales_history rows)
+    used for trend assessment. When omitted the trend layer reports
+    INSUFFICIENT_TREND_DATA and buy signals are capped rather than
+    blocked - so a caller that cannot afford the extra query degrades to
+    "cannot confirm the trend" rather than to the old, dangerous
+    "trend does not exist" behaviour.
+
+    Never raises on missing/None fields - every optional input degrades to
+    a documented insufficient-data outcome.
+    """
+    cfg = config or ENGINE_CONFIG
     as_of = as_of or datetime.now(timezone.utc)
     card_id = snapshot["source_card_id"]
     is_tradeable = snapshot.get("is_tradeable")
-
-    reasons: List[str] = []
+    reasons = ReasonList()
 
     if is_tradeable is False:
-        return CardIntelligence(
-            card_id=card_id, fair_value=None, recommended_buy_max=None,
-            recommended_sell_target=None, expected_profit_after_tax=None,
-            expected_roi=None, liquidity_score=None, confidence_score=0.0,
-            risk_level="avoid", signal="avoid",
-            signal_reasons=["Card is untradeable (SBC/objective reward) - never a live market target."],
-            price_age_minutes=None, sales_sample_size=0, sales_window_span_minutes=None,
+        reasons.add(
+            rc.UNTRADEABLE,
+            "Card is untradeable (SBC/objective reward) - never a live market target.",
+        )
+        return _insufficient(
+            card_id, reasons, as_of=as_of, risk_level="avoid",
+            signal="avoid", config=cfg,
         )
 
     current_bin = snapshot.get("current_bin")
@@ -240,157 +368,266 @@ def evaluate_card(snapshot: Dict[str, Any], *, as_of: Optional[datetime] = None)
     sales_count = int(snapshot.get("sales_count") or 0)
     sales_median = snapshot.get("sales_median")
     sales_trimmed_mean = snapshot.get("sales_trimmed_mean")
+
+    # Postgres numerics arrive from asyncpg as Decimal; normalise once
+    # here rather than at each arithmetic site (mixing Decimal with a
+    # float literal raises TypeError).
     span_minutes = snapshot.get("sales_window_span_minutes")
-    # Postgres numeric columns (EXTRACT(...)/60.0 in the snapshot view)
-    # come back from asyncpg as Decimal, not float - mixing that with a
-    # plain float literal (e.g. `span_minutes / 60.0`) raises TypeError.
-    # Normalize once here, same as dispersion_ratio below, rather than
-    # at each arithmetic site.
     span_minutes = float(span_minutes) if span_minutes is not None else None
     dispersion_ratio = snapshot.get("sales_dispersion_ratio")
     dispersion_ratio = float(dispersion_ratio) if dispersion_ratio is not None else None
 
     price_age_minutes = _price_age_minutes(bin_captured_at, as_of)
     price_tier = snapshot.get("price_tier")
-    max_acceptable_price_age_minutes = _max_acceptable_price_age_minutes(price_tier)
+    max_age = cfg.max_price_age_for_tier(price_tier)
+
+    trend = evaluate_trend(sales or [], as_of=as_of, config=TREND_CONFIG)
 
     confidence = _compute_confidence(
         sales_count=sales_count, price_age_minutes=price_age_minutes,
         dispersion_ratio=dispersion_ratio, is_tradeable=is_tradeable,
-        max_acceptable_price_age_minutes=max_acceptable_price_age_minutes,
+        max_acceptable_price_age_minutes=max_age, config=cfg,
     )
     risk_level = _compute_risk_level(
         confidence=confidence, dispersion_ratio=dispersion_ratio,
         price_age_minutes=price_age_minutes, sales_count=sales_count,
-        is_tradeable=is_tradeable,
-        max_acceptable_price_age_minutes=max_acceptable_price_age_minutes,
+        is_tradeable=is_tradeable, max_acceptable_price_age_minutes=max_age,
+        trend_state=trend.state, config=cfg,
     )
     liquidity = _compute_liquidity_score(sales_count, span_minutes)
 
-    # ---- Hard "can't recommend a trade" gates -----------------------------
-    if sales_count < MIN_SALES_FOR_SIGNAL:
-        reasons.append(f"Only {sales_count} recent sale(s) recorded - need at least {MIN_SALES_FOR_SIGNAL} to trust a price.")
-    if price_age_minutes is None:
-        reasons.append("No BIN price observation recorded for this card.")
-    elif price_age_minutes > max_acceptable_price_age_minutes:
-        reasons.append(
-            f"Current price observation is {price_age_minutes} minutes old - beyond the "
-            f"{max_acceptable_price_age_minutes}-minute freshness limit for a {price_tier or 'unknown'}-tier card."
+    # ---- Hard "cannot evaluate at all" gates ------------------------------
+    if sales_count < cfg.min_sales_for_signal:
+        reasons.add(
+            rc.INSUFFICIENT_SALES,
+            f"Only {sales_count} recent sale(s) recorded - need at least "
+            f"{cfg.min_sales_for_signal} to trust a price.",
         )
-    if dispersion_ratio is not None and dispersion_ratio >= EXTREME_DISPERSION_RATIO:
-        reasons.append(f"Recent sales dispersion ratio {dispersion_ratio:.2f} is extreme (>= {EXTREME_DISPERSION_RATIO}) - the price is too volatile to anchor a fair value on right now.")
+    if price_age_minutes is None:
+        reasons.add(rc.NO_LIVE_PRICE, "No BIN price observation recorded for this card.")
+    elif price_age_minutes > max_age:
+        reasons.add(
+            rc.STALE_MARKET,
+            f"Current price observation is {price_age_minutes} minutes old - beyond the "
+            f"{max_age}-minute freshness limit for a {price_tier or 'unknown'}-tier card.",
+        )
+    if dispersion_ratio is not None and dispersion_ratio >= cfg.extreme_dispersion_ratio:
+        reasons.add(
+            rc.EXCESSIVE_DISPERSION,
+            f"Recent sales dispersion ratio {dispersion_ratio:.2f} is extreme "
+            f"(>= {cfg.extreme_dispersion_ratio}) - the price is too volatile to anchor a "
+            "fair value on right now.",
+        )
     if current_bin is None:
-        reasons.append("No live BIN listing found.")
+        reasons.add(rc.NO_LIVE_PRICE, "No live BIN listing found.")
+
     sales_estimate = sales_trimmed_mean if sales_trimmed_mean is not None else sales_median
     if sales_estimate is None:
-        # Should be unreachable when sales_count >= MIN_SALES_FOR_SIGNAL,
-        # since sales_count/sales_median/sales_trimmed_mean all come from
-        # the same grouped query in futgg_market_snapshot - but this was
-        # previously an `assert`, which is a real 500 (or, worse, a
-        # silent no-op under `python -O`) if that invariant is ever
-        # violated by a snapshot row this function didn't anticipate.
-        # Degrade to the same "insufficient_data" outcome as every other
-        # gate here instead of trusting an assumption about upstream SQL.
-        reasons.append("No recent-sales price estimate available for this card.")
-
-    insufficient = bool(reasons)
-
-    if insufficient:
-        return CardIntelligence(
-            card_id=card_id, fair_value=None, recommended_buy_max=None,
-            recommended_sell_target=None, expected_profit_after_tax=None,
-            expected_roi=None, liquidity_score=liquidity, confidence_score=confidence,
-            risk_level=risk_level, signal="insufficient_data", signal_reasons=reasons,
-            price_age_minutes=price_age_minutes, sales_sample_size=sales_count,
-            sales_window_span_minutes=span_minutes,
+        # Should be unreachable when sales_count >= min_sales_for_signal
+        # (all three come from the same grouped query), but this was once
+        # an `assert` - a real 500, or a silent no-op under `python -O`,
+        # if that invariant is ever violated by a row this function didn't
+        # anticipate. Degrade like every other gate instead.
+        reasons.add(
+            rc.NO_REALISTIC_EXIT_EVIDENCE,
+            "No recent-sales price estimate available for this card.",
         )
 
-    # ---- Fair value: confidence-weighted blend of sales evidence + BIN ----
+    if len(reasons):
+        return _insufficient(
+            card_id, reasons, as_of=as_of, confidence=confidence,
+            liquidity=liquidity, risk_level=risk_level,
+            price_age_minutes=price_age_minutes, sales_count=sales_count,
+            span_minutes=span_minutes, trend=trend, config=cfg,
+            current_bin=current_bin,
+        )
 
-    sales_weight = Decimal(str(FAIR_VALUE_SALES_WEIGHT))
-    bin_weight = Decimal(str(FAIR_VALUE_BIN_WEIGHT))
+    # =====================================================================
+    # Valuation
+    # =====================================================================
+    sales_weight = Decimal(str(cfg.fair_value_sales_weight))
+    bin_weight = Decimal(str(cfg.fair_value_bin_weight))
     fair_value = Decimal(str(sales_estimate)) * sales_weight + Decimal(str(current_bin)) * bin_weight
 
     recommended_sell_target = tm.round_to_ea_increment(fair_value, direction="down")
 
-    # Buy ceiling: the highest entry price that still clears
-    # MIN_NET_ROI_FOR_BUY once sold at fair_value, after EA's tax. This is
-    # exactly trading_math's net_roi() relation solved for entry_price
-    # (net_sale_proceeds(fair_value) / entry - 1 >= MIN_NET_ROI_FOR_BUY),
-    # still built entirely from tm.EA_TAX rather than a hand-rolled
-    # constant, and rounded down (a ceiling should never round up past
-    # what actually clears the bar).
+    # ---- The four prices, each independently meaningful ------------------
     #
-    # Clamped to the live current_bin: this formula alone is derived
-    # purely from fair_value and knows nothing about today's actual
-    # listing price, so on a card where the market has already dropped
-    # below the formula's ceiling, it would tell a user they can pay UP
-    # TO a price well above what the card is genuinely listed for right
-    # now - bad advice (inviting an overpay), and - worse - inconsistent
-    # with expected_profit_after_tax/expected_roi below, which must be
-    # computed from this same final entry price rather than a second,
-    # never-displayed number. A live bug on a real card: current_bin was
-    # ~176,000 while the pre-clamp ceiling was 205,000 - the UI showed
-    # "Buy below 205,000" alongside a profit figure that only made sense
-    # against the 176,000 nobody ever saw.
-    if current_bin is not None:
-        recommended_buy_max = min(
-            tm.round_to_ea_increment(
-                fair_value * (Decimal("1") - tm.EA_TAX) / (Decimal("1") + MIN_NET_ROI_FOR_BUY),
-                direction="down",
-            ),
-            tm.round_to_ea_increment(current_bin, direction="down"),
-        )
-    else:
-        recommended_buy_max = tm.round_to_ea_increment(
-            fair_value * (Decimal("1") - tm.EA_TAX) / (Decimal("1") + MIN_NET_ROI_FOR_BUY),
-            direction="down",
-        )
+    # theoretical_max_buy is trading_math's net_roi() relation solved for
+    # entry price: the highest entry that still clears min_net_roi_for_buy
+    # when sold at fair value after EA's tax. Crucially it is NOT clamped
+    # to current_bin - clamping made the number circular (the "maximum you
+    # should pay" became "what it costs"), which is exactly how a card
+    # ended up described as a valid buy purely because its own ask had
+    # been substituted into the calculation.
+    theoretical_max_buy = tm.round_to_ea_increment(
+        fair_value * (Decimal("1") - tm.EA_TAX) / (Decimal("1") + cfg.min_net_roi_for_buy),
+        direction="down",
+    )
+    # The advised ceiling sits below the theoretical one so the trade
+    # still works if fair value proves slightly optimistic.
+    recommended_buy_max = tm.round_to_ea_increment(
+        theoretical_max_buy * (Decimal("1") - Decimal(str(cfg.conservative_buy_margin))),
+        direction="down",
+    )
 
-    expected_profit_after_tax = tm.net_profit(recommended_sell_target, recommended_buy_max)
-    expected_roi = tm.net_roi(recommended_sell_target, recommended_buy_max)
+    current_bin_dec = Decimal(str(current_bin))
+    is_executable = current_bin_dec <= recommended_buy_max
+    current_executable_buy = current_bin_dec if is_executable else None
+    break_even_price = tm.break_even_sale_price(current_bin_dec)
 
-    reasons = []
-    bin_vs_median_pct = None
+    # Expected outcome is always computed against the price a user would
+    # actually pay. On a buy that is the live BIN; on a watch it is the
+    # trigger price, and the UI labels it as prospective.
+    entry_for_expectation = current_bin_dec if is_executable else recommended_buy_max
+    expected_profit_after_tax = tm.net_profit(recommended_sell_target, entry_for_expectation)
+    expected_roi = tm.net_roi(recommended_sell_target, entry_for_expectation)
+
+    # ---- Evidence reasons (informational) --------------------------------
     if sales_median and sales_median > 0:
-        bin_vs_median_pct = (float(sales_median) - float(current_bin)) / float(sales_median) * 100
-        direction = "below" if bin_vs_median_pct > 0 else "above"
-        reasons.append(f"Current BIN is {abs(bin_vs_median_pct):.1f}% {direction} the median of {sales_count} recent sales.")
+        gap_pct = (float(sales_median) - float(current_bin)) / float(sales_median) * 100
+        direction = "below" if gap_pct > 0 else "above"
+        reasons.add(
+            rc.INFO_BIN_VS_MEDIAN,
+            f"Current BIN is {abs(gap_pct):.1f}% {direction} the median of "
+            f"{sales_count} recent sales.",
+        )
     if span_minutes is not None and sales_count > 1:
         if span_minutes < 60:
-            reasons.append(f"{sales_count} sales occurred within {span_minutes:.0f} minutes.")
+            reasons.add(rc.INFO_SALES_WINDOW, f"{sales_count} sales occurred within {span_minutes:.0f} minutes.")
         else:
-            reasons.append(f"{sales_count} sales occurred over the last {span_minutes / 60.0:.1f} hours.")
+            reasons.add(rc.INFO_SALES_WINDOW, f"{sales_count} sales occurred over the last {span_minutes / 60.0:.1f} hours.")
     if price_age_minutes is not None:
-        reasons.append(f"Current price observation is {price_age_minutes} minute(s) old.")
+        reasons.add(rc.INFO_PRICE_AGE, f"Current price observation is {price_age_minutes} minute(s) old.")
     if dispersion_ratio is not None:
-        reasons.append(f"Recent sales dispersion ratio is {dispersion_ratio:.2f}.")
+        reasons.add(rc.INFO_DISPERSION, f"Recent sales dispersion ratio is {dispersion_ratio:.2f}.")
+    reasons.add(rc.INFO_TREND_STATE, trend.description)
 
-    # ---- Signal decision ---------------------------------------------------
+    # =====================================================================
+    # Signal decision
+    # =====================================================================
+    trend_blocks = trend.state in cfg.trend_states_blocking_buy
+    trend_caps = trend.state in cfg.trend_states_capping_signal
+
+    distance_from_threshold: Optional[float] = None
+    if recommended_buy_max and recommended_buy_max > 0:
+        distance_from_threshold = float((recommended_buy_max - current_bin_dec) / recommended_buy_max)
+
     if expected_roi is None or expected_roi <= 0:
-        signal = "avoid"
-        reasons.append("Expected sell target does not clear EA's 5% tax at the current BIN - not a real edge.")
-    elif confidence < MIN_CONFIDENCE_FOR_ANY_SIGNAL:
-        signal = "insufficient_data"
-        reasons.append(f"Confidence score {confidence:.2f} is below the minimum {MIN_CONFIDENCE_FOR_ANY_SIGNAL} needed to act on any signal.")
-    elif confidence >= MIN_CONFIDENCE_FOR_BUY_SIGNAL and expected_roi >= MIN_NET_ROI_FOR_STRONG_BUY and risk_level in ("low", "medium"):
-        signal = "strong_buy"
-        reasons.append(f"Expected net ROI {float(expected_roi) * 100:.1f}% clears the strong-buy threshold ({float(MIN_NET_ROI_FOR_STRONG_BUY) * 100:.0f}%) with confidence {confidence:.2f}.")
-    elif confidence >= MIN_CONFIDENCE_FOR_BUY_SIGNAL and expected_roi >= MIN_NET_ROI_FOR_BUY and risk_level != "high":
-        signal = "buy"
-        reasons.append(f"Expected net ROI {float(expected_roi) * 100:.1f}% clears the buy threshold ({float(MIN_NET_ROI_FOR_BUY) * 100:.0f}%) with confidence {confidence:.2f}.")
-    elif expected_roi > 0 and confidence >= MIN_CONFIDENCE_FOR_ANY_SIGNAL:
-        signal = "watch"
-        reasons.append("Positive expected edge but below the buy-signal confidence/ROI/risk bar.")
+        signal, status = "avoid", STATUS_INSUFFICIENT_DATA
+        reasons.add(
+            rc.TARGET_BELOW_BREAK_EVEN,
+            "Expected sell target does not clear EA's 5% tax at this entry - not a real edge.",
+        )
+    elif trend_blocks:
+        # The falling-knife guard, and the single most important gate in
+        # the engine: it is what stops the largest apparent discounts -
+        # which are, precisely, the cards that have fallen hardest - from
+        # being ranked as the best opportunities.
+        signal, status = "avoid", STATUS_INSUFFICIENT_DATA
+        code = rc.FALLING_KNIFE if trend.state == "falling_knife" else rc.UNRESOLVED_DOWNTREND
+        reasons.add(
+            code,
+            "The discount against recent sales is explained by an unresolved downtrend, "
+            "not by underpricing - recent sales are still printing lower.",
+        )
+    elif confidence < cfg.min_confidence_for_any_signal:
+        signal, status = "insufficient_data", STATUS_INSUFFICIENT_DATA
+        reasons.add(
+            rc.LOW_CONFIDENCE,
+            f"Confidence score {confidence:.2f} is below the minimum "
+            f"{cfg.min_confidence_for_any_signal} needed to act on any signal.",
+        )
+    elif not is_executable:
+        # Item 10's core correction: above the advised ceiling is a WATCH
+        # with an explicit trigger, never a buy.
+        signal, status = "watch", STATUS_WATCH
+        reasons.add(
+            rc.PRICE_ABOVE_MAX_BUY,
+            f"Currently {int(current_bin):,} - above the {int(recommended_buy_max):,} "
+            "maximum that leaves a worthwhile margin.",
+        )
+        reasons.add(
+            rc.INFO_WATCH_THRESHOLD,
+            f"Buy only if the price falls to {int(recommended_buy_max):,} or below.",
+        )
+    elif (
+        confidence >= cfg.min_confidence_for_buy_signal
+        and expected_roi >= cfg.min_net_roi_for_strong_buy
+        and risk_level in ("low", "medium")
+        and not trend_caps
+    ):
+        signal, status = "strong_buy", STATUS_ACTIVE
+        reasons.add(
+            rc.INFO_ROI_CLEARS_STRONG_BUY,
+            f"Expected net ROI {float(expected_roi) * 100:.1f}% clears the strong-buy "
+            f"threshold ({float(cfg.min_net_roi_for_strong_buy) * 100:.0f}%) with confidence {confidence:.2f}.",
+        )
+    elif (
+        confidence >= cfg.min_confidence_for_buy_signal
+        and expected_roi >= cfg.min_net_roi_for_buy
+        and risk_level != "high"
+    ):
+        signal, status = "buy", STATUS_ACTIVE
+        reasons.add(
+            rc.INFO_ROI_CLEARS_BUY,
+            f"Expected net ROI {float(expected_roi) * 100:.1f}% clears the buy threshold "
+            f"({float(cfg.min_net_roi_for_buy) * 100:.0f}%) with confidence {confidence:.2f}.",
+        )
+        if trend_caps:
+            reasons.add(
+                rc.TREND_UNCONFIRMED,
+                "Held at buy rather than strong buy: the price has fallen and only "
+                "recently flattened, so the discount is not yet confirmed.",
+            )
+    elif expected_roi > 0 and confidence >= cfg.min_confidence_for_any_signal:
+        signal, status = "watch", STATUS_WATCH
+        reasons.add(
+            rc.EXPECTED_PROFIT_TOO_LOW,
+            "Positive expected edge but below the buy-signal confidence/ROI/risk bar.",
+        )
     else:
-        signal = "hold"
-        reasons.append("No actionable edge in either direction right now.")
+        signal, status = "hold", STATUS_WATCH
+        reasons.add(rc.INFO_NO_EDGE, "No actionable edge in either direction right now.")
+
+    buy_below = recommended_buy_max if signal in ("watch", "hold") else None
+
+    expiry_minutes = _compute_expiry_minutes(
+        confidence=confidence, liquidity=liquidity, dispersion_ratio=dispersion_ratio,
+        price_age_minutes=price_age_minutes, max_acceptable_price_age_minutes=max_age,
+        distance_from_threshold=distance_from_threshold, config=cfg,
+    )
 
     return CardIntelligence(
-        card_id=card_id, fair_value=fair_value.quantize(Decimal("1")),
-        recommended_buy_max=recommended_buy_max, recommended_sell_target=recommended_sell_target,
-        expected_profit_after_tax=expected_profit_after_tax, expected_roi=expected_roi,
-        liquidity_score=liquidity, confidence_score=confidence, risk_level=risk_level,
-        signal=signal, signal_reasons=reasons, price_age_minutes=price_age_minutes,
-        sales_sample_size=sales_count, sales_window_span_minutes=span_minutes,
+        card_id=card_id,
+        fair_value=fair_value.quantize(Decimal("1")),
+        theoretical_max_buy=theoretical_max_buy,
+        recommended_buy_max=recommended_buy_max,
+        current_executable_buy=current_executable_buy,
+        break_even_price=break_even_price,
+        recommended_sell_target=recommended_sell_target,
+        buy_below=buy_below,
+        expected_profit_after_tax=expected_profit_after_tax,
+        expected_roi=expected_roi,
+        liquidity_score=liquidity,
+        confidence_score=confidence,
+        risk_level=risk_level,
+        signal=signal,
+        status=status,
+        signal_reasons=reasons.messages,
+        reason_codes=reasons.codes,
+        reasons=reasons.as_dicts(),
+        blocking_codes=reasons.blocking_codes,
+        price_age_minutes=price_age_minutes,
+        sales_sample_size=sales_count,
+        sales_window_span_minutes=span_minutes,
+        trend_state=trend.state,
+        trend_description=trend.description,
+        trend_features=trend.features.as_dict(),
+        engine_version=cfg.version,
+        trend_version=trend.version,
+        evaluated_at=as_of,
+        expires_at=as_of + timedelta(minutes=expiry_minutes),
+        expiry_minutes=expiry_minutes,
+        evaluated_bin=int(current_bin),
     )

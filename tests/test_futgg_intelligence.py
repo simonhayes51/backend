@@ -9,6 +9,7 @@ from decimal import Decimal
 import pytest
 
 from app.services import trading_math as tm
+from app.services import futgg_reasons as reasons_pkg
 from app.services.futgg_intelligence import (
     DEFAULT_MAX_ACCEPTABLE_PRICE_AGE_MINUTES,
     MIN_SALES_FOR_SIGNAL,
@@ -125,19 +126,17 @@ class TestTaxDelegatesToTradingMath:
         assert ci.recommended_sell_target == tm.round_to_ea_increment(ci.recommended_sell_target)
 
 
-class TestBuyMaxNeverExceedsLivePrice:
-    """Regression test for a live bug: on a card whose sales evidence
-    pushed fair_value well above the live BIN, the "Buy below" ceiling
-    (derived purely from fair_value) came out higher than the actual
-    current listing price - a real card showed "Buy below 205,000"
-    while current_bin was ~176,000, alongside an "Expected profit"
-    silently computed against the never-displayed 176,000. Advising a
-    buy ceiling above what the card is actually listed for is bad advice
-    on its own, and the two displayed numbers didn't reconcile."""
+class TestSeparatedBuyPrices:
+    """Engine v2, item 10: the four prices are distinct, and none of them
+    is produced by substituting the card's own asking price into the
+    calculation.
 
-    def test_buy_max_clamped_to_current_bin_when_formula_ceiling_is_higher(self):
-        # Sales evidence far above current_bin pushes the raw formula
-        # ceiling (~118,000) above current_bin (100,000).
+    The previous behaviour clamped recommended_buy_max to current_bin,
+    which made the advice circular - "the most you should pay" became
+    "whatever it costs", so any card could be presented as a valid buy at
+    its own ask. These tests pin the corrected contract."""
+
+    def test_all_four_prices_are_present_and_ordered(self):
         ci = evaluate_card(
             _snapshot(
                 current_bin=100000, sales_median=140000, sales_trimmed_mean=140000,
@@ -146,18 +145,50 @@ class TestBuyMaxNeverExceedsLivePrice:
             ),
             as_of=AS_OF,
         )
-        assert ci.recommended_buy_max is not None
-        assert ci.recommended_buy_max <= 100000
-        # The displayed profit must reconcile with the displayed buy/sell
-        # numbers - simple arithmetic a user can verify themselves.
-        expected_profit = tm.net_profit(ci.recommended_sell_target, ci.recommended_buy_max)
-        assert ci.expected_profit_after_tax == expected_profit
+        # The theoretical ceiling is derived from fair value alone and is
+        # deliberately allowed to sit ABOVE the live ask - that is the
+        # point: it describes how much headroom the card has, it is not a
+        # price we advise paying.
+        assert ci.theoretical_max_buy > 100000
+        # The advised ceiling is strictly below the theoretical one.
+        assert ci.recommended_buy_max < ci.theoretical_max_buy
+        # The live ask is below the advised ceiling here, so it is buyable.
+        assert ci.current_executable_buy == 100000
+        assert ci.break_even_price is not None
+        assert ci.recommended_sell_target > ci.break_even_price
 
-    def test_buy_max_uses_formula_ceiling_when_it_is_the_lower_bound(self):
-        # Default fixture: formula ceiling (9800) is already below
-        # current_bin (10000) - clamping must be a true no-op here.
+    def test_profit_reconciles_with_the_price_a_user_would_actually_pay(self):
+        ci = evaluate_card(
+            _snapshot(
+                current_bin=100000, sales_median=140000, sales_trimmed_mean=140000,
+                sales_low=130000, sales_high=150000, sales_stddev=4000,
+                sales_dispersion_ratio=0.03,
+            ),
+            as_of=AS_OF,
+        )
+        # Arithmetic a user can verify by hand from the displayed numbers.
+        assert ci.expected_profit_after_tax == tm.net_profit(
+            ci.recommended_sell_target, ci.current_executable_buy
+        )
+
+    def test_bin_above_recommended_max_is_a_watch_not_a_buy(self):
+        # Default fixture: theoretical ceiling 9,800, advised ceiling
+        # 9,400, live BIN 10,000. Previously the ceiling was clamped down
+        # to 10,000 and this presented as a buy. It is not one.
         ci = evaluate_card(_snapshot(), as_of=AS_OF)
-        assert ci.recommended_buy_max == 9800
+        assert ci.theoretical_max_buy == 9800
+        assert ci.recommended_buy_max == 9400
+        assert ci.current_executable_buy is None
+        assert ci.signal == "watch"
+        assert ci.status == "watch"
+        assert ci.buy_below == 9400
+        assert reasons_pkg.PRICE_ABOVE_MAX_BUY in ci.reason_codes
+
+    def test_watch_states_an_explicit_trigger_price_in_english(self):
+        ci = evaluate_card(_snapshot(), as_of=AS_OF)
+        joined = " ".join(ci.signal_reasons)
+        assert "9,400" in joined
+        assert "falls to" in joined
 
 
 class TestSignalDecision:
@@ -274,6 +305,153 @@ class TestApproximateTimeNeverClaimedExact:
         # price_age_minutes is derived from bin_captured_at (a real DB
         # timestamp, not a sales approximation) - sanity check it's an int.
         assert isinstance(ci.price_age_minutes, int)
+
+
+def _falling_series(start_price, end_price, *, n=12, hours=48.0):
+    """Monotonic decline with a steepening tail - the shape that used to
+    produce the engine's strongest buy signals."""
+    step = hours / (n - 1)
+    out = []
+    for i in range(n):
+        # Quadratic easing so the decline accelerates rather than being linear.
+        frac = (i / (n - 1)) ** 1.6
+        price = start_price + (end_price - start_price) * frac
+        out.append((price, AS_OF - timedelta(hours=hours - step * i)))
+    return out
+
+
+def _flat_series(price, *, n=12, hours=48.0):
+    step = hours / (n - 1)
+    return [
+        (price + (50 if i % 2 else -50), AS_OF - timedelta(hours=hours - step * i))
+        for i in range(n)
+    ]
+
+
+class TestFallingKnifeGate:
+    """The single most important behavioural change in engine v2.
+
+    A card that has fallen hard has a stale-high sales median, so the
+    naive "BIN vs median" comparison scores it as the *biggest* discount
+    available. With no trend term, the engine ranked exactly the cards
+    that were still collapsing as its top opportunities. These tests pin
+    the gate that stops that."""
+
+    def test_steep_decline_below_stale_median_is_not_a_buy(self):
+        # BIN 60,000 against a 100,000 median: a 40% "discount" on the
+        # old logic, and a large positive expected ROI. It is a card in
+        # free fall.
+        snapshot = _snapshot(
+            current_bin=60000, sales_median=100000, sales_trimmed_mean=100000,
+            sales_low=58000, sales_high=140000, sales_stddev=12000,
+            sales_dispersion_ratio=0.12, sales_count=30,
+        )
+        ci = evaluate_card(
+            snapshot, as_of=AS_OF, sales=_falling_series(140000, 62000),
+        )
+        assert ci.trend_state in ("falling_knife", "downtrend")
+        assert ci.signal == "avoid"
+        assert ci.risk_level == "high"
+        assert (
+            reasons_pkg.FALLING_KNIFE in ci.reason_codes
+            or reasons_pkg.UNRESOLVED_DOWNTREND in ci.reason_codes
+        )
+
+    def test_same_card_without_the_trend_gate_would_have_looked_great(self):
+        # Identical snapshot, no sales series supplied. This documents
+        # exactly how large the mispricing looked before the gate existed
+        # - and that omitting the series now degrades to a capped signal
+        # rather than silently reverting to the old behaviour.
+        snapshot = _snapshot(
+            current_bin=60000, sales_median=100000, sales_trimmed_mean=100000,
+            sales_low=58000, sales_high=140000, sales_stddev=12000,
+            sales_dispersion_ratio=0.12, sales_count=30,
+        )
+        ci = evaluate_card(snapshot, as_of=AS_OF)
+        assert ci.expected_roi > 0.30  # the discount the old engine chased
+        assert ci.trend_state == "insufficient_trend_data"
+        # Capped, never promoted to strong_buy, because the trend is unknown.
+        assert ci.signal != "strong_buy"
+
+    def test_stabilised_card_below_median_is_allowed_but_capped(self):
+        # Fell, then genuinely flattened. This IS a legitimate buy - the
+        # gate must not be so blunt that it blocks every discounted card.
+        sales = _falling_series(120000, 92000, n=7, hours=48.0) + _flat_series(
+            91500, n=7, hours=16.0
+        )
+        snapshot = _snapshot(
+            current_bin=88000, sales_median=95000, sales_trimmed_mean=95000,
+            sales_low=88000, sales_high=120000, sales_stddev=5000,
+            sales_dispersion_ratio=0.05, sales_count=30,
+        )
+        ci = evaluate_card(snapshot, as_of=AS_OF, sales=sales)
+        assert ci.trend_state in ("stabilising", "sideways", "recovering")
+        assert ci.signal in ("buy", "strong_buy", "watch")
+        assert ci.signal != "avoid"
+
+    def test_sideways_liquid_market_still_produces_a_buy(self):
+        snapshot = _snapshot(
+            current_bin=9000, sales_median=11500, sales_trimmed_mean=11500,
+            sales_count=40,
+        )
+        ci = evaluate_card(snapshot, as_of=AS_OF, sales=_flat_series(11500, n=20))
+        assert ci.trend_state == "sideways"
+        assert ci.signal in ("buy", "strong_buy")
+        assert ci.status == "active"
+
+
+class TestExpiryAndProvenance:
+    def test_every_result_is_versioned(self):
+        ci = evaluate_card(_snapshot(), as_of=AS_OF)
+        assert ci.engine_version.startswith("futgg-")
+        assert ci.trend_version.startswith("trend-")
+        assert ci.evaluated_at == AS_OF
+        assert ci.evaluated_bin == 10000
+
+    def test_active_recommendation_carries_an_expiry(self):
+        ci = evaluate_card(
+            _snapshot(current_bin=9000, sales_median=11500, sales_trimmed_mean=11500,
+                      sales_count=40),
+            as_of=AS_OF, sales=_flat_series(11500, n=20),
+        )
+        assert ci.expiry_minutes is not None and ci.expiry_minutes > 0
+        assert ci.expires_at == AS_OF + timedelta(minutes=ci.expiry_minutes)
+
+    def test_expiry_never_outlives_the_price_freshness_budget(self):
+        # A price already 100 minutes old on a 120-minute default tier has
+        # ~20 minutes of credibility left, not a fresh full window.
+        ci = evaluate_card(
+            _snapshot(
+                current_bin=9000, sales_median=11500, sales_trimmed_mean=11500,
+                sales_count=40, bin_captured_at=AS_OF - timedelta(minutes=100),
+            ),
+            as_of=AS_OF, sales=_flat_series(11500, n=20),
+        )
+        assert ci.expiry_minutes <= 20
+
+    def test_stale_price_yields_insufficient_data_with_a_code(self):
+        ci = evaluate_card(
+            _snapshot(bin_captured_at=AS_OF - timedelta(minutes=600)), as_of=AS_OF,
+        )
+        assert ci.status == "insufficient_data"
+        assert reasons_pkg.STALE_MARKET in ci.reason_codes
+
+
+class TestStructuredReasons:
+    def test_reasons_expose_codes_and_english(self):
+        ci = evaluate_card(_snapshot(), as_of=AS_OF)
+        assert ci.reasons, "structured reasons must be populated"
+        for reason in ci.reasons:
+            assert set(reason) == {"code", "message"}
+            assert reason["message"]
+        # The legacy free-text shape stays available for the existing API.
+        assert ci.signal_reasons == [r["message"] for r in ci.reasons]
+
+    def test_blocking_codes_are_separated_from_informational_ones(self):
+        ci = evaluate_card(_snapshot(sales_count=1), as_of=AS_OF)
+        assert reasons_pkg.INSUFFICIENT_SALES in ci.blocking_codes
+        # Informational codes must never appear as blocking.
+        assert reasons_pkg.INFO_PRICE_AGE not in ci.blocking_codes
 
 
 if __name__ == "__main__":
