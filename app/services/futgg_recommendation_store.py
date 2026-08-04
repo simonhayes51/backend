@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Sequence
@@ -68,9 +69,55 @@ INSERT INTO futgg_recommendation_snapshots (
     $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
     $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40
 )
-ON CONFLICT (source_card_id, date_trunc('minute', evaluated_at)) DO NOTHING
+-- Must match futgg_rec_snap_card_minute_uniq in migration 040 exactly,
+-- including the AT TIME ZONE 'UTC' (which is there because date_trunc
+-- over a TIMESTAMPTZ is STABLE, not IMMUTABLE, and so cannot be
+-- indexed). Postgres infers the target index by matching this
+-- expression; any divergence and it reports that no matching unique
+-- constraint exists.
+ON CONFLICT (source_card_id, date_trunc('minute', evaluated_at AT TIME ZONE 'UTC')) DO NOTHING
 RETURNING id
 """
+
+
+# Write failures here are almost always systemic rather than per-card -
+# a missing table, a schema behind the code - so the interesting signal
+# is "the writer is failing and why", not one line per card. Logging a
+# full traceback per card turned a single missing table into thousands of
+# messages a minute: Railway's 500/sec replica limit dropped 8,658 of
+# them in one burst, which discarded the migration errors we needed to
+# diagnose it. Noise this dense is not merely untidy, it destroys
+# evidence.
+#
+# So: first failure of a given class logs once with the traceback, and
+# subsequent ones are counted and summarised at most once a minute.
+_write_failure_counts: Dict[str, int] = {}
+_write_failure_last_log: Dict[str, float] = {}
+_WRITE_FAILURE_LOG_INTERVAL_SECONDS = 60.0
+
+
+def _log_write_failure(exc: BaseException, card_id: Any) -> None:
+    key = type(exc).__name__
+    now = time.monotonic()
+    count = _write_failure_counts.get(key, 0) + 1
+    _write_failure_counts[key] = count
+    last = _write_failure_last_log.get(key)
+
+    if last is None:
+        _write_failure_last_log[key] = now
+        log.warning(
+            "failed to record recommendation (card_id=%s, %s) - further "
+            "failures of this type will be summarised, not logged individually",
+            card_id, key, exc_info=True,
+        )
+        return
+
+    if now - last >= _WRITE_FAILURE_LOG_INTERVAL_SECONDS:
+        _write_failure_last_log[key] = now
+        log.warning(
+            "recommendation writer still failing: %s x%d since start "
+            "(most recent card_id=%s)", key, count, card_id,
+        )
 
 
 async def record_recommendation(
@@ -113,8 +160,8 @@ async def record_recommendation(
                 json.dumps(ENGINE_CONFIG.as_dict()),
                 ci.expires_at, ci.expiry_minutes,
             )
-    except Exception:
-        log.warning("failed to record recommendation for card_id=%s", ci.card_id, exc_info=True)
+    except Exception as exc:
+        _log_write_failure(exc, ci.card_id)
         return None
 
 

@@ -28,6 +28,8 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+import asyncpg
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.db import get_core_pool
@@ -582,6 +584,28 @@ async def market_freshness(
 # signal that only paying users can see is not doing its job.
 
 
+def _degraded_reason(exc: BaseException) -> str:
+    """A short, safe description of why a diagnostic endpoint is degraded.
+
+    Deliberately names the missing relation when that is the cause, since
+    that is the single most useful fact for whoever is looking - a
+    skipped migration is invisible from the outside otherwise. Anything
+    unrecognised is reported by exception class only; no driver message
+    is echoed, because those can carry connection details and these two
+    endpoints are ungated by design.
+    """
+    if isinstance(exc, asyncpg.exceptions.UndefinedTableError):
+        relation = getattr(exc, "table_name", None)
+        if relation:
+            return f"required table '{relation}' does not exist (migration not applied)"
+        return "a required table does not exist (migration not applied)"
+    if isinstance(exc, asyncpg.exceptions.UndefinedColumnError):
+        return "schema is behind the application (migration not applied)"
+    if isinstance(exc, asyncpg.PostgresError):
+        return f"database error ({type(exc).__name__})"
+    return f"unexpected error ({type(exc).__name__})"
+
+
 @router.get("/market/track-record")
 async def market_track_record(
     horizon: str = Query("24h", description="24h|48h|7d"),
@@ -601,21 +625,33 @@ async def market_track_record(
     if horizon not in HORIZONS:
         raise HTTPException(400, f"horizon must be one of {sorted(HORIZONS)}")
     try:
-        return await track_record(provider._pool, horizon=horizon, window_days=window_days)
-    except Exception:
-        # The tables land with migration 040 and stay empty until the
-        # scanner has been running long enough for a horizon to elapse.
-        # An honest empty state beats a 500 on a public trust page.
+        result = await track_record(provider._pool, horizon=horizon, window_days=window_days)
+        result["status"] = "ok"
+        return result
+    except Exception as exc:
+        # An honest empty state still beats a 500 on a public trust page -
+        # but "empty" and "broken" must not look the same, which is what
+        # this handler used to do. It returned a fully success-shaped
+        # payload with total_recommendations=0 and the "no graded outcomes
+        # yet" note, so a missing table read exactly like a quiet first
+        # day. Migration 040 was skipped in production for want of a
+        # prerequisite table and this endpoint reported it as normal for
+        # seven hours.
+        #
+        # `status` is now the field to trust: "ok" only ever comes from
+        # the real query below, so any caller can tell the difference.
         log.warning("track_record query failed", exc_info=True)
         return {
             "horizon": horizon,
             "window_days": window_days,
+            "status": "unavailable",
+            "error": _degraded_reason(exc),
             "has_enough_data": False,
-            "headline": {"total_recommendations": 0},
-            "breakdowns": {},
+            "headline": None,
+            "breakdowns": None,
             "methodology": (
-                "No graded outcomes yet - recommendations are graded only after their "
-                "full horizon has elapsed."
+                "The track record could not be read. This is a fault, not an "
+                "absence of results - no conclusion should be drawn from it."
             ),
         }
 
@@ -634,7 +670,20 @@ async def market_evaluation_coverage(
     from app.services.futgg_scanner import coverage_report
 
     try:
-        return await coverage_report(provider._pool)
-    except Exception:
+        result = await coverage_report(provider._pool)
+        result["status"] = "ok"
+        return result
+    except Exception as exc:
+        # Same trap as track-record above: the old fallback returned
+        # player_pool=0, which is indistinguishable from a working call
+        # against an empty pool - except that it never can be, since
+        # coverage_report's first query is a plain count over
+        # futgg_players. A zero here was always a lie.
         log.warning("coverage_report failed", exc_info=True)
-        return {"player_pool": 0, "cards_evaluated_24h": 0, "pool_coverage_24h_pct": None}
+        return {
+            "status": "unavailable",
+            "error": _degraded_reason(exc),
+            "player_pool": None,
+            "cards_evaluated_24h": None,
+            "pool_coverage_24h_pct": None,
+        }
