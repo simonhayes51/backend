@@ -10,6 +10,8 @@ import pytest
 
 from app.services import trading_math as tm
 from app.services import futgg_reasons as reasons_pkg
+from app.services import futgg_reasons as rc
+from app.services.futgg_config import ENGINE_CONFIG
 from app.services.futgg_intelligence import (
     DEFAULT_MAX_ACCEPTABLE_PRICE_AGE_MINUTES,
     MIN_SALES_FOR_SIGNAL,
@@ -503,3 +505,76 @@ class TestSalesStaleness:
         ci = evaluate_card(self._snap(1, latest_sale_at=None), as_of=AS_OF)
         assert reasons_pkg.STALE_SALES not in ci.reason_codes
         assert ci.confidence_score > 0
+
+
+class TestImplausibleEdge:
+    """The Time Warp Ronaldo incident, reproduced.
+
+    A live BIN of 138,000 - correct, four minutes old, confirmed against
+    the EA web app - sat beside a ~755,000 recent-sales estimate because
+    the card had crashed and the sales window straddled the crash. The
+    engine valued it at 570,000, advised buying at up to 500,000, and
+    quoted a 403,500 profit on a card worth 138,000.
+
+    Every existing gate passed it: the price was fresh, the sales were
+    plentiful and recent, and the trend layer could not establish a slope
+    from a sparse, unevenly spaced sample - falling back to a state that
+    only caps the signal rather than blocking it.
+    """
+
+    def _crashed_card(self, **overrides):
+        snapshot = dict(
+            current_bin=138000,
+            bin_captured_at=AS_OF - timedelta(minutes=4),
+            sales_count=40,
+            sales_median=755000,
+            sales_trimmed_mean=755000,
+            sales_low=138000,
+            sales_high=2250000,
+            sales_stddev=600000,
+            sales_dispersion_ratio=0.8,
+        )
+        snapshot.update(overrides)
+        return _snapshot(**snapshot)
+
+    def test_live_price_far_below_sales_is_never_a_buy(self):
+        ci = evaluate_card(self._crashed_card(), as_of=AS_OF)
+        assert ci.signal not in ("buy", "strong_buy")
+
+    def test_the_divergence_is_reported_as_the_reason(self):
+        ci = evaluate_card(self._crashed_card(), as_of=AS_OF)
+        assert rc.SALES_BIN_DIVERGENCE in ci.reason_codes
+        assert rc.SALES_BIN_DIVERGENCE in ci.blocking_codes
+
+    def test_no_buy_advice_is_published_for_a_broken_anchor(self):
+        # The specific harm: a "buy below 500,000" on a 138,000 card.
+        # Refusing to value it must mean no entry price at all, not a
+        # smaller wrong one.
+        ci = evaluate_card(self._crashed_card(), as_of=AS_OF)
+        assert ci.recommended_buy_max is None
+        assert ci.expected_profit_after_tax is None
+
+    def test_an_ordinary_discount_is_still_allowed_through(self):
+        # 20% below the sales estimate is a normal, tradeable edge and
+        # must not be caught by the plausibility gate.
+        ci = evaluate_card(
+            _snapshot(current_bin=8800, sales_median=11000, sales_trimmed_mean=11000),
+            as_of=AS_OF,
+        )
+        assert rc.SALES_BIN_DIVERGENCE not in ci.reason_codes
+
+    def test_the_boundary_is_the_configured_ratio(self):
+        cfg_ratio = ENGINE_CONFIG.min_bin_to_sales_ratio
+        sales = 100000
+        just_above = evaluate_card(
+            _snapshot(current_bin=int(sales * cfg_ratio) + 1000,
+                      sales_median=sales, sales_trimmed_mean=sales),
+            as_of=AS_OF,
+        )
+        just_below = evaluate_card(
+            _snapshot(current_bin=int(sales * cfg_ratio) - 1000,
+                      sales_median=sales, sales_trimmed_mean=sales),
+            as_of=AS_OF,
+        )
+        assert rc.SALES_BIN_DIVERGENCE not in just_above.reason_codes
+        assert rc.SALES_BIN_DIVERGENCE in just_below.reason_codes

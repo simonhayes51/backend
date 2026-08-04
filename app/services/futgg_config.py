@@ -44,7 +44,7 @@ from typing import Any, Dict, Mapping, Optional
 # unchanged snapshot. Format is "futgg-<major>.<minor>"; the outcome
 # grader groups by this exact string, so it must be stable and unique per
 # behavioural configuration.
-ENGINE_VERSION = "futgg-2.0"
+ENGINE_VERSION = "futgg-2.1"
 
 # Bumped independently of ENGINE_VERSION - see module docstring.
 TREND_VERSION = "trend-1.0"
@@ -130,6 +130,20 @@ class EngineConfig:
     max_sales_age_minutes: int = 720          # 12h - full confidence below this
     # Past this, the sample is not evidence about today's market at all.
     reject_sales_older_than_minutes: int = 4320   # 72h
+
+    # ---- Plausibility of the edge -------------------------------------
+    # Minimum ratio of live BIN to the recent-sales estimate before the
+    # two are accepted as describing the same market. Below this, a
+    # discount is not an opportunity - it is evidence that the sales
+    # window straddles a crash or a promo reprice, and the card cannot
+    # honestly be valued against it.
+    #
+    # 0.5 is deliberately permissive: genuine snipes sit comfortably
+    # inside it. The case this was written for was 0.18 - a live, correct,
+    # four-minute-old BIN of 138,000 against a ~755,000 sales estimate,
+    # which the engine turned into "buy below 500,000" and a claimed
+    # 403,500 profit. Tighten only with graded outcomes in hand.
+    min_bin_to_sales_ratio: float = 0.5
 
     # ---- Confidence gates ---------------------------------------------
     min_confidence_for_buy_signal: float = 0.45
@@ -269,6 +283,7 @@ def _load_engine_config() -> EngineConfig:
         version=os.getenv("FUTGG_ENGINE_VERSION", ENGINE_VERSION),
         min_sales_for_signal=_env_int("FUTGG_MIN_SALES_FOR_SIGNAL", 5),
         extreme_dispersion_ratio=_env_float("FUTGG_EXTREME_DISPERSION_RATIO", 0.45),
+        min_bin_to_sales_ratio=_env_float("FUTGG_MIN_BIN_TO_SALES_RATIO", 0.5),
         min_confidence_for_buy_signal=_env_float("FUTGG_MIN_CONFIDENCE_FOR_BUY", 0.45),
         min_confidence_for_any_signal=_env_float("FUTGG_MIN_CONFIDENCE_ANY", 0.20),
         min_net_roi_for_buy=_env_decimal("FUTGG_MIN_NET_ROI_FOR_BUY", "0.03"),
