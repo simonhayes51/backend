@@ -111,8 +111,26 @@ CREATE INDEX IF NOT EXISTS futgg_rec_snap_actionable_idx
 -- One evaluation per card per minute is plenty; this also makes the
 -- writer safely idempotent under retries without needing a transaction
 -- spanning the whole scan.
+--
+-- The `AT TIME ZONE 'UTC'` is load-bearing, not decoration. evaluated_at
+-- is TIMESTAMPTZ, and date_trunc(text, timestamptz) is STABLE rather
+-- than IMMUTABLE - its result depends on the session TimeZone - so
+-- Postgres rejects it in an index expression with "functions in index
+-- expression must be marked IMMUTABLE". The runner applies each
+-- migration inside a transaction, so that single error rolled back this
+-- entire file: both tables above silently failed to exist in production
+-- while the scanner kept trying to write to them every 10 minutes.
+--
+-- `AT TIME ZONE 'UTC'` yields a plain timestamp and is immutable, and
+-- date_trunc(text, timestamp) is immutable in turn. UTC is also the only
+-- defensible choice regardless - the bucket must not shift with whatever
+-- TimeZone a given connection happens to carry.
+--
+-- The ON CONFLICT inference in futgg_recommendation_store._INSERT must
+-- match this expression exactly or Postgres will not recognise the index.
 CREATE UNIQUE INDEX IF NOT EXISTS futgg_rec_snap_card_minute_uniq
-    ON futgg_recommendation_snapshots (source_card_id, date_trunc('minute', evaluated_at));
+    ON futgg_recommendation_snapshots
+       (source_card_id, date_trunc('minute', evaluated_at AT TIME ZONE 'UTC'));
 
 COMMENT ON TABLE futgg_recommendation_snapshots IS
     'Immutable record of every actionable FUT.GG recommendation and the market state that produced it. Never recomputed from current data.';
