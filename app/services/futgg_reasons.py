@@ -43,6 +43,10 @@ NO_REALISTIC_EXIT_EVIDENCE = "no_realistic_exit_evidence"
 PRICE_ABOVE_MAX_BUY = "price_above_max_buy"
 EVENT_RISK = "event_risk"
 STALE_RECOMMENDATION = "stale_recommendation"
+# The live price sits so far below the recent-sales estimate that the two
+# cannot describe the same market - see the plausibility gate in
+# futgg_intelligence for the incident that motivated this.
+SALES_BIN_DIVERGENCE = "sales_bin_divergence"
 
 # ---- Downgrading codes (signal allowed but capped) --------------------------
 EXCESSIVE_DISPERSION = "excessive_dispersion"
@@ -65,10 +69,11 @@ INFO_WATCH_THRESHOLD = "watch_threshold"
 INFO_NO_EDGE = "no_edge"
 
 BLOCKING_CODES = frozenset({
-    INSUFFICIENT_SALES, STALE_MARKET, NO_LIVE_PRICE, UNTRADEABLE,
+    INSUFFICIENT_SALES, STALE_MARKET, STALE_SALES, NO_LIVE_PRICE, UNTRADEABLE,
     UNRESOLVED_DOWNTREND, FALLING_KNIFE, EXPECTED_PROFIT_TOO_LOW,
     TARGET_BELOW_BREAK_EVEN, NO_REALISTIC_EXIT_EVIDENCE,
     PRICE_ABOVE_MAX_BUY, EVENT_RISK, STALE_RECOMMENDATION,
+    SALES_BIN_DIVERGENCE,
 })
 
 DOWNGRADE_CODES = frozenset({
@@ -161,6 +166,7 @@ CODE_LABELS: Dict[str, str] = {
     NO_REALISTIC_EXIT_EVIDENCE: "No evidence it sells at target",
     PRICE_ABOVE_MAX_BUY: "Costs more than it is worth buying at",
     EVENT_RISK: "Known market event risk",
+    SALES_BIN_DIVERGENCE: "Live price far below recent sales",
     STALE_RECOMMENDATION: "Recommendation out of date",
     EXCESSIVE_DISPERSION: "Sale prices too scattered",
     LOW_LIQUIDITY: "Trades rarely",

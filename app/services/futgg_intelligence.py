@@ -476,6 +476,52 @@ def evaluate_card(
             "No recent-sales price estimate available for this card.",
         )
 
+    # ---- Plausibility of the edge itself --------------------------------
+    #
+    # Every gate above asks whether an input is fresh, plentiful or
+    # trending. None asked the more basic question: is the resulting edge
+    # believable at all?
+    #
+    # Observed live on a Time Warp Ronaldo. The live BIN was 138,000 and
+    # four minutes old - entirely correct, and confirmed against the EA
+    # web app. But recent sales averaged roughly 755,000, because the
+    # card had crashed and the 14-day sales window straddled the crash.
+    # Fair value came out at 570,000, and the engine advised buying at up
+    # to 500,000 a card that was actually worth 138,000, quoting a
+    # 403,500 profit. Following it would have lost around 360,000 coins
+    # per card.
+    #
+    # The trend layer is supposed to catch exactly this, and it is the
+    # right long-term answer, but it cannot fire when the sales sample is
+    # too sparse or too unevenly spaced to establish a slope - and it
+    # then falls back to a state that merely CAPS the signal instead of
+    # blocking it. A card can therefore skip every guard on its way to an
+    # absurd recommendation.
+    #
+    # So: treat an implausibly large discount as evidence that the sales
+    # sample and the live market describe different periods, not as an
+    # opportunity. A genuine snipe is a listing somewhat below market. A
+    # listing at less than half the recent-sales estimate is a broken
+    # anchor essentially every time - a crash, a promo reprice, or bad
+    # data. Refusing to value the card is the honest outcome; guessing
+    # which of the two numbers is real is not something this function can
+    # do, and pretending otherwise is what produced the 500,000 figure.
+    # current_bin is None for a card with no live listing at all - the
+    # no-market case - and that is already handled by its own gate above.
+    # This ratio is only meaningful when there are two real numbers to
+    # compare.
+    if current_bin is not None and sales_estimate is not None and float(sales_estimate) > 0:
+        bin_to_sales = float(current_bin) / float(sales_estimate)
+        if bin_to_sales < cfg.min_bin_to_sales_ratio:
+            reasons.add(
+                rc.SALES_BIN_DIVERGENCE,
+                f"The live price ({int(current_bin):,}) is only "
+                f"{bin_to_sales * 100:.0f}% of what recent sales suggest "
+                f"({int(sales_estimate):,}). A gap that large means the sales "
+                "history no longer describes today's market - most often a "
+                "card that has crashed - so it cannot be valued against it.",
+            )
+
     if len(reasons):
         return _insufficient(
             card_id, reasons, as_of=as_of, confidence=confidence,
