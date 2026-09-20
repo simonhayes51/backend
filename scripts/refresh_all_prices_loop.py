@@ -11,6 +11,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from app.db import _with_connect_retry  # noqa: E402
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s"
@@ -317,7 +319,10 @@ async def _refresh_once(pool: asyncpg.Pool):
 
 # ---------- Main loop ----------
 async def main_loop():
-    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+    pool = await _with_connect_retry(
+        "price refresh",
+        lambda: asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10),
+    )
     try:
         await run_migrations(pool)
         while True:
