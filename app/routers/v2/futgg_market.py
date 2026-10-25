@@ -25,12 +25,14 @@ on top of this router rather than inside the provider/intelligence layers.
 from __future__ import annotations
 
 import logging
+import hmac
+import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import asyncpg
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 
 from app.db import get_core_pool
 from app.services.futgg_intelligence import (
@@ -437,6 +439,20 @@ async def list_opportunities(
         None, rating_min, rating_max, position, rarity, club, league, nation,
         max_price, min_price, max_price_age_minutes,
     )
+    return await _opportunity_results(
+        provider, filters, risk=risk, min_profit=min_profit, min_roi=min_roi,
+        min_confidence=min_confidence, min_liquidity=min_liquidity,
+        page=page, page_size=page_size,
+    )
+
+
+async def _opportunity_results(
+    provider: FutggMarketDataProvider, filters: PlayerFilters, *,
+    risk: Optional[str] = None, min_profit: Optional[float] = None,
+    min_roi: Optional[float] = None, min_confidence: Optional[float] = None,
+    min_liquidity: Optional[float] = None, page: int = 1,
+    page_size: int = DEFAULT_PAGE_SIZE,
+) -> Dict[str, Any]:
     # Scanner state is a broader candidate index, not an executable buy:
     # refresh the verdict with the latest snapshot and sales for each row.
     rows = await provider.search_players(filters, limit=CANDIDATE_SCAN_LIMIT, offset=0, order_by=CANDIDATE_SCAN_ORDER_BY)
@@ -464,6 +480,30 @@ async def list_opportunities(
         "items": items, "page": page, "page_size": page_size, "total": total,
         "scanner_candidates_considered": len(scanner_candidates),
     }
+
+
+@router.get("/market/flipiq-opportunities")
+async def flipiq_service_opportunities(
+    min_profit: float = Query(500, ge=0),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
+    service_token: Optional[str] = Header(None, alias="X-FLIPIQ-Token"),
+    provider: FutggMarketDataProvider = ProviderDep,
+) -> Dict[str, Any]:
+    """First-party FLIPIQ server integration, independent of public teasers.
+
+    Fail closed unless explicitly provisioned on both Coolify services.
+    Credentials must be sent server-to-server, never from browser JS.
+    """
+    expected = os.getenv("FLIPIQ_SERVICE_TOKEN", "")
+    if len(expected) < 32:
+        raise HTTPException(status_code=503, detail="FLIPIQ service integration not configured")
+    if not service_token or not hmac.compare_digest(service_token, expected):
+        raise HTTPException(status_code=401, detail="Invalid FLIPIQ service token")
+    return await _opportunity_results(
+        provider, PlayerFilters(), min_profit=min_profit,
+        page=page, page_size=page_size,
+    )
 
 
 _SORT_ALIASES = {"best": "best_opportunity"}
