@@ -93,6 +93,9 @@ class FakeProvider:
         self.search_calls.append({"limit": limit, "offset": offset, "order_by": order_by})
         return self.rows[offset: offset + limit]
 
+    async def get_scanner_buy_candidates(self, filters: PlayerFilters, *, limit=500):
+        return []
+
     async def count_players(self, filters: PlayerFilters) -> int:
         return len(self.rows)
 
@@ -197,6 +200,46 @@ def test_opportunities_only_returns_buy_signals():
     body = resp.json()
     for item in body["items"]:
         assert item["intelligence"]["signal"] in ("buy", "strong_buy")
+
+
+def test_opportunities_includes_recent_scanner_buys_outside_top_500(monkeypatch):
+    import asyncio
+    import inspect
+    from app.routers.v2 import futgg_market
+
+    class Provider(FakeProvider):
+        async def get_scanner_buy_candidates(self, filters: PlayerFilters, *, limit=500):
+            return [_row(source_card_id=999, name="Scanner discovery")]
+
+    provider = Provider([_row(source_card_id=1, name="Liquidity candidate")])
+    def fake_score(rows, **kwargs):
+        return [(row, type("Signal", (), {
+            "signal": "buy", "risk_level": "low", "expected_roi": 0.1,
+            "expected_profit_after_tax": 1000, "confidence_score": 0.9,
+            "price_age_minutes": 4, "trend_state": "stabilising",
+        })()) for row in rows]
+
+    monkeypatch.setattr(futgg_market, "_score_and_filter", fake_score)
+    monkeypatch.setattr(
+        futgg_market, "_item_with_intelligence",
+        lambda row, ci: {"source_card_id": row["source_card_id"], "signal": ci.signal},
+    )
+
+    async def check_sales(provider_arg, rows):
+        assert {r["source_card_id"] for r in rows} == {1, 999}
+        return {}
+
+    monkeypatch.setattr(futgg_market, "_sales_for_rows", check_sales)
+    # Direct invocation avoids TestClient's background thread while still
+    # exercising the endpoint's candidate merge, scoring and pagination.
+    defaults = {
+        k: (v.default.default if hasattr(v.default, "default") else v.default)
+        for k, v in inspect.signature(futgg_market.list_opportunities).parameters.items()
+        if k != "provider"
+    }
+    body = asyncio.run(futgg_market.list_opportunities(**defaults, provider=provider))
+    assert body["scanner_candidates_considered"] == 1
+    assert {i["source_card_id"] for i in body["items"]} == {1, 999}
 
 
 def test_trade_finder_rejects_bad_sort_by():
