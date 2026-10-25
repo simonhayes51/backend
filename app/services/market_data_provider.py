@@ -415,6 +415,36 @@ class FutggMarketDataProvider(MarketDataProvider):
         async with self._pool.acquire() as conn:
             await conn.executemany(sql, args)
 
+    async def get_scanner_buy_candidates(
+        self, filters: PlayerFilters, *, limit: int = 500,
+    ) -> List[Dict[str, Any]]:
+        """Bring recently scanned buys into user-facing opportunity lists.
+
+        Scan state is a *candidate index*, never a cached recommendation:
+        callers must re-evaluate each card with its latest live snapshot and
+        recent sales before returning it to a user. The three-hour bound
+        prevents ancient scanner calls from being resurrected indefinitely.
+        """
+        where: List[str] = [
+            "last_signal IN ('buy', 'strong_buy')",
+            "last_evaluated_at >= now() - interval '3 hours'",
+            "is_tradeable IS DISTINCT FROM FALSE",
+        ]
+        args: List[Any] = []
+        _apply_common_filters(where, args, filters)
+        args.append(limit)
+        sql = f"""
+            SELECT {_SNAPSHOT_COLUMNS}
+            FROM futgg_market_snapshot
+            JOIN futgg_scan_state USING (source_card_id)
+            WHERE {' AND '.join(where)}
+            ORDER BY last_evaluated_at DESC
+            LIMIT ${len(args)}
+        """
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(sql, *args)
+        return [dict(r) for r in rows]
+
     # -------------------------------------------------------------------
     # List / search surface (backs /players, /opportunities, /trade-finder)
     # -------------------------------------------------------------------
