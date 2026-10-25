@@ -351,19 +351,69 @@ class FutggMarketDataProvider(MarketDataProvider):
         out: Dict[str, List[Dict[str, Any]]] = {}
         async with self._pool.acquire() as conn:
             for segment in SEGMENTS:
-                # segment.where/order_by are static strings from a
-                # module-level whitelist - never user input.
+                # Both predicates and ordering are from module-level static
+                # definitions, never request input. An unseen card is first
+                # in line. Once seen, the oldest eligible evaluation wins;
+                # an interval only establishes the minimum cooldown.
+                # This is intentionally separate from recommendation
+                # snapshots, which omit non-actionable signals.
                 sql = f"""
                     SELECT {_SNAPSHOT_COLUMNS}
                     FROM futgg_market_snapshot
+                    LEFT JOIN futgg_scan_state USING (source_card_id)
                     WHERE is_tradeable IS DISTINCT FROM FALSE
                       AND ({segment.where})
-                    ORDER BY {segment.order_by}
-                    LIMIT $1
+                      AND (
+                          last_evaluated_at IS NULL OR
+                          last_evaluated_at <= now() - ($1::int * interval '1 minute')
+                      )
+                    ORDER BY last_evaluated_at ASC NULLS FIRST, {segment.order_by}
+                    LIMIT $2
                 """
-                rows = await conn.fetch(sql, segment.limit)
+                try:
+                    rows = await conn.fetch(sql, segment.refresh_minutes, segment.limit)
+                except asyncpg.UndefinedTableError:
+                    # An existing deployment may boot before migration 041
+                    # has been applied. Retain the previous selection path
+                    # until the ordered migration runner catches up.
+                    log.warning("futgg_scan_state missing; segmented rotation is disabled until migration 041 applies")
+                    legacy_sql = f"""
+                        SELECT {_SNAPSHOT_COLUMNS}
+                        FROM futgg_market_snapshot
+                        WHERE is_tradeable IS DISTINCT FROM FALSE
+                          AND ({segment.where})
+                        ORDER BY {segment.order_by}
+                        LIMIT $1
+                    """
+                    rows = await conn.fetch(legacy_sql, segment.limit)
                 out[segment.name] = [dict(r) for r in rows]
         return out
+
+    async def record_scan_evaluations(self, evaluations: Sequence[tuple], as_of: datetime) -> None:
+        """Record every successful evaluation, including hold/avoid/insufficient.
+
+        This state drives candidate rotation and is NOT used to grade
+        recommendations. A single batched upsert avoids one DB round-trip
+        per card and keeps only the latest scan state for each card.
+        """
+        if not evaluations:
+            return
+        sql = """
+            INSERT INTO futgg_scan_state (
+                source_card_id, last_evaluated_at, last_signal,
+                last_trend_state, last_observed_bin
+            ) VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (source_card_id) DO UPDATE SET
+                last_evaluated_at = EXCLUDED.last_evaluated_at,
+                last_signal = EXCLUDED.last_signal,
+                last_trend_state = EXCLUDED.last_trend_state,
+                last_observed_bin = EXCLUDED.last_observed_bin,
+                updated_at = now()
+            WHERE futgg_scan_state.last_evaluated_at <= EXCLUDED.last_evaluated_at
+        """
+        args = [(card_id, as_of, signal, trend, price) for card_id, signal, trend, price in evaluations]
+        async with self._pool.acquire() as conn:
+            await conn.executemany(sql, args)
 
     # -------------------------------------------------------------------
     # List / search surface (backs /players, /opportunities, /trade-finder)
