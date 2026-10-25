@@ -242,6 +242,40 @@ def test_opportunities_includes_recent_scanner_buys_outside_top_500(monkeypatch)
     assert {i["source_card_id"] for i in body["items"]} == {1, 999}
 
 
+def test_flipiq_service_fails_closed_and_accepts_configured_token(monkeypatch):
+    import asyncio
+    from app.routers.v2 import futgg_market
+
+    provider = FakeProvider()
+    monkeypatch.delenv("FLIPIQ_SERVICE_TOKEN", raising=False)
+    with pytest.raises(Exception) as missing:
+        asyncio.run(futgg_market.flipiq_service_opportunities(
+            min_profit=500, page=1, page_size=50,
+            service_token="anything", provider=provider,
+        ))
+    assert missing.value.status_code == 503
+
+    token = "a" * 64
+    monkeypatch.setenv("FLIPIQ_SERVICE_TOKEN", token)
+    with pytest.raises(Exception) as denied:
+        asyncio.run(futgg_market.flipiq_service_opportunities(
+            min_profit=500, page=1, page_size=50,
+            service_token="wrong", provider=provider,
+        ))
+    assert denied.value.status_code == 401
+
+    async def verified(*args, **kwargs):
+        assert kwargs["min_profit"] == 500
+        return {"items": [], "total": 0}
+
+    monkeypatch.setattr(futgg_market, "_opportunity_results", verified)
+    data = asyncio.run(futgg_market.flipiq_service_opportunities(
+        min_profit=500, page=1, page_size=50,
+        service_token=token, provider=provider,
+    ))
+    assert data["total"] == 0
+
+
 def test_trade_finder_rejects_bad_sort_by():
     resp = _client().get("/api/v2/trade-finder?sort_by=not_a_real_sort")
     assert resp.status_code == 400
