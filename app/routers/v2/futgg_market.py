@@ -437,7 +437,13 @@ async def list_opportunities(
         None, rating_min, rating_max, position, rarity, club, league, nation,
         max_price, min_price, max_price_age_minutes,
     )
+    # Scanner state is a broader candidate index, not an executable buy:
+    # refresh the verdict with the latest snapshot and sales for each row.
     rows = await provider.search_players(filters, limit=CANDIDATE_SCAN_LIMIT, offset=0, order_by=CANDIDATE_SCAN_ORDER_BY)
+    scanner_candidates = await provider.get_scanner_buy_candidates(filters)
+    rows_by_card = {int(row["source_card_id"]): row for row in rows}
+    rows_by_card.update({int(row["source_card_id"]): row for row in scanner_candidates})
+    rows = list(rows_by_card.values())
     scored = _score_and_filter(
         rows, risk=risk, min_expected_profit=min_profit, min_roi=min_roi,
         min_confidence=min_confidence, min_liquidity=min_liquidity,
@@ -454,7 +460,10 @@ async def list_opportunities(
     total = len(scored)
     window = scored[(page - 1) * page_size: page * page_size]
     items = [_item_with_intelligence(row, ci) for row, ci in window]
-    return {"items": items, "page": page, "page_size": page_size, "total": total}
+    return {
+        "items": items, "page": page, "page_size": page_size, "total": total,
+        "scanner_candidates_considered": len(scanner_candidates),
+    }
 
 
 _SORT_ALIASES = {"best": "best_opportunity"}

@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from app.services import futgg_scanner
-from app.services.market_data_provider import FutggMarketDataProvider
+from app.services.market_data_provider import FutggMarketDataProvider, PlayerFilters
 from app.services.futgg_candidate_segments import SEGMENTS
 
 
@@ -59,6 +59,18 @@ def test_all_signals_are_recorded_in_rotation_state():
     sql, values = pool.conn.batches[0]
     assert "ON CONFLICT (source_card_id)" in sql
     assert values == [(1, now, "hold", "downtrend", 12_000), (2, now, "avoid", "falling_knife", 7_000)]
+
+
+def test_scanner_buy_lookup_preserves_market_filters_and_recent_state():
+    pool = FakePool()
+    provider = FutggMarketDataProvider(pool)
+    asyncio.run(provider.get_scanner_buy_candidates(PlayerFilters(max_price=25_000), limit=30))
+    sql, args = pool.conn.queries[0]
+    assert "JOIN futgg_scan_state USING (source_card_id)" in sql
+    assert "last_signal IN ('buy', 'strong_buy')" in sql
+    assert "last_evaluated_at >= now() - interval '3 hours'" in sql
+    assert "current_bin <= $1" in sql
+    assert args == (25_000, 30)
 
 
 def test_scanner_records_non_actionable_evaluation(monkeypatch):
