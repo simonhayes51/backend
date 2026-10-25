@@ -73,9 +73,8 @@ class ScanMetrics:
 async def run_scan(provider, pool, *, persist: bool = True) -> ScanMetrics:
     """Run one full evaluation pass.
 
-    `persist=False` runs the whole pipeline without writing snapshots -
-    used by the metrics endpoint and by staging, so coverage can be
-    inspected without polluting the outcome-grading corpus.
+    `persist=False` runs the whole pipeline without writing snapshots
+    or scan state - used for read-only diagnostics.
     """
     started = time.monotonic()
     metrics = ScanMetrics(started_at=datetime.now(timezone.utc))
@@ -102,6 +101,7 @@ async def run_scan(provider, pool, *, persist: bool = True) -> ScanMetrics:
 
     as_of = datetime.now(timezone.utc)
     to_persist: List[Tuple[Dict[str, Any], Any]] = []
+    evaluations: List[Tuple[int, str, Optional[str], Optional[int]]] = []
 
     for card_id, row in unique_rows.items():
         segment_name = seen[card_id]
@@ -113,6 +113,7 @@ async def run_scan(provider, pool, *, persist: bool = True) -> ScanMetrics:
             log.warning("evaluate_card failed for card_id=%s", card_id, exc_info=True)
             continue
         sm.evaluated += 1
+        evaluations.append((card_id, ci.signal, ci.trend_state, row.get("current_bin")))
         if ci.signal in ("buy", "strong_buy"):
             sm.buy_signals += 1
             sm.recommendations += 1
@@ -125,6 +126,13 @@ async def run_scan(provider, pool, *, persist: bool = True) -> ScanMetrics:
 
     if persist and to_persist:
         metrics.recommendations_written = await record_many(pool, to_persist)
+    if persist and evaluations:
+        try:
+            await provider.record_scan_evaluations(evaluations, as_of)
+        except Exception:
+            # Keep the scanner alive while migration 041 is pending, but
+            # make the loss of rotation state visible in backend logs.
+            log.warning("failed to record FUT.GG scan rotation state", exc_info=True)
 
     metrics.unique_cards_evaluated = len(unique_rows)
     metrics.segments = list(segment_metrics.values())
@@ -160,19 +168,14 @@ async def coverage_report(pool) -> Dict[str, Any]:
         )
         evaluated_24h = await conn.fetchval(
             """
-            SELECT count(DISTINCT source_card_id)
-            FROM futgg_recommendation_snapshots
-            WHERE evaluated_at >= now() - interval '24 hours'
+            SELECT count(*) FROM futgg_scan_state
+            WHERE last_evaluated_at >= now() - interval '24 hours'
             """
         )
         avg_staleness = await conn.fetchval(
             """
-            SELECT avg(EXTRACT(EPOCH FROM (now() - last_seen)) / 60.0)
-            FROM (
-                SELECT source_card_id, max(evaluated_at) AS last_seen
-                FROM futgg_recommendation_snapshots
-                GROUP BY source_card_id
-            ) t
+            SELECT avg(EXTRACT(EPOCH FROM (now() - last_evaluated_at)) / 60.0)
+            FROM futgg_scan_state
             """
         )
         by_liquidity = await conn.fetch(
